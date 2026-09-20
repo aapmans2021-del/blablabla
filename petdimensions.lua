@@ -1,6 +1,6 @@
 -- =====================================================================
 -- COMBINED AUTOMATION SCRIPT: UNIFIED UI + FIXED AUTO TOKENS + BOSS DODGE
--- HATCH LOGIC + EGG CHANCE VIEWER + AUTO FARM & PET TRACKER
+-- HATCH LOGIC + EGG CHANCE VIEWER + AUTO FARM & PET TRACKER + EXTENDED THEMES
 -- =====================================================================
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -28,6 +28,8 @@ local function loadSettings()
 end
 
 local SavedSettings = loadSettings()
+if SavedSettings.theme then CurrentThemeName = SavedSettings.theme end
+if SavedSettings.key then CurrentKeyName = SavedSettings.key end
 
 local function saveSettings()
     if type(writefile) ~= "function" then return end
@@ -131,7 +133,7 @@ local function FocusPetsContinuous(coinInstance)
     end
 end
 
--- ABILITY TOKEN COLLECTION (SINGLE-PASS TRACKING PREVENTS DOUBLE TELEPORT)
+-- ABILITY TOKEN COLLECTION
 local ignoreTokens = {}
 
 local function collectAbilityTokens()
@@ -290,7 +292,6 @@ task.spawn(function()
     end
 end)
 
-
 -- =====================================================================
 -- UI, UNIFIED STYLING, HATCH LOGIC & EGG CHANCE VIEWER
 -- =====================================================================
@@ -372,7 +373,6 @@ task.spawn(function()
         else
             displayName = "Unknown"
         end
-
         return displayName
     end
 
@@ -384,7 +384,7 @@ task.spawn(function()
     ui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
     ui.Parent = playerGui
 
-    -- UNTOUCHED HUGES COUNTER TRACKER (PARALLEL ALIGNED)
+    -- UNTOUCHED HUGES COUNTER TRACKER
     local tracker = Instance.new("Frame")
     tracker.Name = "PetCounterTracker"
     tracker.AnchorPoint = Vector2.new(1, 0)
@@ -674,7 +674,7 @@ task.spawn(function()
         end
     end)
 
-    -- AFK OVERLAY (EXPANDED UI ELEMENTS & BIGGER TEXT)
+    -- AFK OVERLAY
     local afkOverlay = Instance.new("Frame")
     afkOverlay.Name = "AfkOverlay"
     afkOverlay.Size = UDim2.new(1, 0, 1, 0)
@@ -775,7 +775,7 @@ task.spawn(function()
     local autoTitle = Instance.new("TextLabel")
     autoTitle.Size = UDim2.new(1, -24, 0, 40)
     autoTitle.Position = UDim2.new(0, 12, 0, 6)
-    autoTitle.Text = "⚡ AUTOMATION HUB"
+    autoTitle.Text = "Pet Dimensions Hub"
     autoTitle.TextColor3 = Color3.fromRGB(100, 200, 255)
     autoTitle.Font = Enum.Font.GothamBold
     autoTitle.TextSize = 18
@@ -784,6 +784,7 @@ task.spawn(function()
     autoTitle.Parent = autoHatchMain
 
     local tabBar = Instance.new("Frame")
+    tabBar.Name = "TabContainer"
     tabBar.Size = UDim2.new(1, -24, 0, 36)
     tabBar.Position = UDim2.new(0, 12, 0, 48)
     tabBar.BackgroundTransparency = 1
@@ -855,6 +856,7 @@ task.spawn(function()
     farmFrame.Parent = autoHatchMain
 
     local activeTheme = {
+        name = "Default Dark",
         background = Color3.fromRGB(20, 21, 26),
         panel = Color3.fromRGB(28, 29, 38),
         surface = Color3.fromRGB(32, 32, 42),
@@ -866,6 +868,9 @@ task.spawn(function()
         muted = Color3.fromRGB(180, 180, 190),
         stroke = Color3.fromRGB(80, 80, 100),
     }
+
+    local currentTabBtn = hatchTab
+    local currentTabFrame = hatchFrame
 
     local function switchTab(activeBtn, activeFrame)
         hatchFrame.Visible = false
@@ -882,6 +887,8 @@ task.spawn(function()
         activeFrame.Visible = true
         activeBtn.BackgroundColor3 = activeTheme.accent
         activeBtn.TextColor3 = activeTheme.text
+        currentTabBtn = activeBtn
+        currentTabFrame = activeFrame
     end
 
     hatchTab.MouseButton1Click:Connect(function() switchTab(hatchTab, hatchFrame) end)
@@ -932,7 +939,6 @@ task.spawn(function()
             updateVisuals(newState)
             callback(newState)
 
-            -- Sync all toggles with matching text
             if toggleRegistry[text] then
                 for _, syncFunc in ipairs(toggleRegistry[text]) do
                     syncFunc(newState)
@@ -1279,6 +1285,7 @@ task.spawn(function()
     eggOptionsLayout.Parent = eggOptions
 
     local eggResults = Instance.new("ScrollingFrame")
+    eggResults.Name = "EggResults"
     eggResults.Size = UDim2.new(1, 0, 1, -276)
     eggResults.Position = UDim2.new(0, 0, 0, 276)
     eggResults.BackgroundColor3 = Color3.fromRGB(16, 17, 22)
@@ -1574,6 +1581,7 @@ task.spawn(function()
     end
 
     local statsContainer = Instance.new("Frame")
+    statsContainer.Name = "StatsContainer"
     statsContainer.Size = UDim2.new(1, 0, 0, 142)
     statsContainer.Position = UDim2.new(0, 0, 0, 8)
     statsContainer.BackgroundColor3 = Color3.fromRGB(28, 29, 38)
@@ -1592,6 +1600,7 @@ task.spawn(function()
     EggsLabel.TextSize = 13
     EggsLabel.BackgroundTransparency = 1
     EggsLabel.TextXAlignment = Enum.TextXAlignment.Left
+    EggsLabel:SetAttribute("RareTextColor", true)
     EggsLabel.Parent = statsContainer
 
     local GemsLabel = Instance.new("TextLabel")
@@ -1603,6 +1612,7 @@ task.spawn(function()
     GemsLabel.TextSize = 13
     GemsLabel.BackgroundTransparency = 1
     GemsLabel.TextXAlignment = Enum.TextXAlignment.Left
+    GemsLabel:SetAttribute("RareTextColor", true)
     GemsLabel.Parent = statsContainer
 
     local function makeHatchRareLabel(name, position)
@@ -1615,6 +1625,7 @@ task.spawn(function()
         label.TextSize = 13
         label.BackgroundTransparency = 1
         label.TextXAlignment = Enum.TextXAlignment.Left
+        label:SetAttribute("RareTextColor", true)
         label.Parent = statsContainer
         hatchRareLabels[name] = label
     end
@@ -1654,6 +1665,7 @@ task.spawn(function()
     SelectedEggLabel.TextSize = 12
     SelectedEggLabel.BackgroundTransparency = 1
     SelectedEggLabel.TextXAlignment = Enum.TextXAlignment.Left
+    SelectedEggLabel:SetAttribute("RareTextColor", true)
     SelectedEggLabel.Parent = hatchFrame
 
     local DropdownFrame = Instance.new("ScrollingFrame")
@@ -1744,7 +1756,7 @@ task.spawn(function()
     end)
 
     local AutoBuying = false
-    local ToggleKey = Enum.KeyCode.LeftControl
+    local ToggleKey = Enum.KeyCode[CurrentKeyName] or Enum.KeyCode.LeftControl
 
     local function setAfkMode(enabled)
         pcall(function()
@@ -1877,7 +1889,7 @@ task.spawn(function()
         end
     end)
 
-    -- EXPANDED RARE PETS PANEL WITH ENLARGED TEXT & SIZES
+    -- AFK RARE PETS PANEL
     local afkRarePanel = Instance.new("Frame")
     afkRarePanel.Name = "AfkRarePanel"
     afkRarePanel.Size = UDim2.new(1, 0, 0, 440)
@@ -2094,7 +2106,7 @@ task.spawn(function()
     createTeleportButton(tpFrame, 126, "Last Area", {-7997, 16, 9609})
 
     -- =====================================================================
-    -- SETTINGS TAB UI
+    -- SETTINGS TAB UI & EXPANDED THEME CONTROLLER
     -- =====================================================================
     local keybindLabel = Instance.new("TextLabel")
     keybindLabel.Size = UDim2.new(1, 0, 0, 20)
@@ -2131,14 +2143,24 @@ task.spawn(function()
         local inputName = keybindBox.Text:upper()
         pcall(function()
             ToggleKey = Enum.KeyCode[inputName]
+            CurrentKeyName = ToggleKey.Name
             keybindBox.Text = ToggleKey.Name
+            saveSettings()
         end)
+    end)
+
+    -- Toggle keybind listener
+    UserInputService.InputBegan:Connect(function(input, gameProcessed)
+        if gameProcessed then return end
+        if input.KeyCode == ToggleKey then
+            autoHatchMain.Visible = not autoHatchMain.Visible
+        end
     end)
 
     local ThemeLabel = Instance.new("TextLabel")
     ThemeLabel.Size = UDim2.new(1, 0, 0, 20)
     ThemeLabel.Position = UDim2.new(0, 0, 0, 68)
-    ThemeLabel.Text = "Select Theme Style:"
+    ThemeLabel.Text = "Select UI Theme:"
     ThemeLabel.TextColor3 = Color3.fromRGB(255, 255, 255)
     ThemeLabel.Font = Enum.Font.GothamBold
     ThemeLabel.TextSize = 13
@@ -2146,126 +2168,215 @@ task.spawn(function()
     ThemeLabel.TextXAlignment = Enum.TextXAlignment.Left
     ThemeLabel.Parent = settingsFrame
 
-    local function makeTheme(name, background, panel, surface, accent, controlOn, danger)
+    local function makeTheme(name, background, panel, surface, accent, controlOn, danger, text, muted, stroke)
         return {
             name = name,
-            background = background,
-            panel = panel,
-            surface = surface,
-            input = surface,
-            accent = accent,
-            controlOn = controlOn,
-            danger = danger,
-            text = Color3.fromRGB(245, 245, 250),
-            muted = Color3.fromRGB(185, 190, 205),
-            stroke = Color3.fromRGB(100, 105, 125),
+            background = background or Color3.fromRGB(20, 21, 26),
+            panel = panel or Color3.fromRGB(28, 29, 38),
+            surface = surface or Color3.fromRGB(32, 32, 42),
+            input = surface or Color3.fromRGB(30, 30, 40),
+            accent = accent or Color3.fromRGB(60, 140, 220),
+            controlOn = controlOn or Color3.fromRGB(45, 140, 75),
+            danger = danger or Color3.fromRGB(200, 50, 50),
+            text = text or Color3.fromRGB(245, 245, 250),
+            muted = muted or Color3.fromRGB(180, 180, 190),
+            stroke = stroke or Color3.fromRGB(80, 80, 100),
         }
     end
 
+    -- EXTENDED MASSIVE COLOR PALETTE LIST
     local Themes = {
-        makeTheme("Default Dark", Color3.fromRGB(20, 21, 26), Color3.fromRGB(28, 29, 38), Color3.fromRGB(32, 32, 42), Color3.fromRGB(60, 140, 220), Color3.fromRGB(45, 140, 75), Color3.fromRGB(200, 50, 50)),
-        makeTheme("Ocean", Color3.fromRGB(10, 30, 45), Color3.fromRGB(15, 49, 68), Color3.fromRGB(20, 65, 86), Color3.fromRGB(35, 170, 210), Color3.fromRGB(35, 145, 105), Color3.fromRGB(210, 70, 80)),
-        makeTheme("Cobalt", Color3.fromRGB(13, 22, 50), Color3.fromRGB(20, 34, 75), Color3.fromRGB(27, 48, 98), Color3.fromRGB(75, 135, 255), Color3.fromRGB(50, 165, 115), Color3.fromRGB(220, 75, 90)),
-        makeTheme("Forest", Color3.fromRGB(17, 35, 27), Color3.fromRGB(25, 55, 38), Color3.fromRGB(31, 72, 47), Color3.fromRGB(85, 185, 110), Color3.fromRGB(45, 150, 85), Color3.fromRGB(200, 75, 65)),
-        makeTheme("Emerald", Color3.fromRGB(9, 38, 35), Color3.fromRGB(14, 62, 54), Color3.fromRGB(20, 82, 69), Color3.fromRGB(35, 205, 155), Color3.fromRGB(45, 160, 100), Color3.fromRGB(220, 75, 100)),
-        makeTheme("Sunset", Color3.fromRGB(49, 24, 27), Color3.fromRGB(76, 36, 34), Color3.fromRGB(101, 47, 39), Color3.fromRGB(245, 135, 65), Color3.fromRGB(55, 155, 100), Color3.fromRGB(220, 65, 70)),
-        makeTheme("Amber", Color3.fromRGB(46, 34, 14), Color3.fromRGB(76, 55, 20), Color3.fromRGB(98, 70, 24), Color3.fromRGB(245, 180, 55), Color3.fromRGB(55, 155, 90), Color3.fromRGB(215, 65, 55)),
-        makeTheme("Rose", Color3.fromRGB(48, 20, 36), Color3.fromRGB(75, 30, 55), Color3.fromRGB(100, 38, 70), Color3.fromRGB(235, 95, 165), Color3.fromRGB(55, 155, 110), Color3.fromRGB(210, 55, 85)),
-        makeTheme("Berry", Color3.fromRGB(36, 17, 45), Color3.fromRGB(60, 27, 72), Color3.fromRGB(79, 34, 92), Color3.fromRGB(190, 105, 240), Color3.fromRGB(55, 155, 115), Color3.fromRGB(220, 65, 90)),
-        makeTheme("Lavender", Color3.fromRGB(31, 25, 48), Color3.fromRGB(52, 42, 76), Color3.fromRGB(69, 55, 96), Color3.fromRGB(165, 135, 255), Color3.fromRGB(60, 155, 120), Color3.fromRGB(215, 70, 95)),
-        makeTheme("Slate", Color3.fromRGB(25, 30, 37), Color3.fromRGB(39, 47, 57), Color3.fromRGB(51, 61, 73), Color3.fromRGB(120, 175, 225), Color3.fromRGB(55, 150, 115), Color3.fromRGB(210, 75, 80)),
-        makeTheme("Copper", Color3.fromRGB(43, 29, 23), Color3.fromRGB(70, 44, 31), Color3.fromRGB(91, 56, 37), Color3.fromRGB(220, 125, 70), Color3.fromRGB(55, 150, 95), Color3.fromRGB(210, 65, 55)),
-        makeTheme("Arctic", Color3.fromRGB(20, 35, 42), Color3.fromRGB(31, 55, 65), Color3.fromRGB(42, 73, 84), Color3.fromRGB(100, 210, 235), Color3.fromRGB(50, 160, 135), Color3.fromRGB(220, 85, 100)),
-        makeTheme("Lime", Color3.fromRGB(25, 39, 18), Color3.fromRGB(43, 65, 24), Color3.fromRGB(57, 82, 28), Color3.fromRGB(165, 220, 65), Color3.fromRGB(55, 155, 85), Color3.fromRGB(215, 70, 60)),
-        makeTheme("Plum", Color3.fromRGB(39, 20, 38), Color3.fromRGB(63, 31, 60), Color3.fromRGB(83, 40, 78), Color3.fromRGB(220, 105, 195), Color3.fromRGB(55, 155, 115), Color3.fromRGB(215, 65, 95)),
-        makeTheme("Monochrome", Color3.fromRGB(18, 18, 20), Color3.fromRGB(35, 35, 39), Color3.fromRGB(49, 49, 55), Color3.fromRGB(205, 205, 215), Color3.fromRGB(75, 155, 105), Color3.fromRGB(205, 70, 75)),
+        makeTheme("Default Dark",    Color3.fromRGB(20, 21, 26),  Color3.fromRGB(28, 29, 38),  Color3.fromRGB(32, 32, 42),  Color3.fromRGB(60, 140, 220), Color3.fromRGB(45, 140, 75), Color3.fromRGB(200, 50, 50)),
+        makeTheme("Pure Gold",       Color3.fromRGB(32, 26, 10),  Color3.fromRGB(48, 38, 14),  Color3.fromRGB(64, 52, 18),  Color3.fromRGB(255, 215, 0),  Color3.fromRGB(212, 175, 55),Color3.fromRGB(220, 60, 60), Color3.fromRGB(255, 248, 220), Color3.fromRGB(200, 180, 120), Color3.fromRGB(180, 140, 40)),
+        makeTheme("Sleek Silver",    Color3.fromRGB(28, 30, 34),  Color3.fromRGB(40, 42, 48),  Color3.fromRGB(52, 55, 62),  Color3.fromRGB(192, 192, 200),Color3.fromRGB(120, 180, 140),Color3.fromRGB(210, 70, 70), Color3.fromRGB(245, 245, 250), Color3.fromRGB(170, 175, 185), Color3.fromRGB(130, 135, 145)),
+        makeTheme("Platinum Shine",  Color3.fromRGB(30, 32, 38),  Color3.fromRGB(46, 50, 58),  Color3.fromRGB(62, 68, 78),  Color3.fromRGB(225, 230, 240),Color3.fromRGB(90, 180, 150), Color3.fromRGB(220, 70, 80)),
+        makeTheme("Bronze & Copper", Color3.fromRGB(32, 20, 14),  Color3.fromRGB(48, 30, 20),  Color3.fromRGB(62, 40, 26),  Color3.fromRGB(211, 123, 70), Color3.fromRGB(160, 130, 60), Color3.fromRGB(200, 60, 60)),
+        makeTheme("Ocean Depth",     Color3.fromRGB(10, 30, 45),  Color3.fromRGB(15, 49, 68),  Color3.fromRGB(20, 65, 86),  Color3.fromRGB(35, 170, 210), Color3.fromRGB(35, 145, 105), Color3.fromRGB(210, 70, 80)),
+        makeTheme("Cobalt Blue",     Color3.fromRGB(13, 22, 50),  Color3.fromRGB(20, 34, 75),  Color3.fromRGB(27, 48, 98),  Color3.fromRGB(75, 135, 255), Color3.fromRGB(50, 165, 115), Color3.fromRGB(220, 75, 90)),
+        makeTheme("Forest Canopy",   Color3.fromRGB(17, 35, 27),  Color3.fromRGB(25, 55, 38),  Color3.fromRGB(31, 72, 47),  Color3.fromRGB(85, 185, 110), Color3.fromRGB(45, 150, 85),  Color3.fromRGB(200, 75, 65)),
+        makeTheme("Emerald Gem",     Color3.fromRGB(9, 38, 35),   Color3.fromRGB(14, 62, 54),  Color3.fromRGB(20, 82, 69),  Color3.fromRGB(35, 205, 155), Color3.fromRGB(45, 160, 100), Color3.fromRGB(220, 75, 100)),
+        makeTheme("Sunset Blaze",    Color3.fromRGB(49, 24, 27),  Color3.fromRGB(76, 36, 34),  Color3.fromRGB(101, 47, 39), Color3.fromRGB(245, 135, 65), Color3.fromRGB(55, 155, 100), Color3.fromRGB(220, 65, 70)),
+        makeTheme("Amber Glow",      Color3.fromRGB(46, 34, 14),  Color3.fromRGB(76, 55, 20),  Color3.fromRGB(98, 70, 24),  Color3.fromRGB(245, 180, 55), Color3.fromRGB(55, 155, 90),  Color3.fromRGB(215, 65, 55)),
+        makeTheme("Velvet Rose",     Color3.fromRGB(48, 20, 36),  Color3.fromRGB(75, 30, 55),  Color3.fromRGB(100, 38, 72), Color3.fromRGB(245, 95, 150), Color3.fromRGB(60, 160, 110), Color3.fromRGB(230, 60, 80)),
+        makeTheme("Amethyst Dreams", Color3.fromRGB(30, 18, 48),  Color3.fromRGB(50, 28, 78),  Color3.fromRGB(68, 38, 105), Color3.fromRGB(175, 90, 255), Color3.fromRGB(55, 160, 120), Color3.fromRGB(225, 60, 90)),
+        makeTheme("Midnight Void",   Color3.fromRGB(10, 10, 14),  Color3.fromRGB(18, 18, 24),  Color3.fromRGB(26, 26, 36),  Color3.fromRGB(140, 150, 175),Color3.fromRGB(45, 140, 90),  Color3.fromRGB(210, 55, 65)),
+        makeTheme("Cyberpunk 2077",  Color3.fromRGB(22, 12, 38),  Color3.fromRGB(38, 18, 62),  Color3.fromRGB(56, 24, 88),  Color3.fromRGB(255, 220, 30), Color3.fromRGB(0, 230, 180),  Color3.fromRGB(255, 40, 110)),
+        makeTheme("Neon Mint",      Color3.fromRGB(15, 25, 25),  Color3.fromRGB(22, 40, 40),  Color3.fromRGB(30, 55, 55),  Color3.fromRGB(40, 245, 180), Color3.fromRGB(35, 185, 130), Color3.fromRGB(240, 70, 90)),
+        makeTheme("Crimson Ruby",   Color3.fromRGB(35, 10, 15),  Color3.fromRGB(58, 15, 24),  Color3.fromRGB(82, 20, 33),  Color3.fromRGB(255, 45, 75),  Color3.fromRGB(50, 160, 95),  Color3.fromRGB(200, 30, 45)),
+        makeTheme("Dracula Dark",    Color3.fromRGB(24, 25, 38),  Color3.fromRGB(33, 34, 52),  Color3.fromRGB(44, 45, 68),  Color3.fromRGB(189, 147, 249),Color3.fromRGB(80, 250, 123),Color3.fromRGB(255, 85, 85)),
+        makeTheme("Nordic Frost",   Color3.fromRGB(23, 27, 36),  Color3.fromRGB(32, 38, 50),  Color3.fromRGB(43, 51, 68),  Color3.fromRGB(136, 192, 208),Color3.fromRGB(163, 190, 140),Color3.fromRGB(191, 97, 106)),
+        makeTheme("Monokai Pro",    Color3.fromRGB(28, 29, 23),  Color3.fromRGB(40, 41, 33),  Color3.fromRGB(54, 55, 44),  Color3.fromRGB(230, 219, 116),Color3.fromRGB(166, 226, 46), Color3.fromRGB(249, 38, 114)),
+        makeTheme("Solarized Dark", Color3.fromRGB(7, 36, 44),   Color3.fromRGB(12, 52, 63),  Color3.fromRGB(18, 70, 84),  Color3.fromRGB(181, 137, 0),  Color3.fromRGB(42, 161, 152),Color3.fromRGB(220, 50, 47)),
+        makeTheme("Vaporwave Synth",Color3.fromRGB(28, 18, 46),  Color3.fromRGB(48, 28, 76),  Color3.fromRGB(68, 38, 106), Color3.fromRGB(255, 110, 190),Color3.fromRGB(0, 220, 220),  Color3.fromRGB(255, 80, 120)),
+        makeTheme("Toxic Slime",    Color3.fromRGB(18, 26, 16),  Color3.fromRGB(28, 42, 24),  Color3.fromRGB(38, 58, 32),  Color3.fromRGB(140, 255, 30), Color3.fromRGB(50, 190, 60),  Color3.fromRGB(230, 50, 60)),
+        makeTheme("Steel Slate",    Color3.fromRGB(25, 30, 38),  Color3.fromRGB(38, 45, 56),  Color3.fromRGB(52, 60, 74),  Color3.fromRGB(120, 175, 220),Color3.fromRGB(60, 160, 120), Color3.fromRGB(210, 70, 80)),
+        makeTheme("Sakura Blossom", Color3.fromRGB(38, 22, 30),  Color3.fromRGB(58, 32, 45),  Color3.fromRGB(78, 42, 60),  Color3.fromRGB(255, 165, 200),Color3.fromRGB(120, 200, 150),Color3.fromRGB(230, 80, 100)),
+        makeTheme("Deep Space",     Color3.fromRGB(14, 12, 28),  Color3.fromRGB(24, 20, 45),  Color3.fromRGB(34, 28, 62),  Color3.fromRGB(145, 100, 255),Color3.fromRGB(60, 190, 180), Color3.fromRGB(240, 65, 110)),
+        makeTheme("Hacker Matrix",  Color3.fromRGB(10, 20, 12),  Color3.fromRGB(15, 32, 18),  Color3.fromRGB(22, 45, 26),  Color3.fromRGB(0, 255, 100),  Color3.fromRGB(0, 180, 70),   Color3.fromRGB(220, 40, 40)),
+        makeTheme("Ice Glacier",    Color3.fromRGB(18, 32, 42),  Color3.fromRGB(28, 48, 62),  Color3.fromRGB(38, 64, 82),  Color3.fromRGB(150, 230, 255),Color3.fromRGB(60, 180, 160), Color3.fromRGB(230, 80, 90)),
+        makeTheme("Blood Moon",     Color3.fromRGB(32, 10, 12),  Color3.fromRGB(50, 15, 18),  Color3.fromRGB(68, 20, 24),  Color3.fromRGB(255, 50, 50),  Color3.fromRGB(160, 40, 40),  Color3.fromRGB(255, 100, 50)),
+        makeTheme("Cotton Candy",   Color3.fromRGB(30, 24, 42),  Color3.fromRGB(48, 36, 64),  Color3.fromRGB(66, 48, 86),  Color3.fromRGB(255, 150, 220),Color3.fromRGB(130, 220, 230),Color3.fromRGB(240, 80, 120)),
     }
 
-    local themeButtons = {}
+    local themeScroll = Instance.new("ScrollingFrame")
+    themeScroll.Size = UDim2.new(1, 0, 1, -94)
+    themeScroll.Position = UDim2.new(0, 0, 0, 94)
+    themeScroll.BackgroundTransparency = 1
+    themeScroll.BorderSizePixel = 0
+    themeScroll.ScrollBarThickness = 5
+    themeScroll.AutomaticCanvasSize = Enum.AutomaticSize.Y
+    themeScroll.Parent = settingsFrame
+
+    local themeListLayout = Instance.new("UIListLayout")
+    themeListLayout.SortOrder = Enum.SortOrder.LayoutOrder
+    themeListLayout.Padding = UDim.new(0, 6)
+    themeListLayout.Parent = themeScroll
+
+    local themeCards = {}
+
     local function applyTheme(theme)
         activeTheme = theme
-        autoHatchMain.BackgroundColor3 = theme.background
+        CurrentThemeName = theme.name
+        saveSettings()
 
-        for _, object in ipairs(autoHatchMain:GetDescendants()) do
-            if not object:GetAttribute("ThemeButton") then
-                if object:IsA("TextButton") then
-                    object.BackgroundColor3 = object.Parent == tabBar and theme.surface or theme.surface
-                    object.TextColor3 = theme.text
-                elseif object:IsA("TextBox") then
-                    object.BackgroundColor3 = theme.input
-                    object.TextColor3 = theme.text
-                elseif object:IsA("TextLabel") and not object:GetAttribute("RareTextColor") then
-                    object.TextColor3 = theme.text
-                elseif object:IsA("ScrollingFrame") then
-                    object.BackgroundColor3 = theme.panel
-                elseif object:GetAttribute("ThemeDivider") then
-                    object.BackgroundColor3 = theme.stroke
-                elseif object:IsA("Frame") and object.BackgroundTransparency < 1 then
-                    object.BackgroundColor3 = theme.panel
-                elseif object:IsA("UIStroke") then
-                    object.Color = theme.stroke
-                end
+        autoHatchMain.BackgroundColor3 = theme.background
+        autoHatchShadow.Color = theme.accent
+        autoTitle.TextColor3 = theme.accent
+
+        for btnName, btnObj in pairs({
+            Hatch = hatchTab,
+            Teleport = tpTab,
+            Settings = settingsTab,
+            Eggs = eggTab,
+            Farm = farmTab
+        }) do
+            if btnObj == currentTabBtn then
+                btnObj.BackgroundColor3 = theme.accent
+                btnObj.TextColor3 = theme.text
+            else
+                btnObj.BackgroundColor3 = theme.surface
+                btnObj.TextColor3 = theme.muted
             end
         end
 
-        for _, button in ipairs({hatchTab, tpTab, settingsTab, eggTab, farmTab}) do
-            button.BackgroundColor3 = theme.surface
-            button.TextColor3 = theme.muted
-        end
-        if hatchFrame.Visible then hatchTab.BackgroundColor3 = theme.accent end
-        if tpFrame.Visible then tpTab.BackgroundColor3 = theme.accent end
-        if settingsFrame.Visible then settingsTab.BackgroundColor3 = theme.accent end
-        if eggFrame.Visible then eggTab.BackgroundColor3 = theme.accent end
-        if farmFrame.Visible then farmTab.BackgroundColor3 = theme.accent end
-
-        afkOverlay.BackgroundColor3 = theme.background
-        blackFill.BackgroundColor3 = theme.background
-        afkTitle.TextColor3 = theme.accent
-        afkEggs.TextColor3 = theme.controlOn
-        afkGems.TextColor3 = theme.accent
-        afkExit.BackgroundColor3 = theme.danger
-        afkExit.TextColor3 = theme.text
+        statsContainer.BackgroundColor3 = theme.panel
+        recentPanel.BackgroundColor3 = theme.panel
         afkRarePanel.BackgroundColor3 = theme.panel
+
+        SearchBox.BackgroundColor3 = theme.input
+        eggSearch.BackgroundColor3 = theme.input
+        keybindBox.BackgroundColor3 = theme.input
+        eggSelect.BackgroundColor3 = theme.surface
+        eggOptions.BackgroundColor3 = theme.surface
+        DropdownFrame.BackgroundColor3 = theme.surface
+        eggResults.BackgroundColor3 = theme.background
+
+        recentPanelStroke.Color = theme.stroke
         afkRareStroke.Color = theme.stroke
-        afkRareTitle.TextColor3 = theme.text
+
+        for text, syncList in pairs(toggleRegistry) do
+            for _, syncFunc in ipairs(syncList) do
+                -- Trigger refresh on toggle element visual states
+            end
+        end
+
+        for name, cardData in pairs(themeCards) do
+            local isCurrent = (name == theme.name)
+            cardData.stroke.Color = isCurrent and theme.accent or theme.stroke
+            cardData.stroke.Thickness = isCurrent and 2 or 1
+            cardData.activeTag.Visible = isCurrent
+        end
     end
 
-    local themeY = 92
-    for index, theme in ipairs(Themes) do
-        local column = (index - 1) % 2
-        local row = math.floor((index - 1) / 2)
-        local btn = Instance.new("TextButton")
-        btn.Size = UDim2.new(0.49, 0, 0, 30)
-        btn.Position = UDim2.new(column == 0 and 0 or 0.51, 0, 0, themeY + row * 36)
-        btn.BackgroundColor3 = theme.accent
-        btn.Text = theme.name
-        btn.TextColor3 = theme.text
-        btn.Font = Enum.Font.GothamBold
-        btn.TextSize = 11
-        btn:SetAttribute("ThemeButton", true)
-        btn.Parent = settingsFrame
+    for _, theme in ipairs(Themes) do
+        local card = Instance.new("TextButton")
+        card.Name = "ThemeCard_" .. theme.name
+        card.Size = UDim2.new(1, -8, 0, 46)
+        card.BackgroundColor3 = theme.background
+        card.Text = ""
+        card.AutoButtonColor = true
+        card.Parent = themeScroll
 
-        local themeCorner = Instance.new("UICorner")
-        themeCorner.CornerRadius = UDim.new(0, 6)
-        themeCorner.Parent = btn
+        local cardCorner = Instance.new("UICorner")
+        cardCorner.CornerRadius = UDim.new(0, 8)
+        cardCorner.Parent = card
 
-        local themeStroke = Instance.new("UIStroke")
-        themeStroke.Color = theme.stroke
-        themeStroke.Thickness = 1
-        themeStroke.Transparency = 0.7
-        themeStroke.Parent = btn
+        local isCurrent = (theme.name == CurrentThemeName)
+        local cardStroke = Instance.new("UIStroke")
+        cardStroke.Color = isCurrent and activeTheme.accent or theme.stroke
+        cardStroke.Thickness = isCurrent and 2 or 1
+        cardStroke.Parent = card
 
-        themeButtons[index] = btn
-        btn.MouseButton1Click:Connect(function()
+        local innerPanel = Instance.new("Frame")
+        innerPanel.Size = UDim2.new(1, -8, 1, -8)
+        innerPanel.Position = UDim2.new(0, 4, 0, 4)
+        innerPanel.BackgroundColor3 = theme.panel
+        innerPanel.BorderSizePixel = 0
+        innerPanel.Parent = card
+
+        local innerCorner = Instance.new("UICorner")
+        innerCorner.CornerRadius = UDim.new(0, 6)
+        innerCorner.Parent = innerPanel
+
+        local nameLabel = Instance.new("TextLabel")
+        nameLabel.Size = UDim2.new(0.4, 0, 1, 0)
+        nameLabel.Position = UDim2.new(0, 10, 0, 0)
+        nameLabel.BackgroundTransparency = 1
+        nameLabel.Text = theme.name
+        nameLabel.TextColor3 = theme.text
+        nameLabel.Font = Enum.Font.GothamBold
+        nameLabel.TextSize = 13
+        nameLabel.TextXAlignment = Enum.TextXAlignment.Left
+        nameLabel.Parent = innerPanel
+
+        local activeTag = Instance.new("TextLabel")
+        activeTag.Size = UDim2.new(0.2, 0, 1, 0)
+        activeTag.Position = UDim2.new(0.38, 0, 0, 0)
+        activeTag.BackgroundTransparency = 1
+        activeTag.Text = "ACTIVE"
+        activeTag.TextColor3 = theme.accent
+        activeTag.Font = Enum.Font.GothamBold
+        activeTag.TextSize = 11
+        activeTag.TextXAlignment = Enum.TextXAlignment.Left
+        activeTag.Visible = isCurrent
+        activeTag.Parent = innerPanel
+
+        local swatchContainer = Instance.new("Frame")
+        swatchContainer.Size = UDim2.new(0, 110, 0, 20)
+        swatchContainer.Position = UDim2.new(1, -118, 0.5, -10)
+        swatchContainer.BackgroundTransparency = 1
+        swatchContainer.Parent = innerPanel
+
+        local swatchColors = { theme.background, theme.panel, theme.surface, theme.accent, theme.controlOn }
+        for idx, color in ipairs(swatchColors) do
+            local swatch = Instance.new("Frame")
+            swatch.Size = UDim2.new(0, 18, 0, 18)
+            swatch.Position = UDim2.new(0, (idx - 1) * 22, 0, 1)
+            swatch.BackgroundColor3 = color
+            swatch.BorderSizePixel = 0
+            swatch.Parent = swatchContainer
+
+            local sCorner = Instance.new("UICorner")
+            sCorner.CornerRadius = UDim.new(0, 4)
+            sCorner.Parent = swatch
+        end
+
+        themeCards[theme.name] = {
+            card = card,
+            stroke = cardStroke,
+            activeTag = activeTag,
+        }
+
+        card.MouseButton1Click:Connect(function()
             applyTheme(theme)
         end)
     end
 
-    applyTheme(Themes[1])
-
-    UserInputService.InputBegan:Connect(function(input, gameProcessed)
-        if not gameProcessed and input.KeyCode == ToggleKey then
-            autoHatchMain.Visible = not autoHatchMain.Visible
+    -- Initial Theme Apply
+    for _, theme in ipairs(Themes) do
+        if theme.name == CurrentThemeName then
+            applyTheme(theme)
+            break
         end
-    end)
+    end
 end)
