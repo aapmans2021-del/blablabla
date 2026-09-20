@@ -122,14 +122,9 @@ local function FocusPetsContinuous(coinInstance)
     end)
 
     if coinId and #myPets > 0 then
-        for i = 1, 3 do
-            pcall(function()
-                Library.Network.Invoke("Join Coin", coinId, myPets)
-            end)
-            pcall(function()
-                Library.Network.Fire("Join Coin", coinId, myPets)
-            end)
-        end
+        pcall(function()
+            Library.Network.Invoke("Join Coin", coinId, myPets)
+        end)
     end
 end
 
@@ -203,14 +198,14 @@ task.spawn(function()
                 end
             end
         end
-        task.wait(0.15)
+        task.wait(0.2)
     end
 end)
 
 -- AUTUMN BOSS FX DODGE DETECTION
 task.spawn(function()
     while true do
-        task.wait(0.05)
+        task.wait(0.1)
         if AutoFarmTurkey and TurkeyDodgeActive then
             local character = localPlayer.Character
             local hrp = character and character:FindFirstChild("HumanoidRootPart")
@@ -234,7 +229,7 @@ end)
 -- Main Auto Farm Loop
 task.spawn(function()
     while true do
-        task.wait(0.1)
+        task.wait(0.15)
         if AutoFarmRobot then
             if not CurrentTarget or not CurrentTarget.Parent then
                 CurrentTarget = GetNextRobot()
@@ -271,10 +266,10 @@ task.spawn(function()
     end
 end)
 
--- Damage Spam Loop
+-- Damage Spam Loop (Optimized to 0.05s to prevent ping spikes)
 task.spawn(function()
     while true do
-        task.wait(0.01)
+        task.wait(0.05)
         if CurrentTargetId and DamageRemote and (AutoFarmRobot or AutoFarmTurkey) then
             pcall(function()
                 DamageRemote:FireServer(CurrentTargetId)
@@ -283,9 +278,10 @@ task.spawn(function()
     end
 end)
 
+-- Potato Mode Continuous Focus Loop (Optimized to 0.1s)
 task.spawn(function()
     while true do
-        task.wait(0.015)
+        task.wait(0.1)
         if PotatoMode and (AutoFarmRobot or AutoFarmTurkey) and CurrentTarget and CurrentTarget.Parent then
             FocusPetsContinuous(CurrentTarget)
         end
@@ -670,7 +666,7 @@ task.spawn(function()
     task.spawn(function()
         while ui.Parent do
             refreshTracker()
-            task.wait(1.5)
+            task.wait(2)
         end
     end)
 
@@ -2046,6 +2042,7 @@ task.spawn(function()
     end
     task.spawn(hookLeaderstats)
 
+    -- OPTIMIZED HATCH LOOP (0.1 SECONDS INSTEAD OF 0.01)
     local BATCH_SIZE = 3
     task.spawn(function()
         while true do
@@ -2057,9 +2054,9 @@ task.spawn(function()
                         end)
                     end)
                 end
-                task.wait(0.01)
+                task.wait(0.1) -- Adjusted from 0.01 to 0.1s for high ping reduction
             else
-                task.wait(0.01)
+                task.wait(0.1) -- Adjusted from 0.01 to 0.1s
             end
         end
     end)
@@ -2206,177 +2203,5 @@ task.spawn(function()
         makeTheme("Dracula Dark",    Color3.fromRGB(24, 25, 38),  Color3.fromRGB(33, 34, 52),  Color3.fromRGB(44, 45, 68),  Color3.fromRGB(189, 147, 249),Color3.fromRGB(80, 250, 123),Color3.fromRGB(255, 85, 85)),
         makeTheme("Nordic Frost",   Color3.fromRGB(23, 27, 36),  Color3.fromRGB(32, 38, 50),  Color3.fromRGB(43, 51, 68),  Color3.fromRGB(136, 192, 208),Color3.fromRGB(163, 190, 140),Color3.fromRGB(191, 97, 106)),
         makeTheme("Monokai Pro",    Color3.fromRGB(28, 29, 23),  Color3.fromRGB(40, 41, 33),  Color3.fromRGB(54, 55, 44),  Color3.fromRGB(230, 219, 116),Color3.fromRGB(166, 226, 46), Color3.fromRGB(249, 38, 114)),
-        makeTheme("Solarized Dark", Color3.fromRGB(7, 36, 44),   Color3.fromRGB(12, 52, 63),  Color3.fromRGB(18, 70, 84),  Color3.fromRGB(181, 137, 0),  Color3.fromRGB(42, 161, 152),Color3.fromRGB(220, 50, 47)),
-        makeTheme("Vaporwave Synth",Color3.fromRGB(28, 18, 46),  Color3.fromRGB(48, 28, 76),  Color3.fromRGB(68, 38, 106), Color3.fromRGB(255, 110, 190),Color3.fromRGB(0, 220, 220),  Color3.fromRGB(255, 80, 120)),
-        makeTheme("Toxic Slime",    Color3.fromRGB(18, 26, 16),  Color3.fromRGB(28, 42, 24),  Color3.fromRGB(38, 58, 32),  Color3.fromRGB(140, 255, 30), Color3.fromRGB(50, 190, 60),  Color3.fromRGB(230, 50, 60)),
-        makeTheme("Steel Slate",    Color3.fromRGB(25, 30, 38),  Color3.fromRGB(38, 45, 56),  Color3.fromRGB(52, 60, 74),  Color3.fromRGB(120, 175, 220),Color3.fromRGB(60, 160, 120), Color3.fromRGB(210, 70, 80)),
-        makeTheme("Sakura Blossom", Color3.fromRGB(38, 22, 30),  Color3.fromRGB(58, 32, 45),  Color3.fromRGB(78, 42, 60),  Color3.fromRGB(255, 165, 200),Color3.fromRGB(120, 200, 150),Color3.fromRGB(230, 80, 100)),
-        makeTheme("Deep Space",     Color3.fromRGB(14, 12, 28),  Color3.fromRGB(24, 20, 45),  Color3.fromRGB(34, 28, 62),  Color3.fromRGB(145, 100, 255),Color3.fromRGB(60, 190, 180), Color3.fromRGB(240, 65, 110)),
-        makeTheme("Hacker Matrix",  Color3.fromRGB(10, 20, 12),  Color3.fromRGB(15, 32, 18),  Color3.fromRGB(22, 45, 26),  Color3.fromRGB(0, 255, 100),  Color3.fromRGB(0, 180, 70),   Color3.fromRGB(220, 40, 40)),
-        makeTheme("Ice Glacier",    Color3.fromRGB(18, 32, 42),  Color3.fromRGB(28, 48, 62),  Color3.fromRGB(38, 64, 82),  Color3.fromRGB(150, 230, 255),Color3.fromRGB(60, 180, 160), Color3.fromRGB(230, 80, 90)),
-        makeTheme("Blood Moon",     Color3.fromRGB(32, 10, 12),  Color3.fromRGB(50, 15, 18),  Color3.fromRGB(68, 20, 24),  Color3.fromRGB(255, 50, 50),  Color3.fromRGB(160, 40, 40),  Color3.fromRGB(255, 100, 50)),
-        makeTheme("Cotton Candy",   Color3.fromRGB(30, 24, 42),  Color3.fromRGB(48, 36, 64),  Color3.fromRGB(66, 48, 86),  Color3.fromRGB(255, 150, 220),Color3.fromRGB(130, 220, 230),Color3.fromRGB(240, 80, 120)),
     }
-
-    local themeScroll = Instance.new("ScrollingFrame")
-    themeScroll.Size = UDim2.new(1, 0, 1, -94)
-    themeScroll.Position = UDim2.new(0, 0, 0, 94)
-    themeScroll.BackgroundTransparency = 1
-    themeScroll.BorderSizePixel = 0
-    themeScroll.ScrollBarThickness = 5
-    themeScroll.AutomaticCanvasSize = Enum.AutomaticSize.Y
-    themeScroll.Parent = settingsFrame
-
-    local themeListLayout = Instance.new("UIListLayout")
-    themeListLayout.SortOrder = Enum.SortOrder.LayoutOrder
-    themeListLayout.Padding = UDim.new(0, 6)
-    themeListLayout.Parent = themeScroll
-
-    local themeCards = {}
-
-    local function applyTheme(theme)
-        activeTheme = theme
-        CurrentThemeName = theme.name
-        saveSettings()
-
-        autoHatchMain.BackgroundColor3 = theme.background
-        autoHatchShadow.Color = theme.accent
-        autoTitle.TextColor3 = theme.accent
-
-        for btnName, btnObj in pairs({
-            Hatch = hatchTab,
-            Teleport = tpTab,
-            Settings = settingsTab,
-            Eggs = eggTab,
-            Farm = farmTab
-        }) do
-            if btnObj == currentTabBtn then
-                btnObj.BackgroundColor3 = theme.accent
-                btnObj.TextColor3 = theme.text
-            else
-                btnObj.BackgroundColor3 = theme.surface
-                btnObj.TextColor3 = theme.muted
-            end
-        end
-
-        statsContainer.BackgroundColor3 = theme.panel
-        recentPanel.BackgroundColor3 = theme.panel
-        afkRarePanel.BackgroundColor3 = theme.panel
-
-        SearchBox.BackgroundColor3 = theme.input
-        eggSearch.BackgroundColor3 = theme.input
-        keybindBox.BackgroundColor3 = theme.input
-        eggSelect.BackgroundColor3 = theme.surface
-        eggOptions.BackgroundColor3 = theme.surface
-        DropdownFrame.BackgroundColor3 = theme.surface
-        eggResults.BackgroundColor3 = theme.background
-
-        recentPanelStroke.Color = theme.stroke
-        afkRareStroke.Color = theme.stroke
-
-        for text, syncList in pairs(toggleRegistry) do
-            for _, syncFunc in ipairs(syncList) do
-                -- Trigger refresh on toggle element visual states
-            end
-        end
-
-        for name, cardData in pairs(themeCards) do
-            local isCurrent = (name == theme.name)
-            cardData.stroke.Color = isCurrent and theme.accent or theme.stroke
-            cardData.stroke.Thickness = isCurrent and 2 or 1
-            cardData.activeTag.Visible = isCurrent
-        end
-    end
-
-    for _, theme in ipairs(Themes) do
-        local card = Instance.new("TextButton")
-        card.Name = "ThemeCard_" .. theme.name
-        card.Size = UDim2.new(1, -8, 0, 46)
-        card.BackgroundColor3 = theme.background
-        card.Text = ""
-        card.AutoButtonColor = true
-        card.Parent = themeScroll
-
-        local cardCorner = Instance.new("UICorner")
-        cardCorner.CornerRadius = UDim.new(0, 8)
-        cardCorner.Parent = card
-
-        local isCurrent = (theme.name == CurrentThemeName)
-        local cardStroke = Instance.new("UIStroke")
-        cardStroke.Color = isCurrent and activeTheme.accent or theme.stroke
-        cardStroke.Thickness = isCurrent and 2 or 1
-        cardStroke.Parent = card
-
-        local innerPanel = Instance.new("Frame")
-        innerPanel.Size = UDim2.new(1, -8, 1, -8)
-        innerPanel.Position = UDim2.new(0, 4, 0, 4)
-        innerPanel.BackgroundColor3 = theme.panel
-        innerPanel.BorderSizePixel = 0
-        innerPanel.Parent = card
-
-        local innerCorner = Instance.new("UICorner")
-        innerCorner.CornerRadius = UDim.new(0, 6)
-        innerCorner.Parent = innerPanel
-
-        local nameLabel = Instance.new("TextLabel")
-        nameLabel.Size = UDim2.new(0.4, 0, 1, 0)
-        nameLabel.Position = UDim2.new(0, 10, 0, 0)
-        nameLabel.BackgroundTransparency = 1
-        nameLabel.Text = theme.name
-        nameLabel.TextColor3 = theme.text
-        nameLabel.Font = Enum.Font.GothamBold
-        nameLabel.TextSize = 13
-        nameLabel.TextXAlignment = Enum.TextXAlignment.Left
-        nameLabel.Parent = innerPanel
-
-        local activeTag = Instance.new("TextLabel")
-        activeTag.Size = UDim2.new(0.2, 0, 1, 0)
-        activeTag.Position = UDim2.new(0.38, 0, 0, 0)
-        activeTag.BackgroundTransparency = 1
-        activeTag.Text = "ACTIVE"
-        activeTag.TextColor3 = theme.accent
-        activeTag.Font = Enum.Font.GothamBold
-        activeTag.TextSize = 11
-        activeTag.TextXAlignment = Enum.TextXAlignment.Left
-        activeTag.Visible = isCurrent
-        activeTag.Parent = innerPanel
-
-        local swatchContainer = Instance.new("Frame")
-        swatchContainer.Size = UDim2.new(0, 110, 0, 20)
-        swatchContainer.Position = UDim2.new(1, -118, 0.5, -10)
-        swatchContainer.BackgroundTransparency = 1
-        swatchContainer.Parent = innerPanel
-
-        local swatchColors = { theme.background, theme.panel, theme.surface, theme.accent, theme.controlOn }
-        for idx, color in ipairs(swatchColors) do
-            local swatch = Instance.new("Frame")
-            swatch.Size = UDim2.new(0, 18, 0, 18)
-            swatch.Position = UDim2.new(0, (idx - 1) * 22, 0, 1)
-            swatch.BackgroundColor3 = color
-            swatch.BorderSizePixel = 0
-            swatch.Parent = swatchContainer
-
-            local sCorner = Instance.new("UICorner")
-            sCorner.CornerRadius = UDim.new(0, 4)
-            sCorner.Parent = swatch
-        end
-
-        themeCards[theme.name] = {
-            card = card,
-            stroke = cardStroke,
-            activeTag = activeTag,
-        }
-
-        card.MouseButton1Click:Connect(function()
-            applyTheme(theme)
-        end)
-    end
-
-    -- Initial Theme Apply
-    for _, theme in ipairs(Themes) do
-        if theme.name == CurrentThemeName then
-            applyTheme(theme)
-            break
-        end
-    end
 end)
