@@ -552,16 +552,32 @@ task.spawn(function()
     end
 
     local knownPets = {}
+    local afkSessionActive = false
+    local afkSessionCounts = {
+        Huges = 0,
+        Secrets = 0,
+        Titanics = 0,
+        Gargantuans = 0,
+    }
+    local startupCounts = {
+        Huges = 0,
+        Secrets = 0,
+        Titanics = 0,
+        Gargantuans = 0,
+    }
     local recentHuges = {}
     local recentSecrets = {}
     local recentTitanics = {}
     local recentGargantuans = {}
     local hatchRareLabels = {}
     local afkRareLabels = {}
+    local afkSessionLabels = {}
+    local startupLabels = {}
     local hatchRecentLists = {}
     local afkRecentLists = {}
     local renderHatchRecent = function() end
     local renderAfkRecent = function() end
+    local updateAfkSessionLabels = function() end
     local trackerInitialized = false
 
     local function renderRecent(listFrame, entries, color)
@@ -614,6 +630,12 @@ task.spawn(function()
                             local displayName = getPetDisplayName(pet)
                             local entry = { name = displayName, uid = uid }
 
+                            -- Only count newly discovered rare pets while AFK mode is active.
+                            startupCounts[category .. "s"] = (startupCounts[category .. "s"] or 0) + 1
+                            if afkSessionActive then
+                                afkSessionCounts[category .. "s"] = (afkSessionCounts[category .. "s"] or 0) + 1
+                            end
+
                             if category == "Huge" then
                                 table.insert(recentHuges, 1, entry)
                                 if #recentHuges > 5 then table.remove(recentHuges, 6) end
@@ -662,7 +684,9 @@ task.spawn(function()
         if afkRareLabels.Huges then afkRareLabels.Huges.Text = hugeLabel.Text end
         if afkRareLabels.Secrets then afkRareLabels.Secrets.Text = secretLabel.Text end
         if afkRareLabels.Titanics then afkRareLabels.Titanics.Text = titanicLabel.Text end
-        if afkRareLabels.Gargantuans then afkRareLabels.Gargantuans.Text = gargantuanLabel.Text end
+        if afkSessionActive then
+            updateAfkSessionLabels()
+        end
 
         if not trackerInitialized then
             trackerInitialized = true
@@ -1961,8 +1985,45 @@ task.spawn(function()
     local AutoBuying = false
     local ToggleKey = Enum.KeyCode[CurrentKeyName] or Enum.KeyCode.LeftControl
 
+    updateAfkSessionLabels = function()
+        local sessionLabels = {
+            Huges = afkSessionLabels.Huges,
+            Secrets = afkSessionLabels.Secrets,
+            Titanics = afkSessionLabels.Titanics,
+            Gargantuans = afkSessionLabels.Gargantuans,
+        }
+        local startupLabelSet = {
+            Huges = startupLabels.Huges,
+            Secrets = startupLabels.Secrets,
+            Titanics = startupLabels.Titanics,
+            Gargantuans = startupLabels.Gargantuans,
+        }
+
+        for key, label in pairs(sessionLabels) do
+            if label then
+                label.Text = "+" .. tostring(afkSessionCounts[key] or 0) .. " (this AFK session)"
+            end
+        end
+        for key, label in pairs(startupLabelSet) do
+            if label then
+                label.Text = "+" .. tostring(startupCounts[key] or 0) .. " (since startup)"
+            end
+        end
+    end
+
+    local function resetAfkSessionCounts()
+        afkSessionCounts.Huges = 0
+        afkSessionCounts.Secrets = 0
+        afkSessionCounts.Titanics = 0
+        afkSessionCounts.Gargantuans = 0
+        updateAfkSessionLabels()
+    end
+
     local function setAfkMode(enabled)
         pcall(function()
+            afkSessionActive = enabled
+            resetAfkSessionCounts()
+
             if enabled then
                 PotatoMode = true
                 RunService:Set3dRenderingEnabled(false)
@@ -2137,7 +2198,7 @@ task.spawn(function()
         column.Parent = afkRarePanel
 
         local countLabel = Instance.new("TextLabel")
-        countLabel.Size = UDim2.new(1, -6, 0, 36)
+        countLabel.Size = UDim2.new(1, -6, 0, 34)
         countLabel.Position = UDim2.new(0, 3, 0, 0)
         countLabel.BackgroundTransparency = 1
         countLabel.Text = category.name .. ": 0"
@@ -2148,9 +2209,33 @@ task.spawn(function()
         countLabel.Parent = column
         afkRareLabels[category.name .. "s"] = countLabel
 
+        local sessionLabel = Instance.new("TextLabel")
+        sessionLabel.Size = UDim2.new(1, -6, 0, 28)
+        sessionLabel.Position = UDim2.new(0, 3, 0, 32)
+        sessionLabel.BackgroundTransparency = 1
+        sessionLabel.Text = "+0 (this AFK session)"
+        sessionLabel.TextColor3 = category.color
+        sessionLabel.Font = Enum.Font.GothamBold
+        sessionLabel.TextSize = 20
+        sessionLabel.TextXAlignment = Enum.TextXAlignment.Left
+        sessionLabel.Parent = column
+        afkSessionLabels[category.name .. "s"] = sessionLabel
+
+        local startupLabel = Instance.new("TextLabel")
+        startupLabel.Size = UDim2.new(1, -6, 0, 28)
+        startupLabel.Position = UDim2.new(0, 3, 0, 58)
+        startupLabel.BackgroundTransparency = 1
+        startupLabel.Text = "+0 (since startup)"
+        startupLabel.TextColor3 = category.color
+        startupLabel.Font = Enum.Font.GothamBold
+        startupLabel.TextSize = 20
+        startupLabel.TextXAlignment = Enum.TextXAlignment.Left
+        startupLabel.Parent = column
+        startupLabels[category.name .. "s"] = startupLabel
+
         local list = Instance.new("Frame")
-        list.Size = UDim2.new(1, -6, 1, -40)
-        list.Position = UDim2.new(0, 3, 0, 40)
+        list.Size = UDim2.new(1, -6, 1, -94)
+        list.Position = UDim2.new(0, 3, 0, 90)
         list.BackgroundTransparency = 1
         list.Parent = column
         afkRecentLists[category.name] = { frame = list, entries = category.entries, color = category.color }
@@ -2158,8 +2243,8 @@ task.spawn(function()
 
     for index = 1, 3 do
         local divider = Instance.new("Frame")
-        divider.Size = UDim2.new(0, 1, 1, -70)
-        divider.Position = UDim2.new(index * 0.25, 0, 0, 60)
+        divider.Size = UDim2.new(0, 1, 1, -100)
+        divider.Position = UDim2.new(index * 0.25, 0, 0, 90)
         divider.BackgroundColor3 = activeTheme.stroke
         divider.BackgroundTransparency = 0.35
         divider.BorderSizePixel = 0
@@ -2255,18 +2340,28 @@ task.spawn(function()
     task.spawn(hookLeaderstats)
 
     -- OPTIMIZED HATCH LOOP
+    -- Keep the same hatch behavior, but avoid stacking concurrent RemoteFunction
+    -- calls. That can build up network/server work and cause ping spikes/freezes.
     local BATCH_SIZE = 3
+    local HATCH_REQUEST_GAP = 0.08
+    local HATCH_BATCH_GAP = 0.15
     task.spawn(function()
         while true do
             if AutoBuying and SelectedEggId and BuyEggRemote then
                 for i = 1, BATCH_SIZE do
-                    task.spawn(function()
-                        pcall(function()
-                            BuyEggRemote:InvokeServer(SelectedEggId, false, false, true)
-                        end)
+                    if not AutoBuying or not SelectedEggId or not BuyEggRemote then
+                        break
+                    end
+
+                    pcall(function()
+                        BuyEggRemote:InvokeServer(SelectedEggId, false, false, true)
                     end)
+
+                    if i < BATCH_SIZE then
+                        task.wait(HATCH_REQUEST_GAP)
+                    end
                 end
-                task.wait(0.1)
+                task.wait(HATCH_BATCH_GAP)
             else
                 task.wait(0.1)
             end
