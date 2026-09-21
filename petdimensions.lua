@@ -1232,13 +1232,15 @@ task.spawn(function()
     createUnifiedToggle(farmFrame, 32, "🤖 Robot Farm", false, function(state) AutoFarmRobot = state end)
     createUnifiedToggle(farmFrame, 74, "🦃 Turkey/Boss Farm", false, function(state) 
         AutoFarmTurkey = state
+    end)
+    createUnifiedToggle(farmFrame, 116, "🛡️ Auto Dodge", false, function(state) 
         TurkeyDodgeActive = state
     end)
-    createUnifiedToggle(farmFrame, 116, "⭐ Auto Tokens", false, function(state) AutoTokens = state end)
+    createUnifiedToggle(farmFrame, 158, "⭐ Auto Tokens", false, function(state) AutoTokens = state end)
 
     local farmStatus = Instance.new("TextLabel")
     farmStatus.Size = UDim2.new(1, 0, 0, 28)
-    farmStatus.Position = UDim2.new(0, 0, 0, 160)
+    farmStatus.Position = UDim2.new(0, 0, 0, 202)
     farmStatus.BackgroundTransparency = 1
     farmStatus.Text = "Status: Idle"
     farmStatus.TextColor3 = Color3.fromRGB(180, 180, 180)
