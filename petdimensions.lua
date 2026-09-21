@@ -380,8 +380,14 @@ task.spawn(function()
     ui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
     ui.Parent = playerGui
 
-    -- Resolution-friendly scaling: the whole UI scales down on smaller
-    -- displays while keeping the original design size on larger displays.
+    -- =====================================================================
+    -- RESPONSIVE / MOBILE UI SCALING
+    -- The original UI is designed around a 620x710 hub. Instead of using a
+    -- fixed 16:9 scale (which overflows on phones), scale from the actual
+    -- viewport and leave a small safe margin on every side. This keeps the
+    -- entire hub on-screen in portrait, landscape, tablets, laptops and
+    -- ultrawide displays.
+    -- =====================================================================
     local uiScale = Instance.new("UIScale")
     uiScale.Scale = 1
     uiScale.Parent = ui
@@ -389,20 +395,34 @@ task.spawn(function()
     local function updateUIScale()
         local camera = Workspace.CurrentCamera
         if not camera then return end
+
         local viewport = camera.ViewportSize
-        local scale = math.min(viewport.X / 1920, viewport.Y / 1080)
-        uiScale.Scale = math.clamp(scale, 0.65, 1)
+        local safeWidth = math.max(viewport.X - 20, 1)
+        local safeHeight = math.max(viewport.Y - 20, 1)
+
+        -- The largest UI panel is 950x780 (the AFK overlay). Fit the
+        -- COMPLETE UI canvas, not just the 620x710 main hub, so every
+        -- panel can remain on-screen even on small portrait phones.
+        local DESIGN_WIDTH = 950
+        local DESIGN_HEIGHT = 780
+        local scaleX = safeWidth / DESIGN_WIDTH
+        local scaleY = safeHeight / DESIGN_HEIGHT
+        local scale = math.min(scaleX, scaleY, 1)
+
+        -- Never use a hard minimum that could make the UI overflow on an
+        -- unusually small viewport. A tiny viewport simply gets a smaller UI.
+        uiScale.Scale = math.max(scale, 0.10)
     end
 
-    updateUIScale()
-    if Workspace.CurrentCamera then
-        Workspace.CurrentCamera:GetPropertyChangedSignal("ViewportSize"):Connect(updateUIScale)
+    local function hookCamera(camera)
+        if not camera then return end
+        updateUIScale()
+        camera:GetPropertyChangedSignal("ViewportSize"):Connect(updateUIScale)
     end
+
+    hookCamera(Workspace.CurrentCamera)
     Workspace:GetPropertyChangedSignal("CurrentCamera"):Connect(function()
-        if Workspace.CurrentCamera then
-            updateUIScale()
-            Workspace.CurrentCamera:GetPropertyChangedSignal("ViewportSize"):Connect(updateUIScale)
-        end
+        hookCamera(Workspace.CurrentCamera)
     end)
 
     -- UNTOUCHED HUGES COUNTER TRACKER
