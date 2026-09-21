@@ -99,18 +99,110 @@ local function GetNextRobot()
     return nil
 end
 
-local function FindTurkey()
-    local coins = Workspace:FindFirstChild("__THINGS") and Workspace.__THINGS:FindFirstChild("Coins")
-    if not coins then return nil end
-    for _, child in ipairs(coins:GetChildren()) do
-        if not child.Parent then continue end
-        local name = (child:GetAttribute("Name") or child:GetAttribute("Mob") or child.Name):lower()
-        if name:find("turkey") or name:find("autumn") or (name:find("boss") and (name:find("turkey") or name:find("autumn"))) then
-            return child
+-- The Autumn Boss client script shows that the Turkey is not necessarily a
+-- direct child of __THINGS.Coins, and that the boss is announced globally
+-- through the "Autumn Boss: Begin" / "Autumn Boss: Sync" network messages.
+local AutumnBossActive = false
+local AutumnBossState = nil
+
+local function IsTurkeyInstance(instance)
+    if not instance or not instance.Parent then return false end
+
+    local values = {
+        instance.Name,
+        instance:GetAttribute("Name"),
+        instance:GetAttribute("Mob"),
+        instance:GetAttribute("DisplayName"),
+    }
+
+    for _, value in ipairs(values) do
+        if value ~= nil then
+            local text = tostring(value):lower()
+            if text:find("pilgrim turkey", 1, true)
+                or text == "turkey"
+                or text:find("turkey", 1, true)
+                or text:find("autumn boss", 1, true)
+                or (text:find("autumn", 1, true) and text:find("boss", 1, true)) then
+                return true
+            end
         end
     end
+
+    return false
+end
+
+local function SearchForTurkey(root)
+    if not root then return nil end
+
+    if IsTurkeyInstance(root) then
+        return root
+    end
+
+    for _, descendant in ipairs(root:GetDescendants()) do
+        if IsTurkeyInstance(descendant) then
+            return descendant
+        end
+    end
+
     return nil
 end
+
+local function FindTurkey()
+    -- Search the normal coin hierarchy recursively instead of only checking
+    -- direct children. This handles nested Turkey instances.
+    local things = Workspace:FindFirstChild("__THINGS")
+    local coins = things and things:FindFirstChild("Coins")
+
+    local target = SearchForTurkey(coins)
+    if target then
+        return target
+    end
+
+    -- Fallback for versions where the boss is exposed elsewhere under
+    -- __THINGS.
+    target = SearchForTurkey(things)
+    if target then
+        return target
+    end
+
+    -- The game's Autumn Boss client creates this folder for boss FX/minions.
+    -- Only use an actual Turkey-named instance here; do not treat arbitrary
+    -- FX as the damage target.
+    if AutumnBossActive then
+        local fx = Workspace:FindFirstChild("__AUTUMNBOSS_FX")
+        target = SearchForTurkey(fx)
+        if target then
+            return target
+        end
+    end
+
+    return nil
+end
+
+-- Use the same boss lifecycle messages shown in the supplied Autumn Boss
+-- script. This tells the farm that the boss exists even when it is far away.
+pcall(function()
+    Library.Network.Fired("Autumn Boss: Begin"):Connect(function(data)
+        AutumnBossActive = true
+        AutumnBossState = data
+    end)
+
+    Library.Network.Fired("Autumn Boss: End"):Connect(function()
+        AutumnBossActive = false
+        AutumnBossState = nil
+    end)
+end)
+
+task.spawn(function()
+    task.wait(3)
+    if not AutumnBossActive then
+        local ok, result = pcall(Library.Network.Invoke, "Autumn Boss: Sync")
+        if ok and type(result) == "table" then
+            AutumnBossActive = true
+            AutumnBossState = result
+        end
+    end
+end)
 
 local function FocusPetsContinuous(coinInstance)
     if not coinInstance or not coinInstance.Parent then return end
