@@ -99,110 +99,18 @@ local function GetNextRobot()
     return nil
 end
 
--- The Autumn Boss client script shows that the Turkey is not necessarily a
--- direct child of __THINGS.Coins, and that the boss is announced globally
--- through the "Autumn Boss: Begin" / "Autumn Boss: Sync" network messages.
-local AutumnBossActive = false
-local AutumnBossState = nil
-
-local function IsTurkeyInstance(instance)
-    if not instance or not instance.Parent then return false end
-
-    local values = {
-        instance.Name,
-        instance:GetAttribute("Name"),
-        instance:GetAttribute("Mob"),
-        instance:GetAttribute("DisplayName"),
-    }
-
-    for _, value in ipairs(values) do
-        if value ~= nil then
-            local text = tostring(value):lower()
-            if text:find("pilgrim turkey", 1, true)
-                or text == "turkey"
-                or text:find("turkey", 1, true)
-                or text:find("autumn boss", 1, true)
-                or (text:find("autumn", 1, true) and text:find("boss", 1, true)) then
-                return true
-            end
-        end
-    end
-
-    return false
-end
-
-local function SearchForTurkey(root)
-    if not root then return nil end
-
-    if IsTurkeyInstance(root) then
-        return root
-    end
-
-    for _, descendant in ipairs(root:GetDescendants()) do
-        if IsTurkeyInstance(descendant) then
-            return descendant
-        end
-    end
-
-    return nil
-end
-
 local function FindTurkey()
-    -- Search the normal coin hierarchy recursively instead of only checking
-    -- direct children. This handles nested Turkey instances.
-    local things = Workspace:FindFirstChild("__THINGS")
-    local coins = things and things:FindFirstChild("Coins")
-
-    local target = SearchForTurkey(coins)
-    if target then
-        return target
-    end
-
-    -- Fallback for versions where the boss is exposed elsewhere under
-    -- __THINGS.
-    target = SearchForTurkey(things)
-    if target then
-        return target
-    end
-
-    -- The game's Autumn Boss client creates this folder for boss FX/minions.
-    -- Only use an actual Turkey-named instance here; do not treat arbitrary
-    -- FX as the damage target.
-    if AutumnBossActive then
-        local fx = Workspace:FindFirstChild("__AUTUMNBOSS_FX")
-        target = SearchForTurkey(fx)
-        if target then
-            return target
+    local coins = Workspace:FindFirstChild("__THINGS") and Workspace.__THINGS:FindFirstChild("Coins")
+    if not coins then return nil end
+    for _, child in ipairs(coins:GetChildren()) do
+        if not child.Parent then continue end
+        local name = (child:GetAttribute("Name") or child:GetAttribute("Mob") or child.Name):lower()
+        if name:find("turkey") or name:find("autumn") or (name:find("boss") and (name:find("turkey") or name:find("autumn"))) then
+            return child
         end
     end
-
     return nil
 end
-
--- Use the same boss lifecycle messages shown in the supplied Autumn Boss
--- script. This tells the farm that the boss exists even when it is far away.
-pcall(function()
-    Library.Network.Fired("Autumn Boss: Begin"):Connect(function(data)
-        AutumnBossActive = true
-        AutumnBossState = data
-    end)
-
-    Library.Network.Fired("Autumn Boss: End"):Connect(function()
-        AutumnBossActive = false
-        AutumnBossState = nil
-    end)
-end)
-
-task.spawn(function()
-    task.wait(3)
-    if not AutumnBossActive then
-        local ok, result = pcall(Library.Network.Invoke, "Autumn Boss: Sync")
-        if ok and type(result) == "table" then
-            AutumnBossActive = true
-            AutumnBossState = result
-        end
-    end
-end)
 
 local function FocusPetsContinuous(coinInstance)
     if not coinInstance or not coinInstance.Parent then return end
@@ -377,6 +285,73 @@ task.spawn(function()
         if PotatoMode and (AutoFarmRobot or AutoFarmTurkey) and CurrentTarget and CurrentTarget.Parent then
             FocusPetsContinuous(CurrentTarget)
         end
+    end
+end)
+
+-- =====================================================================
+-- EGG OPENING ANIMATION BYPASS
+-- Hooks the actual "Egg Opening Frontend" PlayEggAnimation function.
+-- The game's PlayTrigger still fires, so auto-hatch continues normally;
+-- only the visual animation function is skipped.
+-- =====================================================================
+task.spawn(function()
+    local function installEggAnimationBypass()
+        local Players = game:GetService("Players")
+        local player = Players.LocalPlayer
+        if not player then return false end
+
+        local playerScripts = player:FindFirstChild("PlayerScripts")
+        if not playerScripts then return false end
+
+        local gameFolder = playerScripts:FindFirstChild("Scripts")
+            and playerScripts.Scripts:FindFirstChild("Game")
+        if not gameFolder then return false end
+
+        local frontend = gameFolder:FindFirstChild("Egg Opening Frontend")
+        if not frontend then return false end
+
+        if type(getsenv) ~= "function" or type(hookfunction) ~= "function" then
+            warn("[Egg Animation] Executor does not expose getsenv/hookfunction")
+            return false
+        end
+
+        local ok, env = pcall(getsenv, frontend)
+        if not ok or type(env) ~= "table" then
+            return false
+        end
+
+        local playAnimation = env.PlayEggAnimation
+        if type(playAnimation) ~= "function" then
+            return false
+        end
+
+        if env.__NoEggAnimationInstalled then
+            return true
+        end
+
+        local function skipEggAnimation()
+            -- Return immediately. The original PlayTrigger handler then
+            -- continues to unhide the pets and fires CompletedHatching.
+            return true
+        end
+
+        local hooked = pcall(function()
+            hookfunction(playAnimation, skipEggAnimation)
+        end)
+
+        if hooked then
+            env.__NoEggAnimationInstalled = true
+            return true
+        end
+
+        return false
+    end
+
+    for _ = 1, 100 do
+        if installEggAnimationBypass() then
+            break
+        end
+        task.wait(0.1)
     end
 end)
 
@@ -1324,15 +1299,13 @@ task.spawn(function()
     createUnifiedToggle(farmFrame, 32, "🤖 Robot Farm", false, function(state) AutoFarmRobot = state end)
     createUnifiedToggle(farmFrame, 74, "🦃 Turkey/Boss Farm", false, function(state) 
         AutoFarmTurkey = state
-    end)
-    createUnifiedToggle(farmFrame, 116, "🛡️ Auto Dodge", false, function(state) 
         TurkeyDodgeActive = state
     end)
-    createUnifiedToggle(farmFrame, 158, "⭐ Auto Tokens", false, function(state) AutoTokens = state end)
+    createUnifiedToggle(farmFrame, 116, "⭐ Auto Tokens", false, function(state) AutoTokens = state end)
 
     local farmStatus = Instance.new("TextLabel")
     farmStatus.Size = UDim2.new(1, 0, 0, 28)
-    farmStatus.Position = UDim2.new(0, 0, 0, 202)
+    farmStatus.Position = UDim2.new(0, 0, 0, 160)
     farmStatus.BackgroundTransparency = 1
     farmStatus.Text = "Status: Idle"
     farmStatus.TextColor3 = Color3.fromRGB(180, 180, 180)
