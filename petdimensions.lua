@@ -397,21 +397,22 @@ task.spawn(function()
         if not camera then return end
 
         local viewport = camera.ViewportSize
-        local safeWidth = math.max(viewport.X - 20, 1)
-        local safeHeight = math.max(viewport.Y - 20, 1)
+        if viewport.X <= 1 or viewport.Y <= 1 then return end
 
-        -- The largest UI panel is 950x780 (the AFK overlay). Fit the
-        -- COMPLETE UI canvas, not just the 620x710 main hub, so every
-        -- panel can remain on-screen even on small portrait phones.
-        local DESIGN_WIDTH = 950
-        local DESIGN_HEIGHT = 780
+        -- Scale against the MAIN HUB, not the AFK overlay.  The AFK overlay
+        -- is full-screen and has its own responsive controls below.
+        -- This keeps the normal UI usable on phones instead of making it
+        -- unnecessarily tiny while still guaranteeing it fits.
+        local safeWidth = math.max(viewport.X - 16, 1)
+        local safeHeight = math.max(viewport.Y - 16, 1)
+        local DESIGN_WIDTH = 620
+        local DESIGN_HEIGHT = 710
         local scaleX = safeWidth / DESIGN_WIDTH
         local scaleY = safeHeight / DESIGN_HEIGHT
         local scale = math.min(scaleX, scaleY, 1)
 
-        -- Never use a hard minimum that could make the UI overflow on an
-        -- unusually small viewport. A tiny viewport simply gets a smaller UI.
-        uiScale.Scale = math.max(scale, 0.10)
+        -- Never let a minimum scale force the UI outside the viewport.
+        uiScale.Scale = math.max(scale, 0.05)
     end
 
     local function hookCamera(camera)
@@ -775,19 +776,20 @@ task.spawn(function()
     blackFill.Parent = afkOverlay
 
     local afkCenter = Instance.new("Frame")
-    afkCenter.Size = UDim2.new(0, 950, 0, 780)
+    afkCenter.Size = UDim2.new(0.94, 0, 0.90, 0)
     afkCenter.AnchorPoint = Vector2.new(0.5, 0.5)
-    afkCenter.Position = UDim2.new(0.5, 0, 0.5, 0)
+    afkCenter.Position = UDim2.new(0.5, 0, 0.46, 0)
     afkCenter.BackgroundTransparency = 1
     afkCenter.ZIndex = 102
     afkCenter.Parent = afkOverlay
 
     local afkTitle = Instance.new("TextLabel")
-    afkTitle.Size = UDim2.new(1, 0, 0, 80)
+    afkTitle.Size = UDim2.new(1, 0, 0, 70)
     afkTitle.Text = "AFK MODE ACTIVE"
     afkTitle.TextColor3 = Color3.fromRGB(255, 90, 90)
     afkTitle.Font = Enum.Font.GothamBlack
     afkTitle.TextSize = 64
+    afkTitle.TextScaled = true
     afkTitle.BackgroundTransparency = 1
     afkTitle.TextXAlignment = Enum.TextXAlignment.Center
     afkTitle.ZIndex = 102
@@ -800,6 +802,7 @@ task.spawn(function()
     afkEggs.TextColor3 = Color3.fromRGB(80, 230, 80)
     afkEggs.Font = Enum.Font.GothamSemibold
     afkEggs.TextSize = 42
+    afkEggs.TextScaled = true
     afkEggs.BackgroundTransparency = 1
     afkEggs.TextXAlignment = Enum.TextXAlignment.Center
     afkEggs.ZIndex = 102
@@ -812,19 +815,24 @@ task.spawn(function()
     afkGems.TextColor3 = Color3.fromRGB(110, 185, 255)
     afkGems.Font = Enum.Font.GothamSemibold
     afkGems.TextSize = 42
+    afkGems.TextScaled = true
     afkGems.BackgroundTransparency = 1
     afkGems.TextXAlignment = Enum.TextXAlignment.Center
     afkGems.ZIndex = 102
     afkGems.Parent = afkCenter
 
     local afkExit = Instance.new("TextButton")
-    afkExit.Size = UDim2.new(1, 0, 0, 80)
-    afkExit.Position = UDim2.new(0, 0, 0, 680)
+    -- This button is anchored to the actual screen, not the old 950x780
+    -- design canvas, so it is ALWAYS reachable on a phone.
+    afkExit.Size = UDim2.new(0.72, 0, 0, 64)
+    afkExit.AnchorPoint = Vector2.new(0.5, 1)
+    afkExit.Position = UDim2.new(0.5, 0, 0.96, 0)
     afkExit.Text = "Turn Off AFK Mode"
     afkExit.TextColor3 = Color3.fromRGB(255, 255, 255)
     afkExit.BackgroundColor3 = Color3.fromRGB(200, 50, 50)
     afkExit.Font = Enum.Font.GothamSemibold
     afkExit.TextSize = 32
+    afkExit.TextScaled = true
     afkExit.ZIndex = 102
     afkExit.Parent = afkCenter
 
@@ -2572,6 +2580,48 @@ task.spawn(function()
     keybindStroke.Transparency = 0.7
     keybindStroke.Parent = keybindBtn
 
+    -- MOBILE UI TOGGLE
+    -- Phones do not have the configured keyboard key, so provide a large
+    -- touch button that remains available even when the main UI is hidden.
+    local mobileToggle = Instance.new("TextButton")
+    mobileToggle.Name = "MobileUIToggle"
+    mobileToggle.Size = UDim2.new(0, 58, 0, 58)
+    mobileToggle.AnchorPoint = Vector2.new(1, 1)
+    mobileToggle.Position = UDim2.new(1, -12, 1, -12)
+    mobileToggle.BackgroundColor3 = Color3.fromRGB(32, 32, 42)
+    mobileToggle.TextColor3 = Color3.fromRGB(255, 255, 255)
+    mobileToggle.Text = "UI"
+    mobileToggle.Font = Enum.Font.GothamBold
+    mobileToggle.TextSize = 18
+    mobileToggle.ZIndex = 1000
+    mobileToggle.AutoButtonColor = true
+    mobileToggle.Parent = ui
+
+    local mobileToggleCorner = Instance.new("UICorner")
+    mobileToggleCorner.CornerRadius = UDim.new(1, 0)
+    mobileToggleCorner.Parent = mobileToggle
+
+    local mobileToggleStroke = Instance.new("UIStroke")
+    mobileToggleStroke.Thickness = 2
+    mobileToggleStroke.Transparency = 0.25
+    mobileToggleStroke.Parent = mobileToggle
+
+    local function toggleMainUI()
+        if afkOverlay.Visible then
+            return
+        end
+        autoHatchMain.Visible = not autoHatchMain.Visible
+        mobileToggle.Text = autoHatchMain.Visible and "UI" or "OPEN"
+    end
+
+    mobileToggle.Activated:Connect(toggleMainUI)
+
+    -- Hide the touch button while AFK is active; the dedicated AFK exit
+    -- button remains visible and reachable.
+    afkOverlay:GetPropertyChangedSignal("Visible"):Connect(function()
+        mobileToggle.Visible = not afkOverlay.Visible
+    end)
+
     local listeningForKey = false
     keybindBtn.MouseButton1Click:Connect(function()
         listeningForKey = true
@@ -2586,9 +2636,7 @@ task.spawn(function()
             keybindBtn.Text = "Current Key: " .. CurrentKeyName
             saveSettings()
         elseif not gameProcessed and input.UserInputType == Enum.UserInputType.Keyboard and input.KeyCode == ToggleKey then
-            if not afkOverlay.Visible then
-                autoHatchMain.Visible = not autoHatchMain.Visible
-            end
+            toggleMainUI()
         end
     end)
 
