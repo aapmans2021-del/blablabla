@@ -380,6 +380,31 @@ task.spawn(function()
     ui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
     ui.Parent = playerGui
 
+    -- Resolution-friendly scaling: the whole UI scales down on smaller
+    -- displays while keeping the original design size on larger displays.
+    local uiScale = Instance.new("UIScale")
+    uiScale.Scale = 1
+    uiScale.Parent = ui
+
+    local function updateUIScale()
+        local camera = Workspace.CurrentCamera
+        if not camera then return end
+        local viewport = camera.ViewportSize
+        local scale = math.min(viewport.X / 1920, viewport.Y / 1080)
+        uiScale.Scale = math.clamp(scale, 0.65, 1)
+    end
+
+    updateUIScale()
+    if Workspace.CurrentCamera then
+        Workspace.CurrentCamera:GetPropertyChangedSignal("ViewportSize"):Connect(updateUIScale)
+    end
+    Workspace:GetPropertyChangedSignal("CurrentCamera"):Connect(function()
+        if Workspace.CurrentCamera then
+            updateUIScale()
+            Workspace.CurrentCamera:GetPropertyChangedSignal("ViewportSize"):Connect(updateUIScale)
+        end
+    end)
+
     -- UNTOUCHED HUGES COUNTER TRACKER
     local tracker = Instance.new("Frame")
     tracker.Name = "PetCounterTracker"
@@ -2382,6 +2407,41 @@ task.spawn(function()
     tpTitle.TextXAlignment = Enum.TextXAlignment.Left
     tpTitle.Parent = tpFrame
 
+    local tpTip = Instance.new("TextLabel")
+    tpTip.Size = UDim2.new(1, 0, 0, 42)
+    tpTip.Position = UDim2.new(0, 0, 0, 24)
+    tpTip.BackgroundTransparency = 1
+    tpTip.Text = "⚠ Only teleport to the spots in the same world as you are currently in. It will glitch if you teleport to a different world."
+    tpTip.TextColor3 = Color3.fromRGB(255, 190, 80)
+    tpTip.Font = Enum.Font.GothamSemibold
+    tpTip.TextSize = 11
+    tpTip.TextWrapped = true
+    tpTip.TextXAlignment = Enum.TextXAlignment.Left
+    tpTip.TextYAlignment = Enum.TextYAlignment.Center
+    tpTip.Parent = tpFrame
+
+    -- Scrolling keeps the teleport list usable on smaller resolutions.
+    local tpScroll = Instance.new("ScrollingFrame")
+    tpScroll.Size = UDim2.new(1, 0, 1, -72)
+    tpScroll.Position = UDim2.new(0, 0, 0, 72)
+    tpScroll.BackgroundTransparency = 1
+    tpScroll.BorderSizePixel = 0
+    tpScroll.ScrollBarThickness = 5
+    tpScroll.ScrollBarImageTransparency = 0.35
+    tpScroll.AutomaticCanvasSize = Enum.AutomaticSize.Y
+    tpScroll.CanvasSize = UDim2.new(0, 0, 0, 0)
+    tpScroll.ScrollingDirection = Enum.ScrollingDirection.Y
+    tpScroll.Parent = tpFrame
+
+    local tpLayout = Instance.new("UIListLayout")
+    tpLayout.SortOrder = Enum.SortOrder.LayoutOrder
+    tpLayout.Padding = UDim.new(0, 6)
+    tpLayout.Parent = tpScroll
+
+    local tpPadding = Instance.new("UIPadding")
+    tpPadding.PaddingBottom = UDim.new(0, 8)
+    tpPadding.Parent = tpScroll
+
     local function teleportTo(x, y, z)
         local character = localPlayer.Character
         if character and character:FindFirstChild("HumanoidRootPart") then
@@ -2389,15 +2449,30 @@ task.spawn(function()
         end
     end
 
-    local function createTeleportButton(parent, yPos, name, coords)
+    local function createTeleportSection(parent, name)
+        local section = Instance.new("TextLabel")
+        section.Size = UDim2.new(1, -8, 0, 24)
+        section.BackgroundTransparency = 1
+        section.Text = name
+        section.TextColor3 = activeTheme.accent
+        section.Font = Enum.Font.GothamBold
+        section.TextSize = 13
+        section.TextXAlignment = Enum.TextXAlignment.Left
+        section.LayoutOrder = #parent:GetChildren() + 1
+        section.Parent = parent
+        return section
+    end
+
+    local function createTeleportButton(parent, name, coords)
         local button = Instance.new("TextButton")
-        button.Size = UDim2.new(1, 0, 0, 34)
-        button.Position = UDim2.new(0, 0, 0, yPos)
+        button.Size = UDim2.new(1, -8, 0, 34)
         button.BackgroundColor3 = activeTheme.surface
         button.Text = "📍 Teleport to " .. name
         button.TextColor3 = Color3.fromRGB(255, 255, 255)
         button.Font = Enum.Font.GothamBold
         button.TextSize = 13
+        button.TextScaled = false
+        button.LayoutOrder = #parent:GetChildren() + 1
         button.Parent = parent
 
         local btnCorner = Instance.new("UICorner")
@@ -2415,10 +2490,22 @@ task.spawn(function()
         end)
     end
 
-    createTeleportButton(tpFrame, 32, "World 1 Spawn", {267, 98, 238})
-    createTeleportButton(tpFrame, 74, "Fantasy Spawn", {-7568, 558, -1683})
-    createTeleportButton(tpFrame, 116, "Tech Spawn", {-9977, 16, 9601})
-    createTeleportButton(tpFrame, 158, "Last Area", {-7997, 16, 9609})
+    -- World 1
+    createTeleportSection(tpScroll, "World 1")
+    createTeleportButton(tpScroll, "World 1 Spawn", {267, 98, 238})
+    createTeleportButton(tpScroll, "World 1 Last Area", {-3691, 142, 232})
+
+    -- Fantasy World
+    createTeleportSection(tpScroll, "Fantasy World")
+    createTeleportButton(tpScroll, "Fantasy Spawn", {-7568, 558, -1683})
+    createTeleportButton(tpScroll, "Moon Egg", {-7765, 639, -1247})
+    createTeleportButton(tpScroll, "Crystal Chest", {-5283, 583, -2271})
+    createTeleportButton(tpScroll, "Fantasy Last Area", {-4857, 558, -1679})
+
+    -- Tech World
+    createTeleportSection(tpScroll, "Tech World")
+    createTeleportButton(tpScroll, "Tech Spawn", {-9977, 16, 9601})
+    createTeleportButton(tpScroll, "Tech Last Area", {-7997, 16, 9609})
 
     -- =====================================================================
     -- SETTINGS TAB UI & EXTENDED THEME SWITCHER
