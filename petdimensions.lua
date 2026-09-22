@@ -265,166 +265,6 @@ task.spawn(function()
         end
     end
 end)
-task.spawn(function()
-    local installed = false
-
-    local function tryInstallEggAnimationBypass()
-        if installed then
-            return true
-        end
-        if type(getgc) == "function" and type(hookfunction) == "function" then
-            local ok, result = pcall(function()
-                local player = Players.LocalPlayer
-                local playerScripts = player and player:FindFirstChild("PlayerScripts")
-                local gameFolder = playerScripts
-                    and playerScripts:FindFirstChild("Scripts")
-                    and playerScripts.Scripts:FindFirstChild("Game")
-                local frontend = gameFolder and gameFolder:FindFirstChild("Egg Opening Frontend")
-
-                if not frontend then
-                    return false
-                end
-
-                for _, fn in ipairs(getgc(true)) do
-                    if type(fn) == "function" then
-                        local name = ""
-                        local source = ""
-
-                        if type(debug) == "table" and type(debug.info) == "function" then
-                            pcall(function()
-                                name = debug.info(fn, "n") or ""
-                                source = debug.info(fn, "s") or ""
-                            end)
-                        end
-
-                        if name == "PlayEggAnimation"
-                            and (source == "" or source:find("Egg Opening Frontend", 1, true)) then
-
-                            local hookOk = pcall(function()
-                                hookfunction(fn, function(...)
-                                    return true
-                                end)
-                            end)
-
-                            if hookOk then
-                                return true
-                            end
-                        end
-                    end
-                end
-
-                return false
-            end)
-
-            if ok and result then
-                installed = true
-                return true
-            end
-        end
-        if type(getsenv) == "function" and type(hookfunction) == "function" then
-            local ok, result = pcall(function()
-                local player = Players.LocalPlayer
-                local playerScripts = player and player:FindFirstChild("PlayerScripts")
-                local gameFolder = playerScripts
-                    and playerScripts:FindFirstChild("Scripts")
-                    and playerScripts.Scripts:FindFirstChild("Game")
-                local frontend = gameFolder and gameFolder:FindFirstChild("Egg Opening Frontend")
-
-                if not frontend then
-                    return false
-                end
-
-                local env = getsenv(frontend)
-                local fn = type(env) == "table" and env.PlayEggAnimation
-
-                if type(fn) ~= "function" then
-                    return false
-                end
-
-                hookfunction(fn, function(...)
-                    return true
-                end)
-
-                return true
-            end)
-
-            if ok and result then
-                installed = true
-                return true
-            end
-        end
-
-        return false
-    end
-    for _ = 1, 120 do
-        if tryInstallEggAnimationBypass() then
-            break
-        end
-        task.wait(0.25)
-    end
-
-    if not installed then
-        warn("[Egg Animation] Could not locate PlayEggAnimation; hatch loop will remain untouched.")
-    end
-end)
-task.spawn(function()
-    local function installEggAnimationBypass()
-        local Players = game:GetService("Players")
-        local player = Players.LocalPlayer
-        if not player then return false end
-
-        local playerScripts = player:FindFirstChild("PlayerScripts")
-        if not playerScripts then return false end
-
-        local gameFolder = playerScripts:FindFirstChild("Scripts")
-            and playerScripts.Scripts:FindFirstChild("Game")
-        if not gameFolder then return false end
-
-        local frontend = gameFolder:FindFirstChild("Egg Opening Frontend")
-        if not frontend then return false end
-
-        if type(getsenv) ~= "function" or type(hookfunction) ~= "function" then
-            warn("[Egg Animation] Executor does not expose getsenv/hookfunction")
-            return false
-        end
-
-        local ok, env = pcall(getsenv, frontend)
-        if not ok or type(env) ~= "table" then
-            return false
-        end
-
-        local playAnimation = env.PlayEggAnimation
-        if type(playAnimation) ~= "function" then
-            return false
-        end
-
-        if env.__NoEggAnimationInstalled then
-            return true
-        end
-
-        local function skipEggAnimation()
-            return true
-        end
-
-        local hooked = pcall(function()
-            hookfunction(playAnimation, skipEggAnimation)
-        end)
-
-        if hooked then
-            env.__NoEggAnimationInstalled = true
-            return true
-        end
-
-        return false
-    end
-
-    for _ = 1, 100 do
-        if installEggAnimationBypass() then
-            break
-        end
-        task.wait(0.1)
-    end
-end)
 
 local function destroyOldGui(name)
     local old = playerGui:FindFirstChild(name)
@@ -513,36 +353,6 @@ task.spawn(function()
     ui.DisplayOrder = 999
     ui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
     ui.Parent = playerGui
-    local uiScale = Instance.new("UIScale")
-    uiScale.Scale = 1
-    uiScale.Parent = ui
-
-    local function updateUIScale()
-        local camera = Workspace.CurrentCamera
-        if not camera then return end
-
-        local viewport = camera.ViewportSize
-        if viewport.X <= 1 or viewport.Y <= 1 then return end
-        local safeWidth = math.max(viewport.X - 16, 1)
-        local safeHeight = math.max(viewport.Y - 16, 1)
-        local DESIGN_WIDTH = 620
-        local DESIGN_HEIGHT = 710
-        local scaleX = safeWidth / DESIGN_WIDTH
-        local scaleY = safeHeight / DESIGN_HEIGHT
-        local scale = math.min(scaleX, scaleY, 1)
-        uiScale.Scale = math.max(scale, 0.05)
-    end
-
-    local function hookCamera(camera)
-        if not camera then return end
-        updateUIScale()
-        camera:GetPropertyChangedSignal("ViewportSize"):Connect(updateUIScale)
-    end
-
-    hookCamera(Workspace.CurrentCamera)
-    Workspace:GetPropertyChangedSignal("CurrentCamera"):Connect(function()
-        hookCamera(Workspace.CurrentCamera)
-    end)
     local tracker = Instance.new("Frame")
     tracker.Name = "PetCounterTracker"
     tracker.AnchorPoint = Vector2.new(1, 0)
@@ -888,20 +698,19 @@ task.spawn(function()
     blackFill.Parent = afkOverlay
 
     local afkCenter = Instance.new("Frame")
-    afkCenter.Size = UDim2.new(0.94, 0, 0.90, 0)
+    afkCenter.Size = UDim2.new(0, 950, 0, 780)
     afkCenter.AnchorPoint = Vector2.new(0.5, 0.5)
-    afkCenter.Position = UDim2.new(0.5, 0, 0.46, 0)
+    afkCenter.Position = UDim2.new(0.5, 0, 0.5, 0)
     afkCenter.BackgroundTransparency = 1
     afkCenter.ZIndex = 102
     afkCenter.Parent = afkOverlay
 
     local afkTitle = Instance.new("TextLabel")
-    afkTitle.Size = UDim2.new(1, 0, 0, 70)
+    afkTitle.Size = UDim2.new(1, 0, 0, 80)
     afkTitle.Text = "AFK MODE ACTIVE"
     afkTitle.TextColor3 = Color3.fromRGB(255, 90, 90)
     afkTitle.Font = Enum.Font.GothamBlack
     afkTitle.TextSize = 64
-    afkTitle.TextScaled = true
     afkTitle.BackgroundTransparency = 1
     afkTitle.TextXAlignment = Enum.TextXAlignment.Center
     afkTitle.ZIndex = 102
@@ -914,7 +723,6 @@ task.spawn(function()
     afkEggs.TextColor3 = Color3.fromRGB(80, 230, 80)
     afkEggs.Font = Enum.Font.GothamSemibold
     afkEggs.TextSize = 42
-    afkEggs.TextScaled = true
     afkEggs.BackgroundTransparency = 1
     afkEggs.TextXAlignment = Enum.TextXAlignment.Center
     afkEggs.ZIndex = 102
@@ -927,22 +735,19 @@ task.spawn(function()
     afkGems.TextColor3 = Color3.fromRGB(110, 185, 255)
     afkGems.Font = Enum.Font.GothamSemibold
     afkGems.TextSize = 42
-    afkGems.TextScaled = true
     afkGems.BackgroundTransparency = 1
     afkGems.TextXAlignment = Enum.TextXAlignment.Center
     afkGems.ZIndex = 102
     afkGems.Parent = afkCenter
 
     local afkExit = Instance.new("TextButton")
-    afkExit.Size = UDim2.new(0.72, 0, 0, 64)
-    afkExit.AnchorPoint = Vector2.new(0.5, 1)
-    afkExit.Position = UDim2.new(0.5, 0, 0.96, 0)
+    afkExit.Size = UDim2.new(1, 0, 0, 80)
+    afkExit.Position = UDim2.new(0, 0, 0, 680)
     afkExit.Text = "Turn Off AFK Mode"
     afkExit.TextColor3 = Color3.fromRGB(255, 255, 255)
     afkExit.BackgroundColor3 = Color3.fromRGB(200, 50, 50)
     afkExit.Font = Enum.Font.GothamSemibold
     afkExit.TextSize = 32
-    afkExit.TextScaled = true
     afkExit.ZIndex = 102
     afkExit.Parent = afkCenter
 
@@ -2396,30 +2201,9 @@ task.spawn(function()
             end
         end
     end
-    local BuyEggRemote = nil
-    local childNodes = ReplicatedStorage:GetChildren()
 
-    if childNodes[60] and childNodes[60]:IsA("RemoteFunction") then
-        BuyEggRemote = childNodes[60]
-    else
-        for _, obj in ipairs(childNodes) do
-            if obj:IsA("RemoteFunction") then
-                local name = obj.Name:lower()
-                if name:find("egg", 1, true) or name:find("buy", 1, true) then
-                    BuyEggRemote = obj
-                    break
-                end
-            end
-        end
-    end
-    if not BuyEggRemote then
-        pcall(function()
-            BuyEggRemote = ReplicatedStorage:WaitForChild(childNodes[60] and childNodes[60].Name or "", 2)
-            if not BuyEggRemote or not BuyEggRemote:IsA("RemoteFunction") then
-                BuyEggRemote = nil
-            end
-        end)
-    end
+    renderAfkRecent()
+    local EggNetwork = Library.Network
 
     local function hookLeaderstats()
         local leaderstats = localPlayer:WaitForChild("leaderstats", 5)
@@ -2446,28 +2230,42 @@ task.spawn(function()
         end
     end
     task.spawn(hookLeaderstats)
-    local BATCH_SIZE = 3
-    local HATCH_REQUEST_GAP = 0.08
-    local HATCH_BATCH_GAP = 0.15
+    local HATCH_SUCCESS_GAP = 0.30
+    local HATCH_RETRY_GAP = 0.18
+    local hatchRequestBusy = false
 
     task.spawn(function()
         while true do
-            if AutoBuying and SelectedEggId and BuyEggRemote then
-                for i = 1, BATCH_SIZE do
-                    if not AutoBuying or not SelectedEggId or not BuyEggRemote then
-                        break
-                    end
+            if AutoBuying and SelectedEggId and EggNetwork
+                and type(EggNetwork.Invoke) == "function" then
 
-                    pcall(function()
-                        BuyEggRemote:InvokeServer(SelectedEggId, false, false, true)
+                if not hatchRequestBusy then
+                    hatchRequestBusy = true
+
+                    local success = false
+                    local ok, result = pcall(function()
+                        return EggNetwork.Invoke(
+                            "Buy Egg",
+                            SelectedEggId,
+                            false,
+                            false,
+                            true
+                        )
                     end)
-
-                    if i < BATCH_SIZE then
-                        task.wait(HATCH_REQUEST_GAP)
+                    if ok and result ~= false then
+                        success = true
                     end
-                end
 
-                task.wait(HATCH_BATCH_GAP)
+                    hatchRequestBusy = false
+
+                    if success then
+                        task.wait(HATCH_SUCCESS_GAP)
+                    else
+                        task.wait(HATCH_RETRY_GAP)
+                    end
+                else
+                    task.wait(0.01)
+                end
             else
                 task.wait(0.1)
             end
@@ -2484,39 +2282,6 @@ task.spawn(function()
     tpTitle.TextXAlignment = Enum.TextXAlignment.Left
     tpTitle.Parent = tpFrame
 
-    local tpTip = Instance.new("TextLabel")
-    tpTip.Size = UDim2.new(1, 0, 0, 42)
-    tpTip.Position = UDim2.new(0, 0, 0, 24)
-    tpTip.BackgroundTransparency = 1
-    tpTip.Text = "⚠ Only teleport to the spots in the same world as you are currently in. It will glitch if you teleport to a different world."
-    tpTip.TextColor3 = Color3.fromRGB(255, 190, 80)
-    tpTip.Font = Enum.Font.GothamSemibold
-    tpTip.TextSize = 11
-    tpTip.TextWrapped = true
-    tpTip.TextXAlignment = Enum.TextXAlignment.Left
-    tpTip.TextYAlignment = Enum.TextYAlignment.Center
-    tpTip.Parent = tpFrame
-    local tpScroll = Instance.new("ScrollingFrame")
-    tpScroll.Size = UDim2.new(1, 0, 1, -72)
-    tpScroll.Position = UDim2.new(0, 0, 0, 72)
-    tpScroll.BackgroundTransparency = 1
-    tpScroll.BorderSizePixel = 0
-    tpScroll.ScrollBarThickness = 5
-    tpScroll.ScrollBarImageTransparency = 0.35
-    tpScroll.AutomaticCanvasSize = Enum.AutomaticSize.Y
-    tpScroll.CanvasSize = UDim2.new(0, 0, 0, 0)
-    tpScroll.ScrollingDirection = Enum.ScrollingDirection.Y
-    tpScroll.Parent = tpFrame
-
-    local tpLayout = Instance.new("UIListLayout")
-    tpLayout.SortOrder = Enum.SortOrder.LayoutOrder
-    tpLayout.Padding = UDim.new(0, 6)
-    tpLayout.Parent = tpScroll
-
-    local tpPadding = Instance.new("UIPadding")
-    tpPadding.PaddingBottom = UDim.new(0, 8)
-    tpPadding.Parent = tpScroll
-
     local function teleportTo(x, y, z)
         local character = localPlayer.Character
         if character and character:FindFirstChild("HumanoidRootPart") then
@@ -2524,30 +2289,15 @@ task.spawn(function()
         end
     end
 
-    local function createTeleportSection(parent, name)
-        local section = Instance.new("TextLabel")
-        section.Size = UDim2.new(1, -8, 0, 24)
-        section.BackgroundTransparency = 1
-        section.Text = name
-        section.TextColor3 = activeTheme.accent
-        section.Font = Enum.Font.GothamBold
-        section.TextSize = 13
-        section.TextXAlignment = Enum.TextXAlignment.Left
-        section.LayoutOrder = #parent:GetChildren() + 1
-        section.Parent = parent
-        return section
-    end
-
-    local function createTeleportButton(parent, name, coords)
+    local function createTeleportButton(parent, yPos, name, coords)
         local button = Instance.new("TextButton")
-        button.Size = UDim2.new(1, -8, 0, 34)
+        button.Size = UDim2.new(1, 0, 0, 34)
+        button.Position = UDim2.new(0, 0, 0, yPos)
         button.BackgroundColor3 = activeTheme.surface
         button.Text = "📍 Teleport to " .. name
         button.TextColor3 = Color3.fromRGB(255, 255, 255)
         button.Font = Enum.Font.GothamBold
         button.TextSize = 13
-        button.TextScaled = false
-        button.LayoutOrder = #parent:GetChildren() + 1
         button.Parent = parent
 
         local btnCorner = Instance.new("UICorner")
@@ -2564,17 +2314,11 @@ task.spawn(function()
             teleportTo(coords[1], coords[2], coords[3])
         end)
     end
-    createTeleportSection(tpScroll, "World 1")
-    createTeleportButton(tpScroll, "World 1 Spawn", {267, 98, 238})
-    createTeleportButton(tpScroll, "World 1 Last Area", {-3691, 142, 232})
-    createTeleportSection(tpScroll, "Fantasy World")
-    createTeleportButton(tpScroll, "Fantasy Spawn", {-7568, 558, -1683})
-    createTeleportButton(tpScroll, "Moon Egg", {-7765, 639, -1247})
-    createTeleportButton(tpScroll, "Crystal Chest", {-5283, 583, -2271})
-    createTeleportButton(tpScroll, "Fantasy Last Area", {-4857, 558, -1679})
-    createTeleportSection(tpScroll, "Tech World")
-    createTeleportButton(tpScroll, "Tech Spawn", {-9977, 16, 9601})
-    createTeleportButton(tpScroll, "Tech Last Area", {-7997, 16, 9609})
+
+    createTeleportButton(tpFrame, 32, "World 1 Spawn", {267, 98, 238})
+    createTeleportButton(tpFrame, 74, "Fantasy Spawn", {-7568, 558, -1683})
+    createTeleportButton(tpFrame, 116, "Tech Spawn", {-9977, 16, 9601})
+    createTeleportButton(tpFrame, 158, "Last Area", {-7997, 16, 9609})
     local settingsTitle = Instance.new("TextLabel")
     settingsTitle.Size = UDim2.new(1, 0, 0, 24)
     settingsTitle.Position = UDim2.new(0, 0, 0, 0)
@@ -2616,41 +2360,6 @@ task.spawn(function()
     keybindStroke.Thickness = 1
     keybindStroke.Transparency = 0.7
     keybindStroke.Parent = keybindBtn
-    local mobileToggle = Instance.new("TextButton")
-    mobileToggle.Name = "MobileUIToggle"
-    mobileToggle.Size = UDim2.new(0, 58, 0, 58)
-    mobileToggle.AnchorPoint = Vector2.new(1, 1)
-    mobileToggle.Position = UDim2.new(1, -12, 1, -12)
-    mobileToggle.BackgroundColor3 = Color3.fromRGB(32, 32, 42)
-    mobileToggle.TextColor3 = Color3.fromRGB(255, 255, 255)
-    mobileToggle.Text = "UI"
-    mobileToggle.Font = Enum.Font.GothamBold
-    mobileToggle.TextSize = 18
-    mobileToggle.ZIndex = 1000
-    mobileToggle.AutoButtonColor = true
-    mobileToggle.Parent = ui
-
-    local mobileToggleCorner = Instance.new("UICorner")
-    mobileToggleCorner.CornerRadius = UDim.new(1, 0)
-    mobileToggleCorner.Parent = mobileToggle
-
-    local mobileToggleStroke = Instance.new("UIStroke")
-    mobileToggleStroke.Thickness = 2
-    mobileToggleStroke.Transparency = 0.25
-    mobileToggleStroke.Parent = mobileToggle
-
-    local function toggleMainUI()
-        if afkOverlay.Visible then
-            return
-        end
-        autoHatchMain.Visible = not autoHatchMain.Visible
-        mobileToggle.Text = autoHatchMain.Visible and "UI" or "OPEN"
-    end
-
-    mobileToggle.Activated:Connect(toggleMainUI)
-    afkOverlay:GetPropertyChangedSignal("Visible"):Connect(function()
-        mobileToggle.Visible = not afkOverlay.Visible
-    end)
 
     local listeningForKey = false
     keybindBtn.MouseButton1Click:Connect(function()
@@ -2666,7 +2375,9 @@ task.spawn(function()
             keybindBtn.Text = "Current Key: " .. CurrentKeyName
             saveSettings()
         elseif not gameProcessed and input.UserInputType == Enum.UserInputType.Keyboard and input.KeyCode == ToggleKey then
-            toggleMainUI()
+            if not afkOverlay.Visible then
+                autoHatchMain.Visible = not autoHatchMain.Visible
+            end
         end
     end)
 
