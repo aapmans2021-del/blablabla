@@ -1,4 +1,7 @@
-
+-- =====================================================================
+-- COMBINED AUTOMATION SCRIPT: UNIFIED UI + FIXED AUTO TOKENS + BOSS DODGE
+-- EGG CHANCE VIEWER + AUTO FARM & PET TRACKER + EXTENDED THEMES
+-- =====================================================================
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local RunService = game:GetService("RunService")
@@ -39,6 +42,7 @@ local function saveSettings()
     end)
 end
 
+-- Auto Farm & Token Variables
 local Library = require(ReplicatedStorage:WaitForChild("Framework"):WaitForChild("Library"))
 while not Library.Loaded do
     RunService.Heartbeat:Wait()
@@ -103,10 +107,12 @@ task.spawn(function()
     end
 end)
 
+
 local CurrentTarget = nil
 local CurrentTargetId = nil
 local DamageRemote = ReplicatedStorage:GetChildren()[66]
 
+-- Find token remote on init
 for _, obj in ipairs(ReplicatedStorage:GetChildren()) do
     if obj:IsA("RemoteFunction") or obj:IsA("RemoteEvent") then
         local name = obj.Name:lower()
@@ -117,9 +123,11 @@ for _, obj in ipairs(ReplicatedStorage:GetChildren()) do
     end
 end
 
+-- TURKEY DODGE VARIABLES
 local TurkeyDodgeActive = false
 local IsEvading = false
 
+-- AUTO FARM FUNCTIONS
 local function GetAllEquippedPetUIDs()
     local myPets = {}
     local equipped = Library.PetCmds.GetEquipped()
@@ -253,6 +261,8 @@ local function FocusCometFast(comet)
     return true
 end
 
+
+-- ABILITY TOKEN COLLECTION
 local ignoreTokens = {}
 
 local function collectAbilityTokens()
@@ -268,15 +278,15 @@ task.spawn(function()
         if AutoTokens and localPlayer.Character and localPlayer.Character:FindFirstChild("HumanoidRootPart") then
             local tokens = collectAbilityTokens()
             local hrp = localPlayer.Character:FindFirstChild("HumanoidRootPart")
-
+            
             if hrp and #tokens > 0 then
                 local savedPos = hrp.CFrame
                 local collectedAny = false
-
+                
                 for _, token in ipairs(tokens) do
                     if not AutoTokens then break end
                     if not token or not token.Parent or ignoreTokens[token] then continue end
-
+                    
                     local targetPart = nil
                     if token:IsA("BasePart") then
                         targetPart = token
@@ -285,19 +295,19 @@ task.spawn(function()
                     elseif token:IsA("Folder") then
                         targetPart = token:FindFirstChildWhichIsA("BasePart", true)
                     end
-
+                    
                     if targetPart then
                         ignoreTokens[token] = true
                         task.delay(4, function() ignoreTokens[token] = nil end)
-
+                        
                         collectedAny = true
                         local tokenCFrame = targetPart.CFrame
                         local tokenPos = targetPart.Position
                         local tokenId = tonumber(token.Name) or token.Name
-
+                        
                         hrp.CFrame = tokenCFrame
                         task.wait(0.08)
-
+                        
                         if TokenRemote then
                             pcall(function()
                                 if TokenRemote:IsA("RemoteFunction") then
@@ -307,7 +317,7 @@ task.spawn(function()
                                 end
                             end)
                         end
-
+                        
                         local waitCount = 0
                         while token.Parent and waitCount < 6 do
                             task.wait(0.04)
@@ -315,7 +325,7 @@ task.spawn(function()
                         end
                     end
                 end
-
+                
                 if collectedAny and hrp and hrp.Parent then
                     hrp.CFrame = savedPos
                     task.wait(0.1)
@@ -326,6 +336,7 @@ task.spawn(function()
     end
 end)
 
+-- AUTUMN BOSS FX DODGE DETECTION
 task.spawn(function()
     while true do
         task.wait(0.1)
@@ -333,7 +344,7 @@ task.spawn(function()
             local character = localPlayer.Character
             local hrp = character and character:FindFirstChild("HumanoidRootPart")
             local fxFolder = Workspace:FindFirstChild("__AUTUMNBOSS_FX")
-
+            
             if hrp then
                 if fxFolder and #fxFolder:GetChildren() > 0 then
                     IsEvading = true
@@ -400,6 +411,7 @@ task.spawn(function()
     end
 end)
 
+-- Fast attack loop
 task.spawn(function()
     while true do
         if FastAttackSpeed then
@@ -429,6 +441,7 @@ task.spawn(function()
     end
 end)
 
+-- Main Auto Farm Loop
 task.spawn(function()
     while true do
         task.wait(0.15)
@@ -448,7 +461,7 @@ task.spawn(function()
                 CurrentTargetId = nil
             end
         end
-
+        
         if AutoFarmTurkey then
             if not CurrentTarget or not CurrentTarget.Parent then
                 CurrentTarget = FindTurkey()
@@ -468,6 +481,7 @@ task.spawn(function()
     end
 end)
 
+-- Damage Spam Loop
 task.spawn(function()
     while true do
         task.wait(0.05)
@@ -479,6 +493,7 @@ task.spawn(function()
     end
 end)
 
+-- Potato Mode Continuous Focus Loop
 task.spawn(function()
     while true do
         task.wait(0.1)
@@ -488,6 +503,13 @@ task.spawn(function()
     end
 end)
 
+
+-- =====================================================================
+-- EGG OPEN ANIMATION DISABLED COMPLETELY
+-- The game's hatch result/network flow is left alone. We only suppress the
+-- client-side PlayTrigger used by EggOpenAnim so eggs never play their
+-- opening animation/effects.
+-- =====================================================================
 local function cleanupEggOpeningEffects()
     pcall(function()
         local camera = Workspace.CurrentCamera
@@ -500,12 +522,37 @@ local function cleanupEggOpeningEffects()
     end)
 end
 
+-- EggOpenHook ultimately calls EggOpenPort.PlayTrigger:Fire(...) to start
+-- the visual egg-opening sequence. Block only that client-side trigger.
+pcall(function()
+    if type(hookmetamethod) == "function" and type(getnamecallmethod) == "function" then
+        local oldNamecall
+        oldNamecall = hookmetamethod(game, "__namecall", newcclosure(function(self, ...)
+            local method = getnamecallmethod()
+            if method == "Fire" and self and self.Name == "PlayTrigger" then
+                local parent = self.Parent
+                if parent and parent.Name == "EggOpenPort" then
+                    cleanupEggOpeningEffects()
+                    return nil
+                end
+            end
+            return oldNamecall(self, ...)
+        end))
+    end
+end)
+
+-- Also keep cleaning up any animation container that may have been created
+-- by another client-side path.
 task.spawn(function()
     while true do
         cleanupEggOpeningEffects()
         task.wait(0.1)
     end
 end)
+
+-- =====================================================================
+-- UI, UNIFIED STYLING, HATCH LOGIC & EGG CHANCE VIEWER
+-- =====================================================================
 
 local function destroyOldGui(name)
     local old = playerGui:FindFirstChild(name)
@@ -595,6 +642,14 @@ task.spawn(function()
     ui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
     ui.Parent = playerGui
 
+    -- =====================================================================
+    -- RESPONSIVE / MOBILE UI SCALING
+    -- The original UI is designed around a 620x710 hub. Instead of using a
+    -- fixed 16:9 scale (which overflows on phones), scale from the actual
+    -- viewport and leave a small safe margin on every side. This keeps the
+    -- entire hub on-screen in portrait, landscape, tablets, laptops and
+    -- ultrawide displays.
+    -- =====================================================================
     local uiScale = Instance.new("UIScale")
     uiScale.Scale = 1
     uiScale.Parent = ui
@@ -606,6 +661,10 @@ task.spawn(function()
         local viewport = camera.ViewportSize
         if viewport.X <= 1 or viewport.Y <= 1 then return end
 
+        -- Scale against the MAIN HUB, not the AFK overlay.  The AFK overlay
+        -- is full-screen and has its own responsive controls below.
+        -- This keeps the normal UI usable on phones instead of making it
+        -- unnecessarily tiny while still guaranteeing it fits.
         local safeWidth = math.max(viewport.X - 16, 1)
         local safeHeight = math.max(viewport.Y - 16, 1)
         local DESIGN_WIDTH = 620
@@ -614,6 +673,7 @@ task.spawn(function()
         local scaleY = safeHeight / DESIGN_HEIGHT
         local scale = math.min(scaleX, scaleY, 1)
 
+        -- Never let a minimum scale force the UI outside the viewport.
         uiScale.Scale = math.max(scale, 0.05)
     end
 
@@ -628,6 +688,7 @@ task.spawn(function()
         hookCamera(Workspace.CurrentCamera)
     end)
 
+    -- UNTOUCHED HUGES COUNTER TRACKER
     local tracker = Instance.new("Frame")
     tracker.Name = "PetCounterTracker"
     tracker.AnchorPoint = Vector2.new(1, 0)
@@ -877,6 +938,7 @@ task.spawn(function()
                             local displayName = getPetDisplayName(pet)
                             local entry = { name = displayName, uid = uid }
 
+                            -- Only count newly discovered rare pets while AFK mode is active.
                             startupCounts[category .. "s"] = (startupCounts[category .. "s"] or 0) + 1
                             if afkSessionActive then
                                 afkSessionCounts[category .. "s"] = (afkSessionCounts[category .. "s"] or 0) + 1
@@ -957,6 +1019,7 @@ task.spawn(function()
         end
     end)
 
+    -- AFK OVERLAY
     local afkOverlay = Instance.new("Frame")
     afkOverlay.Name = "AfkOverlay"
     afkOverlay.Size = UDim2.new(1, 0, 1, 0)
@@ -1021,7 +1084,8 @@ task.spawn(function()
     afkGems.Parent = afkCenter
 
     local afkExit = Instance.new("TextButton")
-
+    -- This button is anchored to the actual screen, not the old 950x780
+    -- design canvas, so it is ALWAYS reachable on a phone.
     afkExit.Size = UDim2.new(0.72, 0, 0, 64)
     afkExit.AnchorPoint = Vector2.new(0.5, 1)
     afkExit.Position = UDim2.new(0.5, 0, 0.96, 0)
@@ -1038,6 +1102,7 @@ task.spawn(function()
     afkExitCorner.CornerRadius = UDim.new(0, 12)
     afkExitCorner.Parent = afkExit
 
+    -- MAIN HUB WINDOW
     local autoHatchMain = Instance.new("Frame")
     autoHatchMain.Name = "AutoHatchMain"
     autoHatchMain.Size = UDim2.new(0, 620, 0, 710)
@@ -1052,7 +1117,7 @@ task.spawn(function()
     local autoHatchCorner = Instance.new("UICorner")
     autoHatchCorner.CornerRadius = UDim.new(0, 12)
     autoHatchCorner.Parent = autoHatchMain
-
+    
     local autoHatchShadow = Instance.new("UIStroke")
     autoHatchShadow.Color = Color3.fromRGB(60, 140, 220)
     autoHatchShadow.Thickness = 1.8
@@ -1087,7 +1152,7 @@ task.spawn(function()
         btn.Font = Enum.Font.GothamBold
         btn.TextSize = 12
         btn.Parent = tabBar
-
+        
         local corner = Instance.new("UICorner")
         corner.CornerRadius = UDim.new(0, 6)
         corner.Parent = btn
@@ -1097,7 +1162,7 @@ task.spawn(function()
         stroke.Thickness = 1
         stroke.Transparency = 0.8
         stroke.Parent = btn
-
+        
         return btn
     end
 
@@ -1142,6 +1207,9 @@ task.spawn(function()
     farmFrame.Visible = false
     farmFrame.Parent = autoHatchMain
 
+    -- =====================================================================
+    -- FULL EXTENDED THEMES SYSTEM
+    -- =====================================================================
     local function makeTheme(name, background, panel, surface, accent, controlOn, danger, text, muted, stroke)
         return {
             name = name,
@@ -1196,12 +1264,18 @@ task.spawn(function()
         makeTheme("Deep Space",       Color3.fromRGB(8, 9, 20),    Color3.fromRGB(16, 17, 35),  Color3.fromRGB(25, 27, 52),  Color3.fromRGB(90, 125, 255), Color3.fromRGB(60, 210, 170), Color3.fromRGB(255, 70, 130)),
     }
 
+    -- Always build the UI from the original Default Dark colors first.
+    -- The saved/selected theme is applied only after the UI is fully created.
+    -- This prevents non-themed UI elements from inheriting the last theme
+    -- (for example amber colors from Amber Glow) at launch.
     local savedThemeName = CurrentThemeName
     local activeTheme = Themes[1]
 
     local currentTabBtn = hatchTab
     local currentTabFrame = hatchFrame
 
+    -- Theme-aware color memory. Each UI object keeps its original/base color so
+    -- switching themes never compounds the previous theme's colors.
     local themeBaseColors = setmetatable({}, { __mode = "k" })
     local THEME_LOCKED = "ThemeLocked"
 
@@ -1270,6 +1344,8 @@ task.spawn(function()
         if not obj or not obj.Parent then return end
         if obj:GetAttribute("ThemePreview") or obj:GetAttribute(THEME_LOCKED) then return end
 
+        -- Themes only recolor actual/full button boxes. Text, search fields,
+        -- thin divider/line frames, labels, and strokes keep their original colors.
         if obj:IsA("TextButton") then
             local base = rememberBaseColors(obj)
             if base.background and obj.BackgroundTransparency < 1 then
@@ -1308,6 +1384,8 @@ task.spawn(function()
         end
     end
 
+    -- Instantly theme newly-created UI too. This fixes controls that previously
+    -- needed a click/repaint before their new colors became visible.
     ui.DescendantAdded:Connect(function(obj)
         task.defer(function()
             if obj and obj.Parent then
@@ -1316,13 +1394,14 @@ task.spawn(function()
         end)
     end)
 
+
     local function switchTab(activeBtn, activeFrame)
         hatchFrame.Visible = false
         tpFrame.Visible = false
         settingsFrame.Visible = false
         eggFrame.Visible = false
         farmFrame.Visible = false
-
+        
         for _, btn in ipairs({hatchTab, tpTab, settingsTab, eggTab, farmTab}) do
             btn.BackgroundColor3 = activeTheme.surface
             btn.TextColor3 = Color3.fromRGB(180, 180, 190)
@@ -1343,6 +1422,7 @@ task.spawn(function()
 
     switchTab(hatchTab, hatchFrame)
 
+    -- UNIFIED TOGGLE GENERATOR HELPER
     local toggleRegistry = {}
 
     local function createUnifiedToggle(parent, yPos, text, defaultState, callback)
@@ -1359,7 +1439,7 @@ task.spawn(function()
         local btnCorner = Instance.new("UICorner")
         btnCorner.CornerRadius = UDim.new(0, 6)
         btnCorner.Parent = btn
-
+        
         local btnStroke = Instance.new("UIStroke")
         btnStroke.Color = activeTheme.stroke
         btnStroke.Thickness = 1
@@ -1397,6 +1477,9 @@ task.spawn(function()
         return btn, updateVisuals
     end
 
+    -- =====================================================================
+    -- AUTO FARM TAB UI
+    -- =====================================================================
     local farmTitle = Instance.new("TextLabel")
     farmTitle.Size = UDim2.new(1, 0, 0, 24)
     farmTitle.Position = UDim2.new(0, 0, 0, 0)
@@ -1409,7 +1492,7 @@ task.spawn(function()
     farmTitle.Parent = farmFrame
 
     createUnifiedToggle(farmFrame, 32, "🤖 Robot Farm", false, function(state) AutoFarmRobot = state end)
-    createUnifiedToggle(farmFrame, 74, "🦃 Turkey/Boss Farm", false, function(state)
+    createUnifiedToggle(farmFrame, 74, "🦃 Turkey/Boss Farm", false, function(state) 
         AutoFarmTurkey = state
         TurkeyDodgeActive = state
     end)
@@ -1465,6 +1548,9 @@ task.spawn(function()
         end
     end)
 
+    -- =====================================================================
+    -- EGG CHANCES TAB
+    -- =====================================================================
     local function collectEggChanceData()
         local function trim(value)
             return (value:gsub("^%s+", ""):gsub("%s+$", ""))
@@ -1939,7 +2025,7 @@ task.spawn(function()
                     eggSelect.Text = "Egg: " .. egg.Name
                     eggOptions.Visible = true
                     chanceMode = "Eggs"
-
+                    
                     for modeKey, btnObj in pairs(subTabButtons) do
                         if modeKey == "Eggs" then
                             btnObj.BackgroundColor3 = activeTheme.accent
@@ -1959,6 +2045,7 @@ task.spawn(function()
         showingEasiestPets = false
         chanceMode = mode
 
+        -- Hide search and dropdown for all non-Egg tabs and reposition results frame directly below mode bar
         if mode == "Eggs" then
             eggSearch.Visible = true
             eggSelect.Visible = true
@@ -2018,21 +2105,24 @@ task.spawn(function()
     addEggModeButton("Secrets", 0.606, "Secret")
     addEggModeButton("Gargantuans", 0.808, "Gargantuan")
 
-    eggSelect.MouseButton1Click:Connect(function()
+    eggSelect.MouseButton1Click:Connect(function() 
         if chanceMode == "Eggs" then
-            eggOptions.Visible = not eggOptions.Visible
+            eggOptions.Visible = not eggOptions.Visible 
         end
     end)
-
+    
     eggSearch:GetPropertyChangedSignal("Text"):Connect(function()
         rebuildEggOptions()
         eggOptions.Visible = (chanceMode == "Eggs")
     end)
-
+    
     rebuildEggOptions()
     eggSelect.Text = bestChanceEgg and ("Selected: " .. bestChanceEgg.Name) or "Select an egg"
     selectEggSubTab("Eggs", subTabButtons["Eggs"])
 
+    -- =====================================================================
+    -- AUTO HATCH TAB UI
+    -- =====================================================================
     local function formatNumber(value)
         local text = tostring(value)
         while true do
@@ -2076,6 +2166,7 @@ task.spawn(function()
     GemsLabel.TextXAlignment = Enum.TextXAlignment.Left
     GemsLabel.Parent = statsContainer
 
+    -- These Stats-tab counters keep their fixed colors in every theme.
     local hatchEggsGreen = Color3.fromRGB(80, 230, 80)
     local hatchDiamondsBlue = Color3.fromRGB(110, 185, 255)
     EggsLabel.TextColor3 = hatchEggsGreen
@@ -2097,10 +2188,10 @@ task.spawn(function()
         hatchRareLabels[name] = label
     end
 
-    makeHatchRareLabel("Huges", 38)
-    makeHatchRareLabel("Secrets", 60)
-    makeHatchRareLabel("Titanics", 82)
-    makeHatchRareLabel("Gargantuans", 104)
+    makeHatchRareLabel("Huges", 50)
+    makeHatchRareLabel("Secrets", 72)
+    makeHatchRareLabel("Titanics", 94)
+    makeHatchRareLabel("Gargantuans", 116)
 
     local ToggleKey = Enum.KeyCode[CurrentKeyName] or Enum.KeyCode.LeftControl
 
@@ -2166,7 +2257,7 @@ task.spawn(function()
 autoHatchTip.Size = UDim2.new(1, -20, 0, 38)
 autoHatchTip.Position = UDim2.new(0, 10, 0, 184)
 autoHatchTip.BackgroundTransparency = 1
-autoHatchTip.Text = "Tip: Use the game's built-in Auto Hatch for automatic hatching. This script only removes egg-opening animations. Turn off "Stop on Failure" in Hatch Settings to avoid issues."
+autoHatchTip.Text = "Tip: Use the game's built-in Auto Hatch for automatic hatching. This script only removes egg-opening animations. Turn off Stop on failure in Hatch settings."
 autoHatchTip.TextColor3 = Color3.fromRGB(180, 190, 205)
 autoHatchTip.Font = Enum.Font.Gotham
 autoHatchTip.TextSize = 13
@@ -2176,7 +2267,7 @@ autoHatchTip.Parent = hatchFrame
 
     local recentPanel = Instance.new("Frame")
     recentPanel.Name = "RecentHatchesPanel"
-    recentPanel.Size = UDim2.new(1, -6, 0, 170)
+    recentPanel.Size = UDim2.new(1, -6, 0, 150)
     recentPanel.Position = UDim2.new(0, 3, 0, 230)
     recentPanel.BackgroundColor3 = activeTheme.panel
     recentPanel.BorderSizePixel = 0
@@ -2290,6 +2381,7 @@ autoHatchTip.Parent = hatchFrame
         end
     end)
 
+    -- AFK RARE PETS PANEL
     local afkRarePanel = Instance.new("Frame")
     afkRarePanel.Name = "AfkRarePanel"
     afkRarePanel.Size = UDim2.new(1, 0, 0, 440)
@@ -2431,6 +2523,9 @@ autoHatchTip.Parent = hatchFrame
     end
     task.spawn(hookLeaderstats)
 
+    -- =====================================================================
+    -- TELEPORT TAB UI
+    -- =====================================================================
     local tpTitle = Instance.new("TextLabel")
     tpTitle.Size = UDim2.new(1, 0, 0, 24)
     tpTitle.Position = UDim2.new(0, 0, 0, 0)
@@ -2455,6 +2550,7 @@ autoHatchTip.Parent = hatchFrame
     tpTip.TextYAlignment = Enum.TextYAlignment.Center
     tpTip.Parent = tpFrame
 
+    -- Scrolling keeps the teleport list usable on smaller resolutions.
     local tpScroll = Instance.new("ScrollingFrame")
     tpScroll.Size = UDim2.new(1, 0, 1, -72)
     tpScroll.Position = UDim2.new(0, 0, 0, 72)
@@ -2524,20 +2620,26 @@ autoHatchTip.Parent = hatchFrame
         end)
     end
 
+    -- World 1
     createTeleportSection(tpScroll, "World 1")
     createTeleportButton(tpScroll, "World 1 Spawn", {267, 98, 238})
     createTeleportButton(tpScroll, "World 1 Last Area", {-3691, 142, 232})
 
+    -- Fantasy World
     createTeleportSection(tpScroll, "Fantasy World")
     createTeleportButton(tpScroll, "Fantasy Spawn", {-7568, 558, -1683})
     createTeleportButton(tpScroll, "Moon Egg", {-7765, 639, -1247})
     createTeleportButton(tpScroll, "Crystal Chest", {-5283, 583, -2271})
     createTeleportButton(tpScroll, "Fantasy Last Area", {-4857, 558, -1679})
 
+    -- Tech World
     createTeleportSection(tpScroll, "Tech World")
     createTeleportButton(tpScroll, "Tech Spawn", {-9977, 16, 9601})
     createTeleportButton(tpScroll, "Tech Last Area", {-7997, 16, 9609})
 
+    -- =====================================================================
+    -- SETTINGS TAB UI & EXTENDED THEME SWITCHER
+    -- =====================================================================
     local settingsTitle = Instance.new("TextLabel")
     settingsTitle.Size = UDim2.new(1, 0, 0, 24)
     settingsTitle.Position = UDim2.new(0, 0, 0, 0)
@@ -2580,6 +2682,9 @@ autoHatchTip.Parent = hatchFrame
     keybindStroke.Transparency = 0.7
     keybindStroke.Parent = keybindBtn
 
+    -- MOBILE UI TOGGLE
+    -- Phones do not have the configured keyboard key, so provide a large
+    -- touch button that remains available even when the main UI is hidden.
     local mobileToggle = Instance.new("TextButton")
     mobileToggle.Name = "MobileUIToggle"
     mobileToggle.Size = UDim2.new(0, 58, 0, 58)
@@ -2613,6 +2718,8 @@ autoHatchTip.Parent = hatchFrame
 
     mobileToggle.Activated:Connect(toggleMainUI)
 
+    -- Hide the touch button while AFK is active; the dedicated AFK exit
+    -- button remains visible and reachable.
     afkOverlay:GetPropertyChangedSignal("Visible"):Connect(function()
         mobileToggle.Visible = not afkOverlay.Visible
     end)
@@ -2691,6 +2798,9 @@ autoHatchTip.Parent = hatchFrame
         end)
     end
 
+    -- Apply the saved theme only after every UI element has been created
+    -- from the Default Dark base. Non-button/detail elements therefore stay
+    -- at their original dark colors instead of inheriting a previous theme.
     for _, themeObj in ipairs(Themes) do
         if themeObj.name == savedThemeName then
             applyTheme(themeObj)
