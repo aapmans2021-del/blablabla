@@ -37,6 +37,7 @@ local function saveSettings()
         }))
     end)
 end
+
 local Library = require(ReplicatedStorage:WaitForChild("Framework"):WaitForChild("Library"))
 while not Library.Loaded do
     RunService.Heartbeat:Wait()
@@ -46,11 +47,66 @@ local AutoFarmRobot = false
 local AutoFarmTurkey = false
 local AutoTokens = false
 local PotatoMode = false
+local AutoFarmComet = false
+local FastPetSpeed = false
+local FastAttackSpeed = false
+local FastPetSpeedApplied = false
+local OriginalPetWalkspeedUpgrade = nil
+local PetWalkspeedUpgradeWasPresent = false
+local FastPetSpeedValue = 100000
+local FastAttackInterval = 0.02
 local TokenRemote = nil
+
+local SaveModule = nil
+pcall(function()
+    SaveModule = require(ReplicatedStorage:WaitForChild("Library"):WaitForChild("Client"):WaitForChild("Save"))
+end)
+
+local function SetFastPetSpeed(enabled)
+    FastPetSpeed = enabled
+    if not SaveModule or not SaveModule.Get then
+        return
+    end
+
+    pcall(function()
+        local save = SaveModule.Get()
+        if not save then return end
+        save.Upgrades = save.Upgrades or {}
+
+        if enabled then
+            if not FastPetSpeedApplied then
+                PetWalkspeedUpgradeWasPresent = save.Upgrades["Pet Walkspeed"] ~= nil
+                OriginalPetWalkspeedUpgrade = save.Upgrades["Pet Walkspeed"]
+                FastPetSpeedApplied = true
+            end
+            save.Upgrades["Pet Walkspeed"] = FastPetSpeedValue
+        else
+            if FastPetSpeedApplied then
+                if PetWalkspeedUpgradeWasPresent then
+                    save.Upgrades["Pet Walkspeed"] = OriginalPetWalkspeedUpgrade
+                else
+                    save.Upgrades["Pet Walkspeed"] = nil
+                end
+                FastPetSpeedApplied = false
+            end
+        end
+    end)
+end
+
+task.spawn(function()
+    while true do
+        if FastPetSpeed then
+            SetFastPetSpeed(true)
+        end
+        task.wait(0.5)
+    end
+end)
+
 
 local CurrentTarget = nil
 local CurrentTargetId = nil
 local DamageRemote = ReplicatedStorage:GetChildren()[66]
+
 for _, obj in ipairs(ReplicatedStorage:GetChildren()) do
     if obj:IsA("RemoteFunction") or obj:IsA("RemoteEvent") then
         local name = obj.Name:lower()
@@ -60,8 +116,10 @@ for _, obj in ipairs(ReplicatedStorage:GetChildren()) do
         end
     end
 end
+
 local TurkeyDodgeActive = false
 local IsEvading = false
+
 local function GetAllEquippedPetUIDs()
     local myPets = {}
     local equipped = Library.PetCmds.GetEquipped()
@@ -99,7 +157,6 @@ local function FindTurkey()
     end
     return nil
 end
-
 local function FocusPetsContinuous(coinInstance)
     if not coinInstance or not coinInstance.Parent then return end
     local coinId = coinInstance:GetAttribute("ID")
@@ -113,8 +170,90 @@ local function FocusPetsContinuous(coinInstance)
         pcall(function()
             Library.Network.Invoke("Join Coin", coinId, myPets)
         end)
+
+        for _, petUid in ipairs(myPets) do
+            pcall(function()
+                Library.Network.Fire("Change Pet Target", petUid, "Coin", coinId)
+            end)
+        end
     end
 end
+
+local function IsCometCoin(coinInstance)
+    if not coinInstance or not coinInstance.Parent then
+        return false
+    end
+
+    local coinPart = coinInstance:FindFirstChild("Coin")
+    local isComet = coinInstance:GetAttribute("Comet") == true
+        or (coinPart and coinPart:GetAttribute("Comet") == true)
+
+    if not isComet then
+        return false
+    end
+
+    local area = coinInstance:GetAttribute("Area")
+    if area ~= nil then
+        local ok, available = pcall(function()
+            return Library.WorldCmds.HasArea(area)
+        end)
+        if not ok or not available then
+            return false
+        end
+    end
+
+    if coinPart and coinPart:GetAttribute("PreventClick") then
+        return false
+    end
+
+    return coinInstance:GetAttribute("ID") ~= nil
+end
+
+local function FindCurrentComet()
+    local things = Workspace:FindFirstChild("__THINGS")
+    local coins = things and things:FindFirstChild("Coins")
+    if not coins then
+        return nil
+    end
+
+    for _, coin in ipairs(coins:GetChildren()) do
+        if IsCometCoin(coin) then
+            return coin
+        end
+    end
+
+    return nil
+end
+
+local function FocusCometFast(comet)
+    if not IsCometCoin(comet) then
+        return false
+    end
+
+    local cometId = comet:GetAttribute("ID")
+    local pets = GetAllEquippedPetUIDs()
+    if not cometId or #pets == 0 then
+        return false
+    end
+
+    pcall(function()
+        Library.Signal.Fire("Select Coin", comet)
+    end)
+
+    pcall(function()
+        Library.Network.Invoke("Join Coin", cometId, pets)
+    end)
+
+    for _, petUid in ipairs(pets) do
+        pcall(function()
+            Library.Network.Fire("Change Pet Target", petUid, "Coin", cometId)
+        end)
+    end
+
+    return true
+end
+
+
 local ignoreTokens = {}
 
 local function collectAbilityTokens()
@@ -187,6 +326,7 @@ task.spawn(function()
         task.wait(0.2)
     end
 end)
+
 task.spawn(function()
     while true do
         task.wait(0.1)
@@ -209,6 +349,87 @@ task.spawn(function()
         end
     end
 end)
+
+local CurrentComet = nil
+local CurrentCometId = nil
+
+task.spawn(function()
+    while true do
+        if AutoFarmComet then
+            local comet = CurrentComet
+            if not IsCometCoin(comet) then
+                comet = FindCurrentComet()
+                CurrentComet = comet
+                CurrentCometId = comet and tostring(comet:GetAttribute("ID")) or nil
+            end
+
+            if comet and IsCometCoin(comet) then
+                if CurrentCometId ~= tostring(comet:GetAttribute("ID")) then
+                    CurrentCometId = tostring(comet:GetAttribute("ID"))
+                end
+                FocusCometFast(comet)
+            else
+                CurrentComet = nil
+                CurrentCometId = nil
+            end
+        else
+            CurrentComet = nil
+            CurrentCometId = nil
+        end
+
+        task.wait(0.05)
+    end
+end)
+
+task.spawn(function()
+    while true do
+        if AutoFarmComet and CurrentCometId then
+            pcall(function()
+                if DamageRemote then
+                    DamageRemote:FireServer(CurrentCometId)
+                end
+            end)
+
+            local pets = GetAllEquippedPetUIDs()
+            for _, petUid in ipairs(pets) do
+                pcall(function()
+                    Library.Network.Fire("Farm Coin", CurrentCometId, petUid)
+                end)
+            end
+        end
+        task.wait(0.05)
+    end
+end)
+
+task.spawn(function()
+    while true do
+        if FastAttackSpeed then
+            local targetId = nil
+            if AutoFarmComet then
+                targetId = CurrentCometId
+            elseif AutoFarmRobot or AutoFarmTurkey then
+                targetId = CurrentTargetId
+            end
+
+            if targetId then
+                if DamageRemote then
+                    pcall(function()
+                        DamageRemote:FireServer(targetId)
+                    end)
+                end
+
+                local pets = GetAllEquippedPetUIDs()
+                for _, petUid in ipairs(pets) do
+                    pcall(function()
+                        Library.Network.Fire("Farm Coin", targetId, petUid)
+                    end)
+                end
+            end
+        end
+        task.wait(FastAttackInterval)
+    end
+end)
+
 task.spawn(function()
     while true do
         task.wait(0.15)
@@ -247,6 +468,7 @@ task.spawn(function()
         end
     end
 end)
+
 task.spawn(function()
     while true do
         task.wait(0.05)
@@ -257,6 +479,7 @@ task.spawn(function()
         end
     end
 end)
+
 task.spawn(function()
     while true do
         task.wait(0.1)
@@ -265,6 +488,8 @@ task.spawn(function()
         end
     end
 end)
+
+
 
 local function destroyOldGui(name)
     local old = playerGui:FindFirstChild(name)
@@ -353,6 +578,40 @@ task.spawn(function()
     ui.DisplayOrder = 999
     ui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
     ui.Parent = playerGui
+
+    local uiScale = Instance.new("UIScale")
+    uiScale.Scale = 1
+    uiScale.Parent = ui
+
+    local function updateUIScale()
+        local camera = Workspace.CurrentCamera
+        if not camera then return end
+
+        local viewport = camera.ViewportSize
+        if viewport.X <= 1 or viewport.Y <= 1 then return end
+
+        local safeWidth = math.max(viewport.X - 16, 1)
+        local safeHeight = math.max(viewport.Y - 16, 1)
+        local DESIGN_WIDTH = 620
+        local DESIGN_HEIGHT = 710
+        local scaleX = safeWidth / DESIGN_WIDTH
+        local scaleY = safeHeight / DESIGN_HEIGHT
+        local scale = math.min(scaleX, scaleY, 1)
+
+        uiScale.Scale = math.max(scale, 0.05)
+    end
+
+    local function hookCamera(camera)
+        if not camera then return end
+        updateUIScale()
+        camera:GetPropertyChangedSignal("ViewportSize"):Connect(updateUIScale)
+    end
+
+    hookCamera(Workspace.CurrentCamera)
+    Workspace:GetPropertyChangedSignal("CurrentCamera"):Connect(function()
+        hookCamera(Workspace.CurrentCamera)
+    end)
+
     local tracker = Instance.new("Frame")
     tracker.Name = "PetCounterTracker"
     tracker.AnchorPoint = Vector2.new(1, 0)
@@ -601,6 +860,7 @@ task.spawn(function()
                         if trackerInitialized then
                             local displayName = getPetDisplayName(pet)
                             local entry = { name = displayName, uid = uid }
+
                             startupCounts[category .. "s"] = (startupCounts[category .. "s"] or 0) + 1
                             if afkSessionActive then
                                 afkSessionCounts[category .. "s"] = (afkSessionCounts[category .. "s"] or 0) + 1
@@ -680,6 +940,7 @@ task.spawn(function()
             task.wait(2)
         end
     end)
+
     local afkOverlay = Instance.new("Frame")
     afkOverlay.Name = "AfkOverlay"
     afkOverlay.Size = UDim2.new(1, 0, 1, 0)
@@ -698,19 +959,20 @@ task.spawn(function()
     blackFill.Parent = afkOverlay
 
     local afkCenter = Instance.new("Frame")
-    afkCenter.Size = UDim2.new(0, 950, 0, 780)
+    afkCenter.Size = UDim2.new(0.94, 0, 0.90, 0)
     afkCenter.AnchorPoint = Vector2.new(0.5, 0.5)
-    afkCenter.Position = UDim2.new(0.5, 0, 0.5, 0)
+    afkCenter.Position = UDim2.new(0.5, 0, 0.46, 0)
     afkCenter.BackgroundTransparency = 1
     afkCenter.ZIndex = 102
     afkCenter.Parent = afkOverlay
 
     local afkTitle = Instance.new("TextLabel")
-    afkTitle.Size = UDim2.new(1, 0, 0, 80)
+    afkTitle.Size = UDim2.new(1, 0, 0, 70)
     afkTitle.Text = "AFK MODE ACTIVE"
     afkTitle.TextColor3 = Color3.fromRGB(255, 90, 90)
     afkTitle.Font = Enum.Font.GothamBlack
     afkTitle.TextSize = 64
+    afkTitle.TextScaled = true
     afkTitle.BackgroundTransparency = 1
     afkTitle.TextXAlignment = Enum.TextXAlignment.Center
     afkTitle.ZIndex = 102
@@ -723,6 +985,7 @@ task.spawn(function()
     afkEggs.TextColor3 = Color3.fromRGB(80, 230, 80)
     afkEggs.Font = Enum.Font.GothamSemibold
     afkEggs.TextSize = 42
+    afkEggs.TextScaled = true
     afkEggs.BackgroundTransparency = 1
     afkEggs.TextXAlignment = Enum.TextXAlignment.Center
     afkEggs.ZIndex = 102
@@ -735,25 +998,29 @@ task.spawn(function()
     afkGems.TextColor3 = Color3.fromRGB(110, 185, 255)
     afkGems.Font = Enum.Font.GothamSemibold
     afkGems.TextSize = 42
+    afkGems.TextScaled = true
     afkGems.BackgroundTransparency = 1
     afkGems.TextXAlignment = Enum.TextXAlignment.Center
     afkGems.ZIndex = 102
     afkGems.Parent = afkCenter
 
     local afkExit = Instance.new("TextButton")
-    afkExit.Size = UDim2.new(1, 0, 0, 80)
-    afkExit.Position = UDim2.new(0, 0, 0, 680)
+    afkExit.Size = UDim2.new(0.72, 0, 0, 64)
+    afkExit.AnchorPoint = Vector2.new(0.5, 1)
+    afkExit.Position = UDim2.new(0.5, 0, 0.96, 0)
     afkExit.Text = "Turn Off AFK Mode"
     afkExit.TextColor3 = Color3.fromRGB(255, 255, 255)
     afkExit.BackgroundColor3 = Color3.fromRGB(200, 50, 50)
     afkExit.Font = Enum.Font.GothamSemibold
     afkExit.TextSize = 32
+    afkExit.TextScaled = true
     afkExit.ZIndex = 102
     afkExit.Parent = afkCenter
 
     local afkExitCorner = Instance.new("UICorner")
     afkExitCorner.CornerRadius = UDim.new(0, 12)
     afkExitCorner.Parent = afkExit
+
     local autoHatchMain = Instance.new("Frame")
     autoHatchMain.Name = "AutoHatchMain"
     autoHatchMain.Size = UDim2.new(0, 620, 0, 710)
@@ -857,6 +1124,7 @@ task.spawn(function()
     farmFrame.BackgroundTransparency = 1
     farmFrame.Visible = false
     farmFrame.Parent = autoHatchMain
+
     local function makeTheme(name, background, panel, surface, accent, controlOn, danger, text, muted, stroke)
         return {
             name = name,
@@ -910,11 +1178,13 @@ task.spawn(function()
         makeTheme("Arctic Aurora",    Color3.fromRGB(15, 30, 42),  Color3.fromRGB(24, 48, 62),  Color3.fromRGB(34, 68, 82),  Color3.fromRGB(90, 230, 210), Color3.fromRGB(120, 220, 150),Color3.fromRGB(240, 90, 110)),
         makeTheme("Deep Space",       Color3.fromRGB(8, 9, 20),    Color3.fromRGB(16, 17, 35),  Color3.fromRGB(25, 27, 52),  Color3.fromRGB(90, 125, 255), Color3.fromRGB(60, 210, 170), Color3.fromRGB(255, 70, 130)),
     }
+
     local savedThemeName = CurrentThemeName
     local activeTheme = Themes[1]
 
     local currentTabBtn = hatchTab
     local currentTabFrame = hatchFrame
+
     local themeBaseColors = setmetatable({}, { __mode = "k" })
     local THEME_LOCKED = "ThemeLocked"
 
@@ -982,6 +1252,7 @@ task.spawn(function()
     local function applyThemeToObject(obj)
         if not obj or not obj.Parent then return end
         if obj:GetAttribute("ThemePreview") or obj:GetAttribute(THEME_LOCKED) then return end
+
         if obj:IsA("TextButton") then
             local base = rememberBaseColors(obj)
             if base.background and obj.BackgroundTransparency < 1 then
@@ -1019,6 +1290,7 @@ task.spawn(function()
             end
         end
     end
+
     ui.DescendantAdded:Connect(function(obj)
         task.defer(function()
             if obj and obj.Parent then
@@ -1026,6 +1298,7 @@ task.spawn(function()
             end
         end)
     end)
+
 
     local function switchTab(activeBtn, activeFrame)
         hatchFrame.Visible = false
@@ -1053,6 +1326,7 @@ task.spawn(function()
     farmTab.MouseButton1Click:Connect(function() switchTab(farmTab, farmFrame) end)
 
     switchTab(hatchTab, hatchFrame)
+
     local toggleRegistry = {}
 
     local function createUnifiedToggle(parent, yPos, text, defaultState, callback)
@@ -1106,6 +1380,7 @@ task.spawn(function()
 
         return btn, updateVisuals
     end
+
     local farmTitle = Instance.new("TextLabel")
     farmTitle.Size = UDim2.new(1, 0, 0, 24)
     farmTitle.Position = UDim2.new(0, 0, 0, 0)
@@ -1122,11 +1397,23 @@ task.spawn(function()
         AutoFarmTurkey = state
         TurkeyDodgeActive = state
     end)
-    createUnifiedToggle(farmFrame, 116, "⭐ Auto Tokens", false, function(state) AutoTokens = state end)
+    createUnifiedToggle(farmFrame, 116, "☄️ Comet Farm", false, function(state)
+        AutoFarmComet = state
+        if state then
+            CurrentTarget = nil
+            CurrentTargetId = nil
+        else
+            CurrentComet = nil
+            CurrentCometId = nil
+        end
+    end)
+    createUnifiedToggle(farmFrame, 158, "⭐ Auto Tokens", false, function(state) AutoTokens = state end)
+    createUnifiedToggle(farmFrame, 200, "⚡ Fast Pet Speed", false, function(state) SetFastPetSpeed(state) end)
+    createUnifiedToggle(farmFrame, 242, "⚔️ Fast Attack", false, function(state) FastAttackSpeed = state end)
 
     local farmStatus = Instance.new("TextLabel")
     farmStatus.Size = UDim2.new(1, 0, 0, 28)
-    farmStatus.Position = UDim2.new(0, 0, 0, 160)
+    farmStatus.Position = UDim2.new(0, 0, 0, 286)
     farmStatus.BackgroundTransparency = 1
     farmStatus.Text = "Status: Idle"
     farmStatus.TextColor3 = Color3.fromRGB(180, 180, 180)
@@ -1148,6 +1435,9 @@ task.spawn(function()
                     farmStatus.Text = "Status: 🦃 Farming Target #" .. CurrentTargetId
                     farmStatus.TextColor3 = Color3.fromRGB(255, 200, 100)
                 end
+            elseif AutoFarmComet and CurrentCometId then
+                farmStatus.Text = "Status: ☄️ Farming Comet #" .. CurrentCometId
+                farmStatus.TextColor3 = Color3.fromRGB(180, 220, 255)
             elseif AutoFarmTurkey or AutoFarmRobot then
                 farmStatus.Text = "Status: ⏳ Searching Target..."
                 farmStatus.TextColor3 = Color3.fromRGB(255, 200, 80)
@@ -1158,6 +1448,7 @@ task.spawn(function()
             task.wait(0.5)
         end
     end)
+
     local function collectEggChanceData()
         local function trim(value)
             return (value:gsub("^%s+", ""):gsub("%s+$", ""))
@@ -1651,6 +1942,7 @@ task.spawn(function()
     local function selectEggSubTab(mode, targetBtn)
         showingEasiestPets = false
         chanceMode = mode
+
         if mode == "Eggs" then
             eggSearch.Visible = true
             eggSelect.Visible = true
@@ -1724,6 +2016,7 @@ task.spawn(function()
     rebuildEggOptions()
     eggSelect.Text = bestChanceEgg and ("Selected: " .. bestChanceEgg.Name) or "Select an egg"
     selectEggSubTab("Eggs", subTabButtons["Eggs"])
+
     local function formatNumber(value)
         local text = tostring(value)
         while true do
@@ -1766,6 +2059,7 @@ task.spawn(function()
     GemsLabel.BackgroundTransparency = 1
     GemsLabel.TextXAlignment = Enum.TextXAlignment.Left
     GemsLabel.Parent = statsContainer
+
     local hatchEggsGreen = Color3.fromRGB(80, 230, 80)
     local hatchDiamondsBlue = Color3.fromRGB(110, 185, 255)
     EggsLabel.TextColor3 = hatchEggsGreen
@@ -2089,6 +2383,7 @@ task.spawn(function()
             end
         end
     end)
+
     local afkRarePanel = Instance.new("Frame")
     afkRarePanel.Name = "AfkRarePanel"
     afkRarePanel.Size = UDim2.new(1, 0, 0, 440)
@@ -2230,15 +2525,14 @@ task.spawn(function()
         end
     end
     task.spawn(hookLeaderstats)
+
     local HATCH_SUCCESS_GAP = 0.30
     local HATCH_RETRY_GAP = 0.18
     local hatchRequestBusy = false
 
     task.spawn(function()
         while true do
-            if AutoBuying and SelectedEggId and EggNetwork
-                and type(EggNetwork.Invoke) == "function" then
-
+            if AutoBuying and SelectedEggId and EggNetwork and type(EggNetwork.Invoke) == "function" then
                 if not hatchRequestBusy then
                     hatchRequestBusy = true
 
@@ -2252,6 +2546,7 @@ task.spawn(function()
                             true
                         )
                     end)
+
                     if ok and result ~= false then
                         success = true
                     end
@@ -2271,6 +2566,7 @@ task.spawn(function()
             end
         end
     end)
+
     local tpTitle = Instance.new("TextLabel")
     tpTitle.Size = UDim2.new(1, 0, 0, 24)
     tpTitle.Position = UDim2.new(0, 0, 0, 0)
@@ -2282,6 +2578,40 @@ task.spawn(function()
     tpTitle.TextXAlignment = Enum.TextXAlignment.Left
     tpTitle.Parent = tpFrame
 
+    local tpTip = Instance.new("TextLabel")
+    tpTip.Size = UDim2.new(1, 0, 0, 42)
+    tpTip.Position = UDim2.new(0, 0, 0, 24)
+    tpTip.BackgroundTransparency = 1
+    tpTip.Text = "⚠ Only teleport to the spots in the same world as you are currently in. It will glitch if you teleport to a different world."
+    tpTip.TextColor3 = Color3.fromRGB(255, 190, 80)
+    tpTip.Font = Enum.Font.GothamSemibold
+    tpTip.TextSize = 11
+    tpTip.TextWrapped = true
+    tpTip.TextXAlignment = Enum.TextXAlignment.Left
+    tpTip.TextYAlignment = Enum.TextYAlignment.Center
+    tpTip.Parent = tpFrame
+
+    local tpScroll = Instance.new("ScrollingFrame")
+    tpScroll.Size = UDim2.new(1, 0, 1, -72)
+    tpScroll.Position = UDim2.new(0, 0, 0, 72)
+    tpScroll.BackgroundTransparency = 1
+    tpScroll.BorderSizePixel = 0
+    tpScroll.ScrollBarThickness = 5
+    tpScroll.ScrollBarImageTransparency = 0.35
+    tpScroll.AutomaticCanvasSize = Enum.AutomaticSize.Y
+    tpScroll.CanvasSize = UDim2.new(0, 0, 0, 0)
+    tpScroll.ScrollingDirection = Enum.ScrollingDirection.Y
+    tpScroll.Parent = tpFrame
+
+    local tpLayout = Instance.new("UIListLayout")
+    tpLayout.SortOrder = Enum.SortOrder.LayoutOrder
+    tpLayout.Padding = UDim.new(0, 6)
+    tpLayout.Parent = tpScroll
+
+    local tpPadding = Instance.new("UIPadding")
+    tpPadding.PaddingBottom = UDim.new(0, 8)
+    tpPadding.Parent = tpScroll
+
     local function teleportTo(x, y, z)
         local character = localPlayer.Character
         if character and character:FindFirstChild("HumanoidRootPart") then
@@ -2289,15 +2619,30 @@ task.spawn(function()
         end
     end
 
-    local function createTeleportButton(parent, yPos, name, coords)
+    local function createTeleportSection(parent, name)
+        local section = Instance.new("TextLabel")
+        section.Size = UDim2.new(1, -8, 0, 24)
+        section.BackgroundTransparency = 1
+        section.Text = name
+        section.TextColor3 = activeTheme.accent
+        section.Font = Enum.Font.GothamBold
+        section.TextSize = 13
+        section.TextXAlignment = Enum.TextXAlignment.Left
+        section.LayoutOrder = #parent:GetChildren() + 1
+        section.Parent = parent
+        return section
+    end
+
+    local function createTeleportButton(parent, name, coords)
         local button = Instance.new("TextButton")
-        button.Size = UDim2.new(1, 0, 0, 34)
-        button.Position = UDim2.new(0, 0, 0, yPos)
+        button.Size = UDim2.new(1, -8, 0, 34)
         button.BackgroundColor3 = activeTheme.surface
         button.Text = "📍 Teleport to " .. name
         button.TextColor3 = Color3.fromRGB(255, 255, 255)
         button.Font = Enum.Font.GothamBold
         button.TextSize = 13
+        button.TextScaled = false
+        button.LayoutOrder = #parent:GetChildren() + 1
         button.Parent = parent
 
         local btnCorner = Instance.new("UICorner")
@@ -2315,10 +2660,20 @@ task.spawn(function()
         end)
     end
 
-    createTeleportButton(tpFrame, 32, "World 1 Spawn", {267, 98, 238})
-    createTeleportButton(tpFrame, 74, "Fantasy Spawn", {-7568, 558, -1683})
-    createTeleportButton(tpFrame, 116, "Tech Spawn", {-9977, 16, 9601})
-    createTeleportButton(tpFrame, 158, "Last Area", {-7997, 16, 9609})
+    createTeleportSection(tpScroll, "World 1")
+    createTeleportButton(tpScroll, "World 1 Spawn", {267, 98, 238})
+    createTeleportButton(tpScroll, "World 1 Last Area", {-3691, 142, 232})
+
+    createTeleportSection(tpScroll, "Fantasy World")
+    createTeleportButton(tpScroll, "Fantasy Spawn", {-7568, 558, -1683})
+    createTeleportButton(tpScroll, "Moon Egg", {-7765, 639, -1247})
+    createTeleportButton(tpScroll, "Crystal Chest", {-5283, 583, -2271})
+    createTeleportButton(tpScroll, "Fantasy Last Area", {-4857, 558, -1679})
+
+    createTeleportSection(tpScroll, "Tech World")
+    createTeleportButton(tpScroll, "Tech Spawn", {-9977, 16, 9601})
+    createTeleportButton(tpScroll, "Tech Last Area", {-7997, 16, 9609})
+
     local settingsTitle = Instance.new("TextLabel")
     settingsTitle.Size = UDim2.new(1, 0, 0, 24)
     settingsTitle.Position = UDim2.new(0, 0, 0, 0)
@@ -2361,6 +2716,43 @@ task.spawn(function()
     keybindStroke.Transparency = 0.7
     keybindStroke.Parent = keybindBtn
 
+    local mobileToggle = Instance.new("TextButton")
+    mobileToggle.Name = "MobileUIToggle"
+    mobileToggle.Size = UDim2.new(0, 58, 0, 58)
+    mobileToggle.AnchorPoint = Vector2.new(1, 1)
+    mobileToggle.Position = UDim2.new(1, -12, 1, -12)
+    mobileToggle.BackgroundColor3 = Color3.fromRGB(32, 32, 42)
+    mobileToggle.TextColor3 = Color3.fromRGB(255, 255, 255)
+    mobileToggle.Text = "UI"
+    mobileToggle.Font = Enum.Font.GothamBold
+    mobileToggle.TextSize = 18
+    mobileToggle.ZIndex = 1000
+    mobileToggle.AutoButtonColor = true
+    mobileToggle.Parent = ui
+
+    local mobileToggleCorner = Instance.new("UICorner")
+    mobileToggleCorner.CornerRadius = UDim.new(1, 0)
+    mobileToggleCorner.Parent = mobileToggle
+
+    local mobileToggleStroke = Instance.new("UIStroke")
+    mobileToggleStroke.Thickness = 2
+    mobileToggleStroke.Transparency = 0.25
+    mobileToggleStroke.Parent = mobileToggle
+
+    local function toggleMainUI()
+        if afkOverlay.Visible then
+            return
+        end
+        autoHatchMain.Visible = not autoHatchMain.Visible
+        mobileToggle.Text = autoHatchMain.Visible and "UI" or "OPEN"
+    end
+
+    mobileToggle.Activated:Connect(toggleMainUI)
+
+    afkOverlay:GetPropertyChangedSignal("Visible"):Connect(function()
+        mobileToggle.Visible = not afkOverlay.Visible
+    end)
+
     local listeningForKey = false
     keybindBtn.MouseButton1Click:Connect(function()
         listeningForKey = true
@@ -2375,9 +2767,7 @@ task.spawn(function()
             keybindBtn.Text = "Current Key: " .. CurrentKeyName
             saveSettings()
         elseif not gameProcessed and input.UserInputType == Enum.UserInputType.Keyboard and input.KeyCode == ToggleKey then
-            if not afkOverlay.Visible then
-                autoHatchMain.Visible = not autoHatchMain.Visible
-            end
+            toggleMainUI()
         end
     end)
 
@@ -2436,6 +2826,7 @@ task.spawn(function()
             applyTheme(themeObj)
         end)
     end
+
     for _, themeObj in ipairs(Themes) do
         if themeObj.name == savedThemeName then
             applyTheme(themeObj)
