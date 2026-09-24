@@ -1,6 +1,6 @@
 -- =====================================================================
 -- COMBINED AUTOMATION SCRIPT: UNIFIED UI + FIXED AUTO TOKENS + BOSS DODGE
--- EGG CHANCE VIEWER + AUTO FARM & PET TRACKER + EXTENDED THEMES
+-- HATCH LOGIC + EGG CHANCE VIEWER + AUTO FARM & PET TRACKER + EXTENDED THEMES
 -- =====================================================================
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -132,10 +132,7 @@ end
 local TurkeyDodgeActive = false
 local IsEvading = false
 
--- EXPEDITION ATTACK DODGE
--- Uses the same attack event consumed by the AutumnBoss client controller.
--- We do not rely on __AUTUMNBOSS_FX, because the attack event contains the
--- actual telegraph parameters and some attacks can exist without visible FX.
+-- EXPEDITION DODGE VARIABLES
 local ExpeditionDodgeEnabled = true
 local ExpeditionDodgeActive = false
 local ExpeditionDodgeSavedCFrame = nil
@@ -146,6 +143,91 @@ local ExpeditionCombatRadius = 10.5
 local ExpeditionDodgeMargin = 1.75
 local ExpeditionFloorHeight = 3
 
+-- AUTO FARM FUNCTIONS
+local function GetAllEquippedPetUIDs()
+    local myPets = {}
+    local equipped = Library.PetCmds.GetEquipped()
+    for uid, petData in pairs(equipped) do
+        if type(petData) == "table" and petData.uid then
+            table.insert(myPets, petData.uid)
+        else
+            table.insert(myPets, uid)
+        end
+    end
+    return myPets
+end
+
+local function GetNextRobot()
+    local coins = Workspace:FindFirstChild("__THINGS") and Workspace.__THINGS:FindFirstChild("Coins")
+    if not coins then return nil end
+    for _, child in ipairs(coins:GetChildren()) do
+        local name = (child:GetAttribute("Name") or child:GetAttribute("Mob") or child.Name):lower()
+        if name:find("robot") and not name:find("factory") then
+            return child
+        end
+    end
+    return nil
+end
+
+local function FindTurkey()
+    local coins = Workspace:FindFirstChild("__THINGS") and Workspace.__THINGS:FindFirstChild("Coins")
+    if not coins then return nil end
+    for _, child in ipairs(coins:GetChildren()) do
+        if not child.Parent then continue end
+        local name = (child:GetAttribute("Name") or child:GetAttribute("Mob") or child.Name):lower()
+        if name:find("turkey") or name:find("autumn") or (name:find("boss") and (name:find("turkey") or name:find("autumn"))) then
+            return child
+        end
+    end
+    return nil
+end
+-- Expedition mobs live in the same Coins container while an expedition is
+-- running. Unlike robots/turkey, there is no fixed mob name to rely on, so
+-- choose randomly from the currently spawned expedition coins.
+local function IsExpeditionMob(coin)
+    if not coin or not coin.Parent then return false end
+    if not localPlayer:GetAttribute("ExpeditionRun") then return false end
+
+    local id = coin:GetAttribute("ID")
+    if id == nil then return false end
+
+    -- Expedition coins should have health and a rendered Coin part.
+    -- Ignore non-mob/placeholder objects that happen to be in Coins.
+    local health = coin:GetAttribute("Health")
+    local coinPart = coin:FindFirstChild("Coin")
+    if health == nil or not coinPart then return false end
+
+    if coinPart:GetAttribute("PreventClick") then return false end
+    return true
+end
+
+local function FindRandomExpeditionMob(previous)
+    local coinsFolder = Workspace:FindFirstChild("__THINGS")
+        and Workspace.__THINGS:FindFirstChild("Coins")
+    if not coinsFolder or not localPlayer:GetAttribute("ExpeditionRun") then
+        return nil
+    end
+
+    local candidates = {}
+    for _, coin in ipairs(coinsFolder:GetChildren()) do
+        if IsExpeditionMob(coin) and coin ~= previous then
+            table.insert(candidates, coin)
+        end
+    end
+
+    -- If only one mob is alive, allow it to be selected again after the
+    -- previous target disappears/reappears.
+    if #candidates == 0 and previous and IsExpeditionMob(previous) then
+        table.insert(candidates, previous)
+    end
+
+    if #candidates == 0 then return nil end
+    return candidates[math.random(1, #candidates)]
+end
+-- EXPEDITION ATTACK DODGE
+-- Uses the same attack event consumed by the AutumnBoss client controller.
+-- We do not rely on __AUTUMNBOSS_FX, because the attack event contains the
+-- actual telegraph parameters and some attacks can exist without visible FX.
 local function GetExpeditionCombatPosition()
     local target = CurrentExpeditionTarget
     if target and target.Parent then
@@ -457,89 +539,6 @@ localPlayer.CharacterAdded:Connect(function()
     ExpeditionDodgeSavedCFrame = nil
     table.clear(ExpeditionActiveAttacks)
 end)
-
--- AUTO FARM FUNCTIONS
-local function GetAllEquippedPetUIDs()
-    local myPets = {}
-    local equipped = Library.PetCmds.GetEquipped()
-    for uid, petData in pairs(equipped) do
-        if type(petData) == "table" and petData.uid then
-            table.insert(myPets, petData.uid)
-        else
-            table.insert(myPets, uid)
-        end
-    end
-    return myPets
-end
-
-local function GetNextRobot()
-    local coins = Workspace:FindFirstChild("__THINGS") and Workspace.__THINGS:FindFirstChild("Coins")
-    if not coins then return nil end
-    for _, child in ipairs(coins:GetChildren()) do
-        local name = (child:GetAttribute("Name") or child:GetAttribute("Mob") or child.Name):lower()
-        if name:find("robot") and not name:find("factory") then
-            return child
-        end
-    end
-    return nil
-end
-
-local function FindTurkey()
-    local coins = Workspace:FindFirstChild("__THINGS") and Workspace.__THINGS:FindFirstChild("Coins")
-    if not coins then return nil end
-    for _, child in ipairs(coins:GetChildren()) do
-        if not child.Parent then continue end
-        local name = (child:GetAttribute("Name") or child:GetAttribute("Mob") or child.Name):lower()
-        if name:find("turkey") or name:find("autumn") or (name:find("boss") and (name:find("turkey") or name:find("autumn"))) then
-            return child
-        end
-    end
-    return nil
-end
-
--- Expedition mobs live in the same Coins container while an expedition is
--- running. Unlike robots/turkey, there is no fixed mob name to rely on, so
--- choose randomly from the currently spawned expedition coins.
-local function IsExpeditionMob(coin)
-    if not coin or not coin.Parent then return false end
-    if not localPlayer:GetAttribute("ExpeditionRun") then return false end
-
-    local id = coin:GetAttribute("ID")
-    if id == nil then return false end
-
-    -- Expedition coins should have health and a rendered Coin part.
-    -- Ignore non-mob/placeholder objects that happen to be in Coins.
-    local health = coin:GetAttribute("Health")
-    local coinPart = coin:FindFirstChild("Coin")
-    if health == nil or not coinPart then return false end
-
-    if coinPart:GetAttribute("PreventClick") then return false end
-    return true
-end
-
-local function FindRandomExpeditionMob(previous)
-    local coinsFolder = Workspace:FindFirstChild("__THINGS")
-        and Workspace.__THINGS:FindFirstChild("Coins")
-    if not coinsFolder or not localPlayer:GetAttribute("ExpeditionRun") then
-        return nil
-    end
-
-    local candidates = {}
-    for _, coin in ipairs(coinsFolder:GetChildren()) do
-        if IsExpeditionMob(coin) and coin ~= previous then
-            table.insert(candidates, coin)
-        end
-    end
-
-    -- If only one mob is alive, allow it to be selected again after the
-    -- previous target disappears/reappears.
-    if #candidates == 0 and previous and IsExpeditionMob(previous) then
-        table.insert(candidates, previous)
-    end
-
-    if #candidates == 0 then return nil end
-    return candidates[math.random(1, #candidates)]
-end
 local function FocusPetsContinuous(coinInstance)
     if not coinInstance or not coinInstance.Parent then return end
 
@@ -569,6 +568,29 @@ local function FocusPetsContinuous(coinInstance)
         end
 
         LastPetSendTarget = coinInstance
+    end
+end
+
+
+local function FocusPetsContinuous(coinInstance)
+    if not coinInstance or not coinInstance.Parent then return end
+    local coinId = coinInstance:GetAttribute("ID")
+    local myPets = GetAllEquippedPetUIDs()
+
+    pcall(function()
+        Library.Signal.Fire("Select Coin", coinInstance)
+    end)
+
+    if coinId and #myPets > 0 then
+        pcall(function()
+            Library.Network.Invoke("Join Coin", coinId, myPets)
+        end)
+
+        for _, petUid in ipairs(myPets) do
+            pcall(function()
+                Library.Network.Fire("Change Pet Target", petUid, "Coin", coinId)
+            end)
+        end
     end
 end
 
@@ -898,6 +920,103 @@ task.spawn(function()
     end
 end)
 
+-- EXPEDITION ATTACK DODGE
+-- Keep the player close enough that expedition mobs can still target them.
+-- The expedition source does not expose a numeric arena radius, so the dodge
+-- uses a conservative target-relative radius instead of making large jumps.
+local function GetSafeExpeditionDodgeCFrame(hrp, targetPosition)
+    local offset = hrp.Position - targetPosition
+    local flatOffset = Vector3.new(offset.X, 0, offset.Z)
+
+    if flatOffset.Magnitude < 0.5 then
+        flatOffset = Vector3.new(hrp.CFrame.RightVector.X, 0, hrp.CFrame.RightVector.Z)
+    end
+
+    if flatOffset.Magnitude < 0.05 then
+        flatOffset = Vector3.new(1, 0, 0)
+    end
+
+    local radial = flatOffset.Unit
+    local perpendicular = Vector3.new(-radial.Z, 0, radial.X)
+
+    -- Alternate sides so repeated attacks do not send the player farther away.
+    if math.random(0, 1) == 0 then
+        perpendicular = -perpendicular
+    end
+
+    local candidate = targetPosition + perpendicular * ExpeditionDodgeRadius
+
+    -- Put the player on actual ground. This prevents the dodge from placing
+    -- the HumanoidRootPart in mid-air and falling through the expedition map.
+    local rayParams = RaycastParams.new()
+    rayParams.FilterType = Enum.RaycastFilterType.Exclude
+    rayParams.FilterDescendantsInstances = {localPlayer.Character, CurrentExpeditionTarget}
+    rayParams.IgnoreWater = true
+
+    local rayOrigin = candidate + Vector3.new(0, 60, 0)
+    local rayResult = Workspace:Raycast(rayOrigin, Vector3.new(0, -140, 0), rayParams)
+    if rayResult then
+        candidate = rayResult.Position + Vector3.new(0, 3, 0)
+    else
+        -- If no floor was found, do not perform the teleport at all.
+        return nil
+    end
+
+    -- Final safety check: never place the player farther than the combat radius.
+    local finalOffset = Vector3.new(candidate.X - targetPosition.X, 0, candidate.Z - targetPosition.Z)
+    if finalOffset.Magnitude > ExpeditionMaxCombatRadius then
+        candidate = targetPosition + finalOffset.Unit * ExpeditionMaxCombatRadius
+        local floorCheck = Workspace:Raycast(candidate + Vector3.new(0, 60, 0), Vector3.new(0, -140, 0), rayParams)
+        if not floorCheck then
+            return nil
+        end
+        candidate = floorCheck.Position + Vector3.new(0, 3, 0)
+    end
+
+    return CFrame.new(candidate, Vector3.new(targetPosition.X, candidate.Y, targetPosition.Z))
+end
+
+task.spawn(function()
+    while true do
+        task.wait(0.05)
+
+        if AutoFarmExpedition then
+            local character = localPlayer.Character
+            local hrp = character and character:FindFirstChild("HumanoidRootPart")
+            local fxFolder = Workspace:FindFirstChild("__AUTUMNBOSS_FX")
+
+            if hrp and CurrentExpeditionTarget and CurrentExpeditionTarget.Parent and fxFolder and #fxFolder:GetChildren() > 0 then
+                if not ExpeditionIsEvading then
+                    local targetPart = CurrentExpeditionTarget:FindFirstChild("Coin")
+                    local targetPosition = targetPart and targetPart.Position or CurrentExpeditionTarget:GetPivot().Position
+                    local safeDodge = GetSafeExpeditionDodgeCFrame(hrp, targetPosition)
+
+                    if safeDodge then
+                        ExpeditionIsEvading = true
+                        ExpeditionSavedCFrame = hrp.CFrame
+                        hrp.CFrame = safeDodge
+                    end
+                end
+            elseif ExpeditionIsEvading and hrp then
+                ExpeditionIsEvading = false
+                if ExpeditionSavedCFrame then
+                    hrp.CFrame = ExpeditionSavedCFrame
+                end
+                ExpeditionSavedCFrame = nil
+            end
+        elseif ExpeditionIsEvading then
+            local character = localPlayer.Character
+            local hrp = character and character:FindFirstChild("HumanoidRootPart")
+            if hrp and ExpeditionSavedCFrame then
+                hrp.CFrame = ExpeditionSavedCFrame
+            end
+            ExpeditionIsEvading = false
+            ExpeditionSavedCFrame = nil
+        end
+    end
+end)
+
+
 -- Main Auto Farm Loop
 task.spawn(function()
     while true do
@@ -911,13 +1030,11 @@ task.spawn(function()
                 FocusPetsContinuous(CurrentTarget)
             else
                 CurrentTargetId = nil
-                LastPetSendTarget = nil
             end
         else
             if not AutoFarmTurkey then
                 CurrentTarget = nil
                 CurrentTargetId = nil
-                LastPetSendTarget = nil
             end
         end
         
@@ -930,13 +1047,11 @@ task.spawn(function()
                 FocusPetsContinuous(CurrentTarget)
             else
                 CurrentTargetId = nil
-                LastPetSendTarget = nil
             end
         else
             if not AutoFarmRobot then
                 CurrentTarget = nil
                 CurrentTargetId = nil
-                LastPetSendTarget = nil
             end
         end
     end
@@ -966,48 +1081,33 @@ end)
 
 
 -- =====================================================================
--- EGG OPEN ANIMATION DISABLED COMPLETELY
--- The game's hatch result/network flow is left alone. We only suppress the
--- client-side PlayTrigger used by EggOpenAnim so eggs never play their
--- opening animation/effects.
+-- EGG OPEN ANIMATION DISABLED
+-- Keeps the normal hatch request/results, but skips the client-side
+-- EggOpenAnim.Play sequence (cracks, sounds, particles, blur, waits).
 -- =====================================================================
-local function cleanupEggOpeningEffects()
-    pcall(function()
-        local camera = Workspace.CurrentCamera
-        if camera then
-            local animatedEggs = camera:FindFirstChild("EggOpenAnim_Eggs")
-            if animatedEggs then animatedEggs:Destroy() end
-        end
-        local dof = Lighting:FindFirstChild("EggOpenDOF")
-        if dof then dof:Destroy() end
-    end)
-end
-
--- EggOpenHook ultimately calls EggOpenPort.PlayTrigger:Fire(...) to start
--- the visual egg-opening sequence. Block only that client-side trigger.
-pcall(function()
-    if type(hookmetamethod) == "function" and type(getnamecallmethod) == "function" then
-        local oldNamecall
-        oldNamecall = hookmetamethod(game, "__namecall", newcclosure(function(self, ...)
-            local method = getnamecallmethod()
-            if method == "Fire" and self and self.Name == "PlayTrigger" then
-                local parent = self.Parent
-                if parent and parent.Name == "EggOpenPort" then
-                    cleanupEggOpeningEffects()
-                    return nil
-                end
-            end
-            return oldNamecall(self, ...)
-        end))
-    end
-end)
-
--- Also keep cleaning up any animation container that may have been created
--- by another client-side path.
 task.spawn(function()
-    while true do
-        cleanupEggOpeningEffects()
-        task.wait(0.1)
+    local eggOpenPort = ReplicatedStorage:FindFirstChild("EggOpenPort")
+    if eggOpenPort then
+        local eggOpenAnim = eggOpenPort:FindFirstChild("EggOpenAnim")
+        if eggOpenAnim and (eggOpenAnim:IsA("ModuleScript") or eggOpenAnim:IsA("LocalScript")) then
+            pcall(function()
+                -- Replace the module's Play function when the executor exposes
+                -- a mutable module table. If it cannot be modified directly,
+                -- the game module remains untouched rather than breaking hatch.
+                local anim = require(eggOpenAnim)
+                if type(anim) == "table" then
+                    anim.Play = function()
+                        local camera = Workspace.CurrentCamera
+                        if camera then
+                            local eggs = camera:FindFirstChild("EggOpenAnim_Eggs")
+                            if eggs then eggs:Destroy() end
+                        end
+                        local dof = Lighting:FindFirstChild("EggOpenDOF")
+                        if dof then dof:Destroy() end
+                    end
+                end
+            end)
+        end
     end
 end)
 
@@ -1627,7 +1727,7 @@ task.spawn(function()
         return btn
     end
 
-    local hatchTab = createTabButton("Stats", 0)
+    local hatchTab = createTabButton("Hatch", 0)
     local tpTab = createTabButton("Teleport", 0.202)
     local settingsTab = createTabButton("Settings", 0.404)
     local eggTab = createTabButton("Egg Chances", 0.606)
@@ -1957,15 +2057,7 @@ task.spawn(function()
         AutoFarmTurkey = state
         TurkeyDodgeActive = state
     end)
-    createUnifiedToggle(farmFrame, 116, "🍂 Expedition Farm", false, function(state)
-        AutoFarmExpedition = state
-        if not state then
-            CurrentExpeditionTarget = nil
-            CurrentExpeditionTargetId = nil
-            LastExpeditionPetSendTarget = nil
-        end
-    end)
-    createUnifiedToggle(farmFrame, 200, "☄️ Comet Farm", false, function(state)
+    createUnifiedToggle(farmFrame, 116, "☄️ Comet Farm", false, function(state)
         AutoFarmComet = state
         if state then
             CurrentTarget = nil
@@ -1975,26 +2067,25 @@ task.spawn(function()
             CurrentCometId = nil
         end
     end)
-    createUnifiedToggle(farmFrame, 242, "⭐ Auto Tokens", false, function(state) AutoTokens = state end)
-    createUnifiedToggle(farmFrame, 284, "⚡ Fast Pet Speed", false, function(state) SetFastPetSpeed(state) end)
-    createUnifiedToggle(farmFrame, 326, "⚔️ Fast Attack", false, function(state) FastAttackSpeed = state end)
+    createUnifiedToggle(farmFrame, 158, "⭐ Auto Tokens", false, function(state) AutoTokens = state end)
+    createUnifiedToggle(farmFrame, 200, "⚡ Fast Pet Speed", false, function(state) SetFastPetSpeed(state) end)
+    createUnifiedToggle(farmFrame, 242, "⚔️ Fast Attack", false, function(state) FastAttackSpeed = state end)
 
-    local farmTip = Instance.new("TextLabel")
-    farmTip.Size = UDim2.new(1, 0, 0, 40)
-    farmTip.Position = UDim2.new(0, 0, 0, 368)
-    farmTip.BackgroundTransparency = 1
-    farmTip.Text = "Tip: Turn on Pets sending all when you use the mobs features."
-    farmTip.TextColor3 = Color3.fromRGB(180, 180, 190)
-    farmTip.Font = Enum.Font.Gotham
-    farmTip.TextSize = 12
-    farmTip.TextWrapped = true
-    farmTip.TextXAlignment = Enum.TextXAlignment.Left
-    farmTip.TextYAlignment = Enum.TextYAlignment.Center
-    farmTip.Parent = farmFrame
+    createUnifiedToggle(farmFrame, 284, "🍂 Expedition Farm", false, function(state)
+        AutoFarmExpedition = state
+        if not state then
+            CurrentExpeditionTarget = nil
+            CurrentExpeditionTargetId = nil
+            LastExpeditionPetSendTarget = nil
+            ExpeditionActiveAttacks = {}
+            ExpeditionDodgeActive = false
+            ExpeditionDodgeSavedCFrame = nil
+        end
+    end)
 
     local farmStatus = Instance.new("TextLabel")
     farmStatus.Size = UDim2.new(1, 0, 0, 28)
-    farmStatus.Position = UDim2.new(0, 0, 0, 414)
+    farmStatus.Position = UDim2.new(0, 0, 0, 326)
     farmStatus.BackgroundTransparency = 1
     farmStatus.Text = "Status: Idle"
     farmStatus.TextColor3 = Color3.fromRGB(180, 180, 180)
@@ -2010,22 +2101,24 @@ task.spawn(function()
                 farmStatus.TextColor3 = Color3.fromRGB(100, 255, 100)
             elseif AutoFarmTurkey and CurrentTargetId then
                 if IsEvading then
-                    farmStatus.Text = "Status: 🦃 DODGING ATTACK!"
+                    farmStatus.Text = "Status: 🦃 DODGING BOSS FX!"
                     farmStatus.TextColor3 = Color3.fromRGB(255, 100, 100)
                 else
                     farmStatus.Text = "Status: 🦃 Farming Target #" .. CurrentTargetId
                     farmStatus.TextColor3 = Color3.fromRGB(255, 200, 100)
                 end
-            elseif AutoFarmExpedition and ExpeditionDodgeActive then
-                farmStatus.Text = "Status: 🍂 DODGING EXPEDITION ATTACK!"
-                farmStatus.TextColor3 = Color3.fromRGB(255, 100, 100)
             elseif AutoFarmExpedition and CurrentExpeditionTargetId then
-                farmStatus.Text = "Status: 🍂 Farming Expedition Mob #" .. CurrentExpeditionTargetId
-                farmStatus.TextColor3 = Color3.fromRGB(255, 170, 100)
+                if ExpeditionDodgeActive then
+                    farmStatus.Text = "Status: 🍂 DODGING EXPEDITION ATTACK!"
+                    farmStatus.TextColor3 = Color3.fromRGB(255, 100, 100)
+                else
+                    farmStatus.Text = "Status: 🍂 Farming Expedition Mob #" .. CurrentExpeditionTargetId
+                    farmStatus.TextColor3 = Color3.fromRGB(255, 170, 100)
+                end
             elseif AutoFarmComet and CurrentCometId then
                 farmStatus.Text = "Status: ☄️ Farming Comet #" .. CurrentCometId
                 farmStatus.TextColor3 = Color3.fromRGB(180, 220, 255)
-            elseif AutoFarmExpedition or AutoFarmTurkey or AutoFarmRobot then
+            elseif AutoFarmTurkey or AutoFarmRobot then
                 farmStatus.Text = "Status: ⏳ Searching Target..."
                 farmStatus.TextColor3 = Color3.fromRGB(255, 200, 80)
             else
@@ -2623,7 +2716,7 @@ task.spawn(function()
 
     local statsContainer = Instance.new("Frame")
     statsContainer.Name = "StatsContainer"
-    statsContainer.Size = UDim2.new(1, 0, 0, 136)
+    statsContainer.Size = UDim2.new(1, 0, 0, 142)
     statsContainer.Position = UDim2.new(0, 0, 0, 0)
     statsContainer.BackgroundColor3 = Color3.fromRGB(28, 29, 38)
     statsContainer.Parent = hatchFrame
@@ -2654,7 +2747,7 @@ task.spawn(function()
     GemsLabel.TextXAlignment = Enum.TextXAlignment.Left
     GemsLabel.Parent = statsContainer
 
-    -- These Stats-tab counters keep their fixed colors in every theme.
+    -- These Hatch-tab counters keep their fixed colors in every theme.
     local hatchEggsGreen = Color3.fromRGB(80, 230, 80)
     local hatchDiamondsBlue = Color3.fromRGB(110, 185, 255)
     EggsLabel.TextColor3 = hatchEggsGreen
@@ -2681,6 +2774,126 @@ task.spawn(function()
     makeHatchRareLabel("Titanics", 94)
     makeHatchRareLabel("Gargantuans", 116)
 
+    local SearchBox = Instance.new("TextBox")
+    SearchBox.Size = UDim2.new(1, 0, 0, 32)
+    SearchBox.Position = UDim2.new(0, 0, 0, 152)
+    SearchBox.PlaceholderText = "Search egg to hatch..."
+    SearchBox.Text = ""
+    SearchBox.BackgroundColor3 = Color3.fromRGB(30, 30, 40)
+    SearchBox.TextColor3 = Color3.fromRGB(255, 255, 255)
+    SearchBox.Font = Enum.Font.Gotham
+    SearchBox.TextSize = 13
+    SearchBox.Parent = hatchFrame
+
+    local searchCorner = Instance.new("UICorner")
+    searchCorner.CornerRadius = UDim.new(0, 6)
+    searchCorner.Parent = SearchBox
+
+    local searchStroke = Instance.new("UIStroke")
+    searchStroke.Color = Color3.fromRGB(80, 80, 100)
+    searchStroke.Thickness = 1
+    searchStroke.Transparency = 0.7
+    searchStroke.Parent = SearchBox
+
+    local SelectedEggLabel = Instance.new("TextLabel")
+    SelectedEggLabel.Size = UDim2.new(1, 0, 0, 20)
+    SelectedEggLabel.Position = UDim2.new(0, 0, 0, 190)
+    SelectedEggLabel.Text = "Selected: Spawn Egg"
+    SelectedEggLabel.TextColor3 = Color3.fromRGB(100, 225, 100)
+    SelectedEggLabel.Font = Enum.Font.GothamBold
+    SelectedEggLabel.TextSize = 12
+    SelectedEggLabel.BackgroundTransparency = 1
+    SelectedEggLabel.TextXAlignment = Enum.TextXAlignment.Left
+    SelectedEggLabel.Parent = hatchFrame
+
+    local DropdownFrame = Instance.new("ScrollingFrame")
+    DropdownFrame.Size = UDim2.new(1, 0, 0, 100)
+    DropdownFrame.Position = UDim2.new(0, 0, 0, 216)
+    DropdownFrame.BackgroundColor3 = Color3.fromRGB(25, 25, 35)
+    DropdownFrame.BorderSizePixel = 0
+    DropdownFrame.CanvasSize = UDim2.new(0, 0, 0, 0)
+    DropdownFrame.ScrollBarThickness = 5
+    DropdownFrame.Parent = hatchFrame
+
+    local dropdownCorner = Instance.new("UICorner")
+    dropdownCorner.CornerRadius = UDim.new(0, 6)
+    dropdownCorner.Parent = DropdownFrame
+
+    local dropdownStroke = Instance.new("UIStroke")
+    dropdownStroke.Color = Color3.fromRGB(80, 80, 100)
+    dropdownStroke.Thickness = 1
+    dropdownStroke.Transparency = 0.7
+    dropdownStroke.Parent = DropdownFrame
+
+    local dropdownLayout = Instance.new("UIListLayout")
+    dropdownLayout.Parent = DropdownFrame
+    dropdownLayout.SortOrder = Enum.SortOrder.LayoutOrder
+    dropdownLayout.Padding = UDim.new(0, 2)
+
+    local EggList = {
+        { ID = "Spawn Egg", Name = "Spawn Egg" },
+        { ID = "Fogbound Forest Egg", Name = "Fogbound Forest Egg" },
+    }
+
+    pcall(function()
+        local Lib = require(ReplicatedStorage.Framework.Library)
+        if Lib and Lib.Directory and Lib.Directory.Eggs then
+            local list = {}
+            for id, data in pairs(Lib.Directory.Eggs) do
+                if type(data) == "table" then
+                    table.insert(list, { ID = id, Name = data.displayName or id })
+                end
+            end
+            table.sort(list, function(a, b)
+                return (a.Name or ""):lower() < (b.Name or ""):lower()
+            end)
+            EggList = list
+        end
+    end)
+
+    local SelectedEggId = EggList[1] and EggList[1].ID or "Spawn Egg"
+    local function updateDropdown(filter)
+        for _, child in ipairs(DropdownFrame:GetChildren()) do
+            if child:IsA("TextButton") then child:Destroy() end
+        end
+        local query = filter:lower()
+        local count = 0
+        for _, egg in ipairs(EggList) do
+            if query == "" or (egg.Name or ""):lower():find(query, 1, true) then
+                count += 1
+                local button = Instance.new("TextButton")
+                button.Size = UDim2.new(1, -6, 0, 24)
+                button.BackgroundColor3 = activeTheme.surface
+                button.Text = "  " .. egg.Name
+                button.TextColor3 = Color3.fromRGB(255, 255, 255)
+                button.Font = Enum.Font.Gotham
+                button.TextSize = 12
+                button.TextXAlignment = Enum.TextXAlignment.Left
+                button.Parent = DropdownFrame
+
+                local optCorner = Instance.new("UICorner")
+                optCorner.CornerRadius = UDim.new(0, 4)
+                optCorner.Parent = button
+
+                button.MouseButton1Click:Connect(function()
+                    SelectedEggId = egg.ID
+                    SelectedEggLabel.Text = "Selected: " .. egg.Name
+                end)
+            end
+        end
+        DropdownFrame.CanvasSize = UDim2.new(0, 0, 0, math.max(count * 26, 0))
+    end
+
+    updateDropdown("")
+    SelectedEggLabel.Text = "Selected: " .. (EggList[1] and EggList[1].Name or "None")
+
+    SearchBox.Changed:Connect(function(prop)
+        if prop == "Text" then
+            updateDropdown(SearchBox.Text)
+        end
+    end)
+
+    local AutoBuying = false
     local ToggleKey = Enum.KeyCode[CurrentKeyName] or Enum.KeyCode.LeftControl
 
     updateAfkSessionLabels = function()
@@ -2740,23 +2953,13 @@ task.spawn(function()
         end)
     end
 
-    createUnifiedToggle(hatchFrame, 144, "AFK CPU Reducer", false, function(value) setAfkMode(value) end)
-    local autoHatchTip = Instance.new("TextLabel")
-autoHatchTip.Size = UDim2.new(1, -20, 0, 38)
-autoHatchTip.Position = UDim2.new(0, 10, 0, 184)
-autoHatchTip.BackgroundTransparency = 1
-autoHatchTip.Text = "Tip: Use the game's built-in Auto Hatch for automatic hatching. This script only removes egg-opening animations. Turn off Stop on failure in Hatch settings."
-autoHatchTip.TextColor3 = Color3.fromRGB(180, 190, 205)
-autoHatchTip.Font = Enum.Font.Gotham
-autoHatchTip.TextSize = 13
-autoHatchTip.TextWrapped = true
-autoHatchTip.TextXAlignment = Enum.TextXAlignment.Left
-autoHatchTip.Parent = hatchFrame
+    createUnifiedToggle(hatchFrame, 326, "AFK CPU Reducer", false, function(value) setAfkMode(value) end)
+    createUnifiedToggle(hatchFrame, 368, "⚡ Auto-Hatch Egg", false, function(value) AutoBuying = value end)
 
     local recentPanel = Instance.new("Frame")
     recentPanel.Name = "RecentHatchesPanel"
     recentPanel.Size = UDim2.new(1, -6, 0, 150)
-    recentPanel.Position = UDim2.new(0, 3, 0, 230)
+    recentPanel.Position = UDim2.new(0, 3, 0, 412)
     recentPanel.BackgroundColor3 = activeTheme.panel
     recentPanel.BorderSizePixel = 0
     recentPanel.Parent = hatchFrame
@@ -2983,7 +3186,43 @@ autoHatchTip.Parent = hatchFrame
         end
     end
 
+    local childNodes = ReplicatedStorage:GetChildren()
     renderAfkRecent()
+    local BuyEggRemote = nil
+
+    if childNodes[60] and childNodes[60]:IsA("RemoteFunction") then
+        BuyEggRemote = childNodes[60]
+    else
+        for _, obj in ipairs(childNodes) do
+            if obj:IsA("RemoteFunction") and (obj.Name:lower():find("egg") or obj.Name:lower():find("buy")) then
+                BuyEggRemote = obj
+                break
+            end
+        end
+    end
+
+    pcall(function()
+        local Lib = require(ReplicatedStorage:WaitForChild("Framework", 2):WaitForChild("Library", 2))
+        if Lib then
+            if Lib.Variables then
+                Lib.Variables.OpeningEgg = 0
+            end
+            if Lib.EggCmd and type(Lib.EggCmd.Open) == "function" then
+                Lib.EggCmd.Open = function() return end
+            end
+        end
+    end)
+
+    if localPlayer then
+        local targetGui = localPlayer:WaitForChild("PlayerGui", 2)
+        if targetGui then
+            for _, gui in ipairs(targetGui:GetChildren()) do
+                if gui.Name:lower():find("egg") or gui.Name:lower():find("open") then
+                    gui:Destroy()
+                end
+            end
+        end
+    end
 
     local function hookLeaderstats()
         local leaderstats = localPlayer:WaitForChild("leaderstats", 5)
@@ -3010,6 +3249,35 @@ autoHatchTip.Parent = hatchFrame
         end
     end
     task.spawn(hookLeaderstats)
+
+    -- OPTIMIZED HATCH LOOP
+    -- Keep the same hatch behavior, but avoid stacking concurrent RemoteFunction
+    -- calls. That can build up network/server work and cause ping spikes/freezes.
+    local BATCH_SIZE = 3
+    local HATCH_REQUEST_GAP = 0.08
+    local HATCH_BATCH_GAP = 0.15
+    task.spawn(function()
+        while true do
+            if AutoBuying and SelectedEggId and BuyEggRemote then
+                for i = 1, BATCH_SIZE do
+                    if not AutoBuying or not SelectedEggId or not BuyEggRemote then
+                        break
+                    end
+
+                    pcall(function()
+                        BuyEggRemote:InvokeServer(SelectedEggId, false, false, true)
+                    end)
+
+                    if i < BATCH_SIZE then
+                        task.wait(HATCH_REQUEST_GAP)
+                    end
+                end
+                task.wait(HATCH_BATCH_GAP)
+            else
+                task.wait(0.1)
+            end
+        end
+    end)
 
     -- =====================================================================
     -- TELEPORT TAB UI
