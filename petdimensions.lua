@@ -50,6 +50,7 @@ end
 
 local AutoFarmRobot = false
 local AutoFarmTurkey = false
+local AutoFarmExpedition = false
 local AutoTokens = false
 local PotatoMode = false
 local AutoFarmComet = false
@@ -110,6 +111,10 @@ end)
 
 local CurrentTarget = nil
 local CurrentTargetId = nil
+local LastPetSendTarget = nil
+local CurrentExpeditionTarget = nil
+local CurrentExpeditionTargetId = nil
+local LastExpeditionPetSendTarget = nil
 local DamageRemote = ReplicatedStorage:GetChildren()[66]
 
 -- Find token remote on init
@@ -126,6 +131,332 @@ end
 -- TURKEY DODGE VARIABLES
 local TurkeyDodgeActive = false
 local IsEvading = false
+
+-- EXPEDITION ATTACK DODGE
+-- Uses the same attack event consumed by the AutumnBoss client controller.
+-- We do not rely on __AUTUMNBOSS_FX, because the attack event contains the
+-- actual telegraph parameters and some attacks can exist without visible FX.
+local ExpeditionDodgeEnabled = true
+local ExpeditionDodgeActive = false
+local ExpeditionDodgeSavedCFrame = nil
+local ExpeditionDodgeUntil = 0
+local ExpeditionAttackSequence = 0
+local ExpeditionActiveAttacks = {}
+local ExpeditionCombatRadius = 10.5
+local ExpeditionDodgeMargin = 1.75
+local ExpeditionFloorHeight = 3
+
+local function GetExpeditionCombatPosition()
+    local target = CurrentExpeditionTarget
+    if target and target.Parent then
+        local coinPart = target:FindFirstChild("Coin")
+        if coinPart and coinPart:IsA("BasePart") then
+            return coinPart.Position
+        end
+        return target:GetPivot().Position
+    end
+
+    local character = localPlayer.Character
+    local hrp = character and character:FindFirstChild("HumanoidRootPart")
+    return hrp and hrp.Position or nil
+end
+
+local function ExpeditionGroundedPosition(position, character)
+    local rayParams = RaycastParams.new()
+    rayParams.FilterType = Enum.RaycastFilterType.Exclude
+    rayParams.FilterDescendantsInstances = {
+        character,
+        Workspace:FindFirstChild("__THINGS"),
+        Workspace:FindFirstChild("__DEBRIS"),
+    }
+    rayParams.IgnoreWater = true
+
+    local origin = position + Vector3.new(0, 60, 0)
+    local hit = Workspace:Raycast(origin, Vector3.new(0, -140, 0), rayParams)
+    if not hit then
+        return nil
+    end
+
+    return hit.Position + Vector3.new(0, ExpeditionFloorHeight, 0)
+end
+
+local function NormalizeAngle(angle)
+    local twoPi = math.pi * 2
+    angle = angle % twoPi
+    if angle < 0 then
+        angle += twoPi
+    end
+    return angle
+end
+
+local function AngleOnArc(angle, startAngle, arcAngle)
+    if arcAngle >= math.pi * 2 - 0.001 then
+        return true
+    end
+
+    local delta = NormalizeAngle(angle - startAngle)
+    return delta <= arcAngle
+end
+
+local function IsPointInSweep(point, attack, now)
+    local at = attack.at
+    if typeof(at) ~= "Vector3" then
+        return false
+    end
+
+    local length = tonumber(attack.length) or 100
+    local width = tonumber(attack.width) or 6
+    local clear = tonumber(attack.clear) or 0
+    local startAngle = math.rad(tonumber(attack.start) or 0)
+    local arc = math.rad(tonumber(attack.arc) or 360)
+    local windup = tonumber(attack.windup) or 1
+    local seconds = math.max(0.05, tonumber(attack.seconds) or 2)
+
+    local elapsed = now - attack.started
+    if elapsed < windup then
+        return false
+    end
+
+    local progress = math.clamp((elapsed - windup) / seconds, 0, 1)
+    local currentAngle = startAngle + arc * progress
+
+    local dx = point.X - at.X
+    local dz = point.Z - at.Z
+    local distance = math.sqrt(dx * dx + dz * dz)
+    if distance < clear or distance > length then
+        return false
+    end
+
+    local direction = Vector3.new(math.cos(currentAngle), 0, math.sin(currentAngle))
+    local relative = Vector3.new(dx, 0, dz)
+    local forward = relative:Dot(direction)
+    local sideways = math.abs(relative:Cross(direction).Y)
+
+    return forward >= clear and forward <= length and sideways <= width
+end
+
+local function IsPointDangerous(point, now)
+    for _, attack in ipairs(ExpeditionActiveAttacks) do
+        if attack and attack.expires > now then
+            if attack.kind == "slam" or attack.kind == "barrage" or attack.kind == "leap" or attack.kind == "land" then
+                local at = attack.at
+                local radius = tonumber(attack.radius) or 0
+                if typeof(at) == "Vector3" then
+                    local dx = point.X - at.X
+                    local dz = point.Z - at.Z
+                    if math.sqrt(dx * dx + dz * dz) <= radius + ExpeditionDodgeMargin then
+                        return true
+                    end
+                end
+            elseif attack.kind == "sweep" and IsPointInSweep(point, attack, now) then
+                return true
+            end
+        end
+    end
+
+    return false
+end
+
+local function GetSafeExpeditionDodgeCFrame(character, now)
+    local combatCenter = GetExpeditionCombatPosition()
+    if not combatCenter then
+        return nil
+    end
+
+    local hrp = character:FindFirstChild("HumanoidRootPart")
+    if not hrp then
+        return nil
+    end
+
+    local current = hrp.Position
+    local candidates = {}
+
+    -- Try the current position first if the attack has not reached it yet.
+    table.insert(candidates, Vector3.new(current.X, combatCenter.Y, current.Z))
+
+    -- Sample the entire local combat ring. This keeps the player inside the
+    -- Expedition arena while looking for a point outside the attack shape.
+    for i = 0, 47 do
+        local angle = (math.pi * 2) * (i / 48)
+        local radius = ExpeditionCombatRadius
+        table.insert(candidates, combatCenter + Vector3.new(math.cos(angle) * radius, 0, math.sin(angle) * radius))
+
+        local innerRadius = math.max(3, ExpeditionCombatRadius - 2.5)
+        table.insert(candidates, combatCenter + Vector3.new(math.cos(angle) * innerRadius, 0, math.sin(angle) * innerRadius))
+    end
+
+    local best = nil
+    local bestScore = math.huge
+
+    for _, candidate in ipairs(candidates) do
+        local horizontal = Vector3.new(candidate.X - combatCenter.X, 0, candidate.Z - combatCenter.Z)
+        if horizontal.Magnitude <= ExpeditionCombatRadius + 0.01 then
+            local grounded = ExpeditionGroundedPosition(candidate, character)
+            if grounded then
+                if not IsPointDangerous(grounded, now) then
+                    local moveDistance = (grounded - current).Magnitude
+                    if moveDistance < bestScore then
+                        best = grounded
+                        bestScore = moveDistance
+                    end
+                end
+            end
+        end
+    end
+
+    if not best then
+        return nil
+    end
+
+    return CFrame.lookAt(
+        best,
+        Vector3.new(combatCenter.X, best.Y, combatCenter.Z)
+    )
+end
+
+local function BeginExpeditionDodge()
+    if ExpeditionDodgeActive then
+        return
+    end
+
+    local character = localPlayer.Character
+    local hrp = character and character:FindFirstChild("HumanoidRootPart")
+    if not hrp then
+        return
+    end
+
+    local safe = GetSafeExpeditionDodgeCFrame(character, os.clock())
+    if not safe then
+        return
+    end
+
+    ExpeditionDodgeSavedCFrame = hrp.CFrame
+    ExpeditionDodgeActive = true
+    hrp.CFrame = safe
+end
+
+local function EndExpeditionDodge()
+    if not ExpeditionDodgeActive then
+        return
+    end
+
+    local character = localPlayer.Character
+    local hrp = character and character:FindFirstChild("HumanoidRootPart")
+
+    if hrp and ExpeditionDodgeSavedCFrame then
+        hrp.CFrame = ExpeditionDodgeSavedCFrame
+    end
+
+    ExpeditionDodgeActive = false
+    ExpeditionDodgeSavedCFrame = nil
+end
+
+-- The boss client uses this exact event to receive the attack parameters.
+-- Expedition reuses the same Autumn attack system.
+pcall(function()
+    Library.Network.Fired("Autumn Boss: Attack"):Connect(function(attack)
+        if not ExpeditionDodgeEnabled or not AutoFarmExpedition then
+            return
+        end
+        if type(attack) ~= "table" or not attack.kind then
+            return
+        end
+
+        local kind = tostring(attack.kind)
+        if kind ~= "slam" and kind ~= "barrage" and kind ~= "sweep" and kind ~= "leap" and kind ~= "land" then
+            return
+        end
+
+        local now = os.clock()
+        local windup = tonumber(attack.windup) or 0
+        local duration
+
+        if kind == "sweep" then
+            duration = windup + math.max(0.05, tonumber(attack.seconds) or 2) + 0.35
+        elseif kind == "leap" then
+            duration = windup + math.max(0, tonumber(attack.air) or 1) + 0.7
+        elseif kind == "land" then
+            duration = 0.9
+        else
+            duration = windup + 0.8
+        end
+
+        ExpeditionAttackSequence += 1
+        table.insert(ExpeditionActiveAttacks, {
+            kind = kind,
+            at = attack.at,
+            radius = attack.radius,
+            length = attack.length,
+            width = attack.width,
+            clear = attack.clear,
+            start = attack.start,
+            arc = attack.arc,
+            windup = windup,
+            seconds = attack.seconds,
+            started = now,
+            expires = now + duration,
+            sequence = ExpeditionAttackSequence,
+        })
+        ExpeditionDodgeUntil = math.max(ExpeditionDodgeUntil, now + duration)
+    end)
+end)
+
+-- Continuously maintain the safe position while an attack is active. This
+-- is intentionally independent from the visible FX folder.
+task.spawn(function()
+    while true do
+        task.wait(0.025)
+
+        local now = os.clock()
+        for i = #ExpeditionActiveAttacks, 1, -1 do
+            local attack = ExpeditionActiveAttacks[i]
+            if not attack or attack.expires <= now then
+                table.remove(ExpeditionActiveAttacks, i)
+            end
+        end
+
+        if not AutoFarmExpedition or not ExpeditionDodgeEnabled or #ExpeditionActiveAttacks == 0 then
+            if ExpeditionDodgeActive then
+                EndExpeditionDodge()
+            end
+            continue
+        end
+
+        local character = localPlayer.Character
+        local hrp = character and character:FindFirstChild("HumanoidRootPart")
+        if not hrp then
+            EndExpeditionDodge()
+            continue
+        end
+
+        -- Before the telegraph resolves, we can wait. Once the player's
+        -- current position becomes dangerous, move immediately to a safe
+        -- point inside the combat radius.
+        if not IsPointDangerous(hrp.Position, now) then
+            if ExpeditionDodgeActive and now >= ExpeditionDodgeUntil then
+                EndExpeditionDodge()
+            end
+            continue
+        end
+
+        if not ExpeditionDodgeActive then
+            BeginExpeditionDodge()
+        else
+            -- Recalculate while a sweep is rotating or another attack is
+            -- layered on top, preventing the player from walking back into it.
+            local safe = GetSafeExpeditionDodgeCFrame(character, now)
+            if safe then
+                hrp.CFrame = safe
+            end
+        end
+    end
+end)
+
+localPlayer.CharacterAdded:Connect(function()
+    ExpeditionDodgeActive = false
+    ExpeditionDodgeSavedCFrame = nil
+    table.clear(ExpeditionActiveAttacks)
+end)
 
 -- AUTO FARM FUNCTIONS
 local function GetAllEquippedPetUIDs()
@@ -165,16 +496,68 @@ local function FindTurkey()
     end
     return nil
 end
+
+-- Expedition mobs live in the same Coins container while an expedition is
+-- running. Unlike robots/turkey, there is no fixed mob name to rely on, so
+-- choose randomly from the currently spawned expedition coins.
+local function IsExpeditionMob(coin)
+    if not coin or not coin.Parent then return false end
+    if not localPlayer:GetAttribute("ExpeditionRun") then return false end
+
+    local id = coin:GetAttribute("ID")
+    if id == nil then return false end
+
+    -- Expedition coins should have health and a rendered Coin part.
+    -- Ignore non-mob/placeholder objects that happen to be in Coins.
+    local health = coin:GetAttribute("Health")
+    local coinPart = coin:FindFirstChild("Coin")
+    if health == nil or not coinPart then return false end
+
+    if coinPart:GetAttribute("PreventClick") then return false end
+    return true
+end
+
+local function FindRandomExpeditionMob(previous)
+    local coinsFolder = Workspace:FindFirstChild("__THINGS")
+        and Workspace.__THINGS:FindFirstChild("Coins")
+    if not coinsFolder or not localPlayer:GetAttribute("ExpeditionRun") then
+        return nil
+    end
+
+    local candidates = {}
+    for _, coin in ipairs(coinsFolder:GetChildren()) do
+        if IsExpeditionMob(coin) and coin ~= previous then
+            table.insert(candidates, coin)
+        end
+    end
+
+    -- If only one mob is alive, allow it to be selected again after the
+    -- previous target disappears/reappears.
+    if #candidates == 0 and previous and IsExpeditionMob(previous) then
+        table.insert(candidates, previous)
+    end
+
+    if #candidates == 0 then return nil end
+    return candidates[math.random(1, #candidates)]
+end
 local function FocusPetsContinuous(coinInstance)
     if not coinInstance or not coinInstance.Parent then return end
-    local coinId = coinInstance:GetAttribute("ID")
-    local myPets = GetAllEquippedPetUIDs()
 
+    local coinId = coinInstance:GetAttribute("ID")
+    if not coinId then return end
+
+    -- Keep the original Select Coin behavior.
     pcall(function()
         Library.Signal.Fire("Select Coin", coinInstance)
     end)
 
-    if coinId and #myPets > 0 then
+    -- Send pets using the ORIGINAL sequence, but only once for this
+    -- individual robot/turkey.  Do not mark it as sent until the calls
+    -- below have actually been attempted.
+    if LastPetSendTarget ~= coinInstance then
+        local myPets = GetAllEquippedPetUIDs()
+        if #myPets == 0 then return end
+
         pcall(function()
             Library.Network.Invoke("Join Coin", coinId, myPets)
         end)
@@ -184,6 +567,8 @@ local function FocusPetsContinuous(coinInstance)
                 Library.Network.Fire("Change Pet Target", petUid, "Coin", coinId)
             end)
         end
+
+        LastPetSendTarget = coinInstance
     end
 end
 
@@ -418,6 +803,8 @@ task.spawn(function()
             local targetId = nil
             if AutoFarmComet then
                 targetId = CurrentCometId
+            elseif AutoFarmExpedition then
+                targetId = CurrentExpeditionTargetId
             elseif AutoFarmRobot or AutoFarmTurkey then
                 targetId = CurrentTargetId
             end
@@ -441,6 +828,76 @@ task.spawn(function()
     end
 end)
 
+-- Expedition Auto Farm Loop
+-- Picks a random living expedition mob, selects/taps it, and sends the
+-- equipped pets once. Damage/Fast Attack can then keep hitting the target.
+task.spawn(function()
+    while true do
+        task.wait(0.15)
+
+        if AutoFarmExpedition and localPlayer:GetAttribute("ExpeditionRun") then
+            if not CurrentExpeditionTarget or not IsExpeditionMob(CurrentExpeditionTarget) then
+                CurrentExpeditionTarget = FindRandomExpeditionMob(CurrentExpeditionTarget)
+                CurrentExpeditionTargetId = CurrentExpeditionTarget
+                    and tostring(CurrentExpeditionTarget:GetAttribute("ID"))
+                    or nil
+                LastExpeditionPetSendTarget = nil
+            end
+
+            if CurrentExpeditionTarget and IsExpeditionMob(CurrentExpeditionTarget) then
+                local targetId = tostring(CurrentExpeditionTarget:GetAttribute("ID"))
+                CurrentExpeditionTargetId = targetId
+
+                pcall(function()
+                    Library.Signal.Fire("Select Coin", CurrentExpeditionTarget)
+                end)
+
+                -- Same original pet-send sequence as robots/turkey, once per
+                -- individual expedition mob.
+                if LastExpeditionPetSendTarget ~= CurrentExpeditionTarget then
+                    local myPets = GetAllEquippedPetUIDs()
+                    if #myPets > 0 then
+                        pcall(function()
+                            Library.Network.Invoke("Join Coin", targetId, myPets)
+                        end)
+
+                        for _, petUid in ipairs(myPets) do
+                            pcall(function()
+                                Library.Network.Fire("Change Pet Target", petUid, "Coin", targetId)
+                            end)
+                        end
+
+                        LastExpeditionPetSendTarget = CurrentExpeditionTarget
+                    end
+                end
+            else
+                CurrentExpeditionTarget = nil
+                CurrentExpeditionTargetId = nil
+                LastExpeditionPetSendTarget = nil
+            end
+        else
+            CurrentExpeditionTarget = nil
+            CurrentExpeditionTargetId = nil
+            LastExpeditionPetSendTarget = nil
+        end
+    end
+end)
+
+-- Expedition damage uses the same target as the normal mob farm.
+task.spawn(function()
+    while true do
+        task.wait(0.05)
+        if AutoFarmExpedition and CurrentExpeditionTargetId
+            and localPlayer:GetAttribute("ExpeditionRun") then
+            pcall(function()
+                if DamageRemote then
+                    DamageRemote:FireServer(CurrentExpeditionTargetId)
+                end
+            end)
+        end
+    end
+end)
+
 -- Main Auto Farm Loop
 task.spawn(function()
     while true do
@@ -454,11 +911,13 @@ task.spawn(function()
                 FocusPetsContinuous(CurrentTarget)
             else
                 CurrentTargetId = nil
+                LastPetSendTarget = nil
             end
         else
             if not AutoFarmTurkey then
                 CurrentTarget = nil
                 CurrentTargetId = nil
+                LastPetSendTarget = nil
             end
         end
         
@@ -471,11 +930,13 @@ task.spawn(function()
                 FocusPetsContinuous(CurrentTarget)
             else
                 CurrentTargetId = nil
+                LastPetSendTarget = nil
             end
         else
             if not AutoFarmRobot then
                 CurrentTarget = nil
                 CurrentTargetId = nil
+                LastPetSendTarget = nil
             end
         end
     end
@@ -1496,7 +1957,15 @@ task.spawn(function()
         AutoFarmTurkey = state
         TurkeyDodgeActive = state
     end)
-    createUnifiedToggle(farmFrame, 116, "☄️ Comet Farm", false, function(state)
+    createUnifiedToggle(farmFrame, 116, "🍂 Expedition Farm", false, function(state)
+        AutoFarmExpedition = state
+        if not state then
+            CurrentExpeditionTarget = nil
+            CurrentExpeditionTargetId = nil
+            LastExpeditionPetSendTarget = nil
+        end
+    end)
+    createUnifiedToggle(farmFrame, 200, "☄️ Comet Farm", false, function(state)
         AutoFarmComet = state
         if state then
             CurrentTarget = nil
@@ -1506,13 +1975,26 @@ task.spawn(function()
             CurrentCometId = nil
         end
     end)
-    createUnifiedToggle(farmFrame, 158, "⭐ Auto Tokens", false, function(state) AutoTokens = state end)
-    createUnifiedToggle(farmFrame, 200, "⚡ Fast Pet Speed", false, function(state) SetFastPetSpeed(state) end)
-    createUnifiedToggle(farmFrame, 242, "⚔️ Fast Attack", false, function(state) FastAttackSpeed = state end)
+    createUnifiedToggle(farmFrame, 242, "⭐ Auto Tokens", false, function(state) AutoTokens = state end)
+    createUnifiedToggle(farmFrame, 284, "⚡ Fast Pet Speed", false, function(state) SetFastPetSpeed(state) end)
+    createUnifiedToggle(farmFrame, 326, "⚔️ Fast Attack", false, function(state) FastAttackSpeed = state end)
+
+    local farmTip = Instance.new("TextLabel")
+    farmTip.Size = UDim2.new(1, 0, 0, 40)
+    farmTip.Position = UDim2.new(0, 0, 0, 368)
+    farmTip.BackgroundTransparency = 1
+    farmTip.Text = "Tip: Turn on Pets sending all when you use the mobs features."
+    farmTip.TextColor3 = Color3.fromRGB(180, 180, 190)
+    farmTip.Font = Enum.Font.Gotham
+    farmTip.TextSize = 12
+    farmTip.TextWrapped = true
+    farmTip.TextXAlignment = Enum.TextXAlignment.Left
+    farmTip.TextYAlignment = Enum.TextYAlignment.Center
+    farmTip.Parent = farmFrame
 
     local farmStatus = Instance.new("TextLabel")
     farmStatus.Size = UDim2.new(1, 0, 0, 28)
-    farmStatus.Position = UDim2.new(0, 0, 0, 286)
+    farmStatus.Position = UDim2.new(0, 0, 0, 414)
     farmStatus.BackgroundTransparency = 1
     farmStatus.Text = "Status: Idle"
     farmStatus.TextColor3 = Color3.fromRGB(180, 180, 180)
@@ -1528,16 +2010,22 @@ task.spawn(function()
                 farmStatus.TextColor3 = Color3.fromRGB(100, 255, 100)
             elseif AutoFarmTurkey and CurrentTargetId then
                 if IsEvading then
-                    farmStatus.Text = "Status: 🦃 DODGING BOSS FX!"
+                    farmStatus.Text = "Status: 🦃 DODGING ATTACK!"
                     farmStatus.TextColor3 = Color3.fromRGB(255, 100, 100)
                 else
                     farmStatus.Text = "Status: 🦃 Farming Target #" .. CurrentTargetId
                     farmStatus.TextColor3 = Color3.fromRGB(255, 200, 100)
                 end
+            elseif AutoFarmExpedition and ExpeditionDodgeActive then
+                farmStatus.Text = "Status: 🍂 DODGING EXPEDITION ATTACK!"
+                farmStatus.TextColor3 = Color3.fromRGB(255, 100, 100)
+            elseif AutoFarmExpedition and CurrentExpeditionTargetId then
+                farmStatus.Text = "Status: 🍂 Farming Expedition Mob #" .. CurrentExpeditionTargetId
+                farmStatus.TextColor3 = Color3.fromRGB(255, 170, 100)
             elseif AutoFarmComet and CurrentCometId then
                 farmStatus.Text = "Status: ☄️ Farming Comet #" .. CurrentCometId
                 farmStatus.TextColor3 = Color3.fromRGB(180, 220, 255)
-            elseif AutoFarmTurkey or AutoFarmRobot then
+            elseif AutoFarmExpedition or AutoFarmTurkey or AutoFarmRobot then
                 farmStatus.Text = "Status: ⏳ Searching Target..."
                 farmStatus.TextColor3 = Color3.fromRGB(255, 200, 80)
             else
