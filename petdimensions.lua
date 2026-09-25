@@ -1081,32 +1081,92 @@ end)
 
 
 -- =====================================================================
--- EGG OPEN ANIMATION DISABLED
--- Keeps the normal hatch request/results, but skips the client-side
--- EggOpenAnim.Play sequence (cracks, sounds, particles, blur, waits).
+-- EGG OPEN ANIMATION DISABLED COMPLETELY (LOW-LAG)
+-- Event-driven cleanup only. Do not scan the entire Camera/Lighting tree
+-- every frame, since that causes significant client-side lag.
 -- =====================================================================
-task.spawn(function()
-    local eggOpenPort = ReplicatedStorage:FindFirstChild("EggOpenPort")
-    if eggOpenPort then
-        local eggOpenAnim = eggOpenPort:FindFirstChild("EggOpenAnim")
-        if eggOpenAnim and (eggOpenAnim:IsA("ModuleScript") or eggOpenAnim:IsA("LocalScript")) then
-            pcall(function()
-                -- Replace the module's Play function when the executor exposes
-                -- a mutable module table. If it cannot be modified directly,
-                -- the game module remains untouched rather than breaking hatch.
-                local anim = require(eggOpenAnim)
-                if type(anim) == "table" then
-                    anim.Play = function()
-                        local camera = Workspace.CurrentCamera
-                        if camera then
-                            local eggs = camera:FindFirstChild("EggOpenAnim_Eggs")
-                            if eggs then eggs:Destroy() end
-                        end
-                        local dof = Lighting:FindFirstChild("EggOpenDOF")
-                        if dof then dof:Destroy() end
-                    end
+local function destroyEggAnimationObject(obj)
+    if not obj then return end
+    pcall(function()
+        if obj.Name == "EggOpenAnim_Eggs" or obj.Name == "EggOpenDOF" then
+            obj:Destroy()
+        end
+    end)
+end
+
+local function cleanupEggOpeningEffects()
+    pcall(function()
+        local camera = Workspace.CurrentCamera
+        if camera then
+            local eggs = camera:FindFirstChild("EggOpenAnim_Eggs")
+            if eggs then eggs:Destroy() end
+        end
+
+        local dof = Lighting:FindFirstChild("EggOpenDOF")
+        if dof then dof:Destroy() end
+
+        local guiEggs = playerGui and playerGui:FindFirstChild("EggOpenAnim_Eggs", true)
+        if guiEggs then guiEggs:Destroy() end
+        local guiDof = playerGui and playerGui:FindFirstChild("EggOpenDOF", true)
+        if guiDof then guiDof:Destroy() end
+    end)
+end
+
+-- Watch only for newly-created top-level animation containers.
+local eggAnimationConnections = {}
+local function watchEggAnimationContainer(container)
+    if not container then return end
+    if eggAnimationConnections[container] then return end
+
+    local ok, connection = pcall(function()
+        return container.ChildAdded:Connect(function(child)
+            if child.Name == "EggOpenAnim_Eggs" or child.Name == "EggOpenDOF" then
+                destroyEggAnimationObject(child)
+            end
+        end)
+    end)
+
+    if ok and connection then
+        eggAnimationConnections[container] = connection
+    end
+end
+
+watchEggAnimationContainer(Workspace.CurrentCamera)
+watchEggAnimationContainer(Lighting)
+watchEggAnimationContainer(playerGui)
+
+Workspace:GetPropertyChangedSignal("CurrentCamera"):Connect(function()
+    watchEggAnimationContainer(Workspace.CurrentCamera)
+    cleanupEggOpeningEffects()
+end)
+
+-- Keep the known local trigger blocked. This prevents the animation from
+-- starting in executors that support metamethod hooks.
+pcall(function()
+    if type(hookmetamethod) == "function" and type(getnamecallmethod) == "function" and type(newcclosure) == "function" then
+        local oldNamecall
+        oldNamecall = hookmetamethod(game, "__namecall", newcclosure(function(self, ...)
+            local method = getnamecallmethod()
+            if method == "Fire" and self and self.Name == "PlayTrigger" then
+                local parent = self.Parent
+                if parent and parent.Name == "EggOpenPort" then
+                    return nil
                 end
-            end)
+            end
+            return oldNamecall(self, ...)
+        end))
+    end
+end)
+
+-- Small fallback cleanup only while Auto-Hatch is active. This runs at 4 Hz
+-- instead of every frame and avoids expensive GetDescendants scans.
+task.spawn(function()
+    while true do
+        if AutoBuying then
+            cleanupEggOpeningEffects()
+            task.wait(0.25)
+        else
+            task.wait(0.5)
         end
     end
 end)
