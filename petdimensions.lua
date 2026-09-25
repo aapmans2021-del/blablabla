@@ -51,6 +51,7 @@ end
 local AutoFarmRobot = false
 local AutoFarmTurkey = false
 local AutoFarmExpedition = false
+local AutoFarmHackerBoss = false
 local AutoTokens = false
 local PotatoMode = false
 local AutoFarmComet = false
@@ -115,6 +116,8 @@ local LastPetSendTarget = nil
 local CurrentExpeditionTarget = nil
 local CurrentExpeditionTargetId = nil
 local LastExpeditionPetSendTarget = nil
+local CurrentHackerBoss = nil
+local CurrentHackerBossId = nil
 local DamageRemote = ReplicatedStorage:GetChildren()[66]
 
 -- Find token remote on init
@@ -179,6 +182,25 @@ local function FindTurkey()
             return child
         end
     end
+    return nil
+end
+
+local function FindHackerBoss()
+    local coins = Workspace:FindFirstChild("__THINGS") and Workspace.__THINGS:FindFirstChild("Coins")
+    if not coins then return nil end
+
+    for _, child in ipairs(coins:GetChildren()) do
+        if child.Parent then
+            local name = tostring(child:GetAttribute("Name") or child:GetAttribute("Mob") or child.Name):lower()
+            if name == "hacker prime" or name == "hacker boss" or name:find("hacker prime", 1, true) then
+                local id = child:GetAttribute("ID")
+                if id ~= nil then
+                    return child
+                end
+            end
+        end
+    end
+
     return nil
 end
 -- Expedition mobs live in the same Coins container while an expedition is
@@ -825,6 +847,8 @@ task.spawn(function()
             local targetId = nil
             if AutoFarmComet then
                 targetId = CurrentCometId
+            elseif AutoFarmHackerBoss then
+                targetId = CurrentHackerBossId
             elseif AutoFarmExpedition then
                 targetId = CurrentExpeditionTargetId
             elseif AutoFarmRobot or AutoFarmTurkey then
@@ -1017,6 +1041,33 @@ task.spawn(function()
 end)
 
 
+-- Hacker Boss Auto Farm Loop
+-- Uses the same coin selection / Join Coin / Change Pet Target sequence
+-- as the other auto farms, targeting the live Hacker Prime boss coin.
+task.spawn(function()
+    while true do
+        task.wait(0.15)
+
+        if AutoFarmHackerBoss then
+            if not CurrentHackerBoss or not CurrentHackerBoss.Parent then
+                CurrentHackerBoss = FindHackerBoss()
+                CurrentHackerBossId = CurrentHackerBoss and tostring(CurrentHackerBoss:GetAttribute("ID")) or nil
+            end
+
+            if CurrentHackerBoss and CurrentHackerBoss.Parent then
+                CurrentHackerBossId = tostring(CurrentHackerBoss:GetAttribute("ID"))
+                FocusPetsContinuous(CurrentHackerBoss)
+            else
+                CurrentHackerBoss = nil
+                CurrentHackerBossId = nil
+            end
+        else
+            CurrentHackerBoss = nil
+            CurrentHackerBossId = nil
+        end
+    end
+end)
+
 -- Main Auto Farm Loop
 task.spawn(function()
     while true do
@@ -1064,6 +1115,18 @@ task.spawn(function()
         if CurrentTargetId and DamageRemote and (AutoFarmRobot or AutoFarmTurkey) then
             pcall(function()
                 DamageRemote:FireServer(CurrentTargetId)
+            end)
+        end
+    end
+end)
+
+-- Hacker Boss damage loop
+task.spawn(function()
+    while true do
+        task.wait(0.05)
+        if AutoFarmHackerBoss and CurrentHackerBossId and DamageRemote then
+            pcall(function()
+                DamageRemote:FireServer(CurrentHackerBossId)
             end)
         end
     end
@@ -2131,7 +2194,15 @@ task.spawn(function()
     createUnifiedToggle(farmFrame, 200, "⚡ Fast Pet Speed", false, function(state) SetFastPetSpeed(state) end)
     createUnifiedToggle(farmFrame, 242, "⚔️ Fast Attack", false, function(state) FastAttackSpeed = state end)
 
-    createUnifiedToggle(farmFrame, 284, "🍂 Expedition Farm", false, function(state)
+    createUnifiedToggle(farmFrame, 326, "💻 Hacker Boss Farm", false, function(state)
+        AutoFarmHackerBoss = state
+        if not state then
+            CurrentHackerBoss = nil
+            CurrentHackerBossId = nil
+        end
+    end)
+
+    createUnifiedToggle(farmFrame, 368, "🍂 Expedition Farm", false, function(state)
         AutoFarmExpedition = state
         if not state then
             CurrentExpeditionTarget = nil
@@ -2145,7 +2216,7 @@ task.spawn(function()
 
     local farmStatus = Instance.new("TextLabel")
     farmStatus.Size = UDim2.new(1, 0, 0, 28)
-    farmStatus.Position = UDim2.new(0, 0, 0, 326)
+    farmStatus.Position = UDim2.new(0, 0, 0, 410)
     farmStatus.BackgroundTransparency = 1
     farmStatus.Text = "Status: Idle"
     farmStatus.TextColor3 = Color3.fromRGB(180, 180, 180)
@@ -2167,6 +2238,9 @@ task.spawn(function()
                     farmStatus.Text = "Status: 🦃 Farming Target #" .. CurrentTargetId
                     farmStatus.TextColor3 = Color3.fromRGB(255, 200, 100)
                 end
+            elseif AutoFarmHackerBoss and CurrentHackerBossId then
+                farmStatus.Text = "Status: 💻 Farming Hacker Prime #" .. CurrentHackerBossId
+                farmStatus.TextColor3 = Color3.fromRGB(120, 255, 200)
             elseif AutoFarmExpedition and CurrentExpeditionTargetId then
                 if ExpeditionDodgeActive then
                     farmStatus.Text = "Status: 🍂 DODGING EXPEDITION ATTACK!"
@@ -3014,8 +3088,6 @@ task.spawn(function()
     end
 
     createUnifiedToggle(hatchFrame, 326, "AFK CPU Reducer", false, function(value) setAfkMode(value) end)
-    createUnifiedToggle(hatchFrame, 368, "⚡ Auto-Hatch Egg", false, function(value) AutoBuying = value end)
-
     local recentPanel = Instance.new("Frame")
     recentPanel.Name = "RecentHatchesPanel"
     recentPanel.Size = UDim2.new(1, -6, 0, 150)
@@ -3261,17 +3333,6 @@ task.spawn(function()
         end
     end
 
-    pcall(function()
-        local Lib = require(ReplicatedStorage:WaitForChild("Framework", 2):WaitForChild("Library", 2))
-        if Lib then
-            if Lib.Variables then
-                Lib.Variables.OpeningEgg = 0
-            end
-            if Lib.EggCmd and type(Lib.EggCmd.Open) == "function" then
-                Lib.EggCmd.Open = function() return end
-            end
-        end
-    end)
 
     if localPlayer then
         local targetGui = localPlayer:WaitForChild("PlayerGui", 2)
@@ -3310,31 +3371,103 @@ task.spawn(function()
     end
     task.spawn(hookLeaderstats)
 
-    -- OPTIMIZED HATCH LOOP
-    -- Keep the same hatch behavior, but avoid stacking concurrent RemoteFunction
-    -- calls. That can build up network/server work and cause ping spikes/freezes.
-    local BATCH_SIZE = 3
-    local HATCH_REQUEST_GAP = 0.08
-    local HATCH_BATCH_GAP = 0.15
+    -- AUTO-HATCH
+    -- Match the game's own Eggs controller: it uses the Library network
+    -- endpoint "Buy Egg" and passes the multi/triple flags as the final
+    -- arguments. The custom toggle below drives this directly so it does not
+    -- depend on a ReplicatedStorage child index or on the visual auto-hatch UI.
+    local HatchBusy = false
+
+    local function getHatchMode()
+        local triple = false
+        local multi = false
+
+        pcall(function()
+            local save = Library.Save.Get()
+            if not save then return end
+
+            local multiHatch = tonumber(save.MultiHatch) or 1
+            local ownsOctuple = save.OwnsOctupleEggs == true
+
+            -- Mirror the game's available hatch-slot calculation. If the
+            -- account has multi/extra hatch capacity, request multi-hatch;
+            -- otherwise request one egg, which the server always accepts
+            -- when the selected egg itself is valid/affordable.
+            if multiHatch > 1 or ownsOctuple then
+                multi = true
+            end
+        end)
+
+        return triple, multi
+    end
+
+    local function hatchSelectedEgg()
+        if HatchBusy or not AutoBuying or not SelectedEggId then
+            return false
+        end
+
+        HatchBusy = true
+        local success = false
+
+        pcall(function()
+            local triple, multi = getHatchMode()
+
+            -- This is the exact network endpoint used by the game's Eggs
+            -- controller (Eggs source: Library.Network.Invoke("Buy Egg", ...)).
+            local result, err = Library.Network.Invoke(
+                "Buy Egg",
+                SelectedEggId,
+                triple,
+                false,
+                multi
+            )
+
+            if result == true then
+                success = true
+            end
+
+            -- If multi-hatch was rejected/unavailable, retry exactly once as
+            -- a normal single egg. This keeps auto-hatch working regardless of
+            -- the account's current hatch entitlement.
+            if not success and multi and AutoBuying and SelectedEggId then
+                local singleResult = Library.Network.Invoke(
+                    "Buy Egg",
+                    SelectedEggId,
+                    false,
+                    false,
+                    false
+                )
+                success = singleResult == true
+            end
+        end)
+
+        HatchBusy = false
+        return success
+    end
+
+    -- Keep the game's auto-hatch variables synchronized as well. The actual
+    -- purchase is still performed through the same Buy Egg endpoint above.
+    local function setAutoHatchState(enabled)
+        AutoBuying = enabled
+        pcall(function()
+            Library.Variables.AutoHatchEggId = enabled and SelectedEggId or nil
+            Library.Variables.AutoHatchEnabled = enabled
+        end)
+    end
+
+    -- Rebind the toggle to the real hatch state instead of only changing the
+    -- custom AutoBuying flag.
+    createUnifiedToggle(hatchFrame, 368, "⚡ Auto-Hatch Egg", false, function(value)
+        setAutoHatchState(value)
+    end)
+
     task.spawn(function()
         while true do
-            if AutoBuying and SelectedEggId and BuyEggRemote then
-                for i = 1, BATCH_SIZE do
-                    if not AutoBuying or not SelectedEggId or not BuyEggRemote then
-                        break
-                    end
-
-                    pcall(function()
-                        BuyEggRemote:InvokeServer(SelectedEggId, false, false, true)
-                    end)
-
-                    if i < BATCH_SIZE then
-                        task.wait(HATCH_REQUEST_GAP)
-                    end
-                end
-                task.wait(HATCH_BATCH_GAP)
+            if AutoBuying and SelectedEggId then
+                hatchSelectedEgg()
+                task.wait(0.20)
             else
-                task.wait(0.1)
+                task.wait(0.10)
             end
         end
     end)
