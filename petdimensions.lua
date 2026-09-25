@@ -1571,6 +1571,7 @@ task.spawn(function()
     local renderAfkRecent = function() end
     local updateAfkSessionLabels = function() end
     local trackerInitialized = false
+    local lastRecentRenderSignature = ""
 
     local function renderRecent(listFrame, entries, color)
         for _, child in ipairs(listFrame:GetChildren()) do
@@ -1684,14 +1685,28 @@ task.spawn(function()
             trackerInitialized = true
         end
 
-        if tracker.Parent then
-            renderRecent(hugeList, recentHuges, Color3.fromRGB(100, 255, 100))
-            renderRecent(secretList, recentSecrets, Color3.fromRGB(215, 150, 255))
-            renderRecent(titanicList, recentTitanics, Color3.fromRGB(160, 220, 255))
-            renderRecent(gargantuanList, recentGargantuans, Color3.fromRGB(255, 180, 200))
+        -- Only rebuild recent-pet UI when the data actually changed.
+        -- The old behavior recreated every TextLabel every 2 seconds even
+        -- when nothing had been hatched, which caused unnecessary UI churn.
+        local recentSignature = table.concat({
+            tostring(totalHuge), tostring(totalSecret), tostring(totalTitanic), tostring(totalGargantuan),
+            tostring(recentHuges[1] and recentHuges[1].uid or ""),
+            tostring(recentSecrets[1] and recentSecrets[1].uid or ""),
+            tostring(recentTitanics[1] and recentTitanics[1].uid or ""),
+            tostring(recentGargantuans[1] and recentGargantuans[1].uid or "")
+        }, "|")
+
+        if recentSignature ~= lastRecentRenderSignature then
+            lastRecentRenderSignature = recentSignature
+            if tracker.Parent then
+                renderRecent(hugeList, recentHuges, Color3.fromRGB(100, 255, 100))
+                renderRecent(secretList, recentSecrets, Color3.fromRGB(215, 150, 255))
+                renderRecent(titanicList, recentTitanics, Color3.fromRGB(160, 220, 255))
+                renderRecent(gargantuanList, recentGargantuans, Color3.fromRGB(255, 180, 200))
+            end
+            renderHatchRecent()
+            renderAfkRecent()
         end
-        renderHatchRecent()
-        renderAfkRecent()
     end
 
     updateTrackerState()
@@ -1699,7 +1714,7 @@ task.spawn(function()
     task.spawn(function()
         while ui.Parent do
             refreshTracker()
-            task.wait(2)
+            task.wait(2.5)
         end
     end)
 
@@ -1856,11 +1871,15 @@ task.spawn(function()
     local eggTab = createTabButton("Egg Chances", 0.606)
     local farmTab = createTabButton("Farm", 0.808)
 
-    local hatchFrame = Instance.new("Frame")
+    local hatchFrame = Instance.new("ScrollingFrame")
     hatchFrame.Size = UDim2.new(1, -24, 1, -96)
     hatchFrame.Position = UDim2.new(0, 12, 0, 90)
     hatchFrame.BackgroundTransparency = 1
+    hatchFrame.BorderSizePixel = 0
     hatchFrame.ClipsDescendants = true
+    hatchFrame.ScrollBarThickness = 5
+    hatchFrame.ScrollingDirection = Enum.ScrollingDirection.Y
+    hatchFrame.CanvasSize = UDim2.new(0, 0, 0, 875)
     hatchFrame.Parent = autoHatchMain
 
     local tpFrame = Instance.new("Frame")
@@ -3194,6 +3213,319 @@ task.spawn(function()
         end
     end
     renderHatchRecent()
+
+    -- =====================================================================
+    -- ISOLATED WEBHOOK MODULE
+    -- This entire feature is protected so a webhook/API/UI error cannot
+    -- prevent the main script from loading.
+    -- =====================================================================
+    pcall(function()
+        local WebhookURL = ""
+        local WebhookEnabled = false
+        local WebhookNotify = { Huge = true, Secret = true, Titanic = true, Gargantuan = true }
+        local WebhookSending = false
+        local WebhookInitialized = false
+        local WebhookKnownPets = {}
+
+        local function webhookRequest()
+            local env = _G
+            pcall(function()
+                if type(getgenv) == "function" then env = getgenv() end
+            end)
+            local fn = nil
+            if type(env) == "table" then fn = env.request or env.http_request end
+            if type(fn) ~= "function" and type(syn) == "table" then fn = syn.request end
+            if type(fn) ~= "function" and type(http) == "table" then fn = http.request end
+            return type(fn) == "function" and fn or nil
+        end
+
+        local function webhookSend(payload)
+            local url = tostring(WebhookURL or ""):match("^%s*(.-)%s*$")
+            if url == "" then return false, "Webhook URL is empty" end
+            local request = webhookRequest()
+            if not request then return false, "request function unavailable" end
+            local okEncode, body = pcall(function() return HttpService:JSONEncode(payload) end)
+            if not okEncode then return false, "JSON encoding failed" end
+            local okRequest, response = pcall(function()
+                return request({
+                    Url = url,
+                    Method = "POST",
+                    Headers = { ["Content-Type"] = "application/json" },
+                    Body = body
+                })
+            end)
+            if not okRequest then return false, tostring(response) end
+            if type(response) == "table" then
+                local status = tonumber(response.StatusCode or response.Status)
+                if status and (status < 200 or status >= 300) then
+                    return false, "HTTP " .. tostring(status)
+                end
+            end
+            return true
+        end
+
+        -- Use the same category logic as the main tracker so webhook counts
+        -- exactly match the numbers already shown in the Hatch stats.
+        local function petCategory(pet)
+            local ok, result = pcall(function()
+                return getPetCategory(pet)
+            end)
+            return ok and result or nil
+        end
+
+        local webhookPanel = Instance.new("Frame")
+        webhookPanel.Name = "WebhookPanel"
+        webhookPanel.Size = UDim2.new(1, -16, 0, 290)
+        webhookPanel.Position = UDim2.new(0, 8, 0, 572)
+        webhookPanel.BackgroundColor3 = activeTheme.panel
+        webhookPanel.BorderSizePixel = 0
+        webhookPanel.Parent = hatchFrame
+        local corner = Instance.new("UICorner")
+        corner.CornerRadius = UDim.new(0, 8)
+        corner.Parent = webhookPanel
+
+        local title = Instance.new("TextLabel")
+        title.Size = UDim2.new(1, -24, 0, 24)
+        title.Position = UDim2.new(0, 12, 0, 8)
+        title.BackgroundTransparency = 1
+        title.Text = "WEBHOOK NOTIFICATIONS"
+        title.TextColor3 = Color3.fromRGB(255,255,255)
+        title.Font = Enum.Font.GothamBold
+        title.TextSize = 14
+        title.TextXAlignment = Enum.TextXAlignment.Left
+        title.Parent = webhookPanel
+
+        local box = Instance.new("TextBox")
+        box.Size = UDim2.new(1, -24, 0, 34)
+        box.Position = UDim2.new(0, 12, 0, 38)
+        box.BackgroundColor3 = activeTheme.surface
+        box.BorderSizePixel = 0
+        box.ClearTextOnFocus = false
+        box.PlaceholderText = "Paste Discord webhook URL here..."
+        box.Text = ""
+        box.TextColor3 = Color3.fromRGB(255,255,255)
+        box.Font = Enum.Font.Gotham
+        box.TextSize = 11
+        box.Parent = webhookPanel
+        local boxCorner = Instance.new("UICorner")
+        boxCorner.CornerRadius = UDim.new(0, 6)
+        boxCorner.Parent = box
+
+        local status = Instance.new("TextLabel")
+        status.Size = UDim2.new(1, -24, 0, 18)
+        status.Position = UDim2.new(0, 12, 0, 76)
+        status.BackgroundTransparency = 1
+        status.Text = "Webhook is OFF"
+        status.TextColor3 = activeTheme.muted
+        status.Font = Enum.Font.Gotham
+        status.TextSize = 10
+        status.TextXAlignment = Enum.TextXAlignment.Left
+        status.Parent = webhookPanel
+
+        local enable = Instance.new("TextButton")
+        enable.Size = UDim2.new(1, -24, 0, 30)
+        enable.Position = UDim2.new(0, 12, 0, 98)
+        enable.BackgroundColor3 = activeTheme.surface
+        enable.BorderSizePixel = 0
+        enable.Text = "Webhook: OFF"
+        enable.TextColor3 = Color3.fromRGB(255,255,255)
+        enable.Font = Enum.Font.GothamBold
+        enable.TextSize = 11
+        enable.Parent = webhookPanel
+        local enableCorner = Instance.new("UICorner")
+        enableCorner.CornerRadius = UDim.new(0, 6)
+        enableCorner.Parent = enable
+
+        local function updateEnable()
+            if WebhookEnabled then
+                enable.Text = "Webhook: ON"
+                enable.BackgroundColor3 = activeTheme.controlOn
+                status.Text = "Webhook is ON"
+            else
+                enable.Text = "Webhook: OFF"
+                enable.BackgroundColor3 = activeTheme.surface
+                status.Text = "Webhook is OFF"
+            end
+        end
+
+        enable.MouseButton1Click:Connect(function()
+            WebhookURL = tostring(box.Text or ""):match("^%s*(.-)%s*$")
+            if not WebhookEnabled and WebhookURL == "" then
+                status.Text = "Enter a webhook URL first"
+                return
+            end
+            WebhookEnabled = not WebhookEnabled
+            updateEnable()
+        end)
+
+        local function addToggle(labelText, key, x, y)
+            local b = Instance.new("TextButton")
+            b.Size = UDim2.new(0.47,0,0,28)
+            b.Position = UDim2.new(x, x == 0 and 12 or 0, 0, y)
+            b.BackgroundColor3 = activeTheme.surface
+            b.BorderSizePixel = 0
+            b.Font = Enum.Font.GothamSemibold
+            b.TextSize = 10
+            b.TextColor3 = Color3.fromRGB(255,255,255)
+            b.Parent = webhookPanel
+            local c = Instance.new("UICorner")
+            c.CornerRadius = UDim.new(0,6)
+            c.Parent = b
+            local function redraw()
+                b.Text = (WebhookNotify[key] and "ON  -  " or "OFF -  ") .. labelText
+            end
+            redraw()
+            b.MouseButton1Click:Connect(function()
+                WebhookNotify[key] = not WebhookNotify[key]
+                redraw()
+            end)
+        end
+        addToggle("Huges", "Huge", 0, 136)
+        addToggle("Secrets", "Secret", 0.53, 136)
+        addToggle("Titanics", "Titanic", 0, 168)
+        addToggle("Gargantuans", "Gargantuan", 0.53, 168)
+
+        local test = Instance.new("TextButton")
+        test.Size = UDim2.new(1,-24,0,34)
+        test.Position = UDim2.new(0,12,0,206)
+        test.BackgroundColor3 = activeTheme.accent
+        test.BorderSizePixel = 0
+        test.Text = "Send Test Webhook"
+        test.TextColor3 = Color3.fromRGB(255,255,255)
+        test.Font = Enum.Font.GothamBold
+        test.TextSize = 11
+        test.Parent = webhookPanel
+        local testCorner = Instance.new("UICorner")
+        testCorner.CornerRadius = UDim.new(0,6)
+        testCorner.Parent = test
+
+        local function numberText(v)
+            return tostring(v or 0)
+        end
+
+        local function readCounter(label)
+            local text = tostring(label and label.Text or "0")
+            local raw = string.match(text, "(%d[%d,]*)") or "0"
+            local value = tonumber((string.gsub(raw, ",", ""))) or 0
+            return value
+        end
+
+        local function getCurrentTotals()
+            return {
+                Huge = readCounter(hugeLabel),
+                Secret = readCounter(secretLabel),
+                Titanic = readCounter(titanicLabel),
+                Gargantuan = readCounter(gargantuanLabel)
+            }
+        end
+
+        local function makePayload(testMessage, category, petName, totals)
+            local fields = {
+                {name="🐯 Huges", value="**"..numberText(totals.Huge).."**", inline=true},
+                {name="🌌 Secrets", value="**"..numberText(totals.Secret).."**", inline=true},
+                {name="🚢 Titanics", value="**"..numberText(totals.Titanic).."**", inline=true},
+                {name="👑 Gargantuans", value="**"..numberText(totals.Gargantuan).."**", inline=true}
+            }
+            return {
+                username="Pet Dimensions Hub",
+                embeds={{
+                    title=testMessage and "🧪 Webhook Test" or ("✨ New "..tostring(category).."!"),
+                    description=testMessage and "Your rare-pet webhook is connected." or ("## "..tostring(petName or "Unknown Pet")),
+                    color=5793266,
+                    fields=fields,
+                    footer={text="Pet Dimensions Hub • Rare Hatch Tracker"},
+                    timestamp=os.date("!%Y-%m-%dT%H:%M:%SZ")
+                }}
+            }
+        end
+
+
+        box.FocusLost:Connect(function()
+            WebhookURL = tostring(box.Text or ""):match("^%s*(.-)%s*$")
+        end)
+
+        test.MouseButton1Click:Connect(function()
+            if WebhookSending then return end
+            WebhookURL = tostring(box.Text or ""):match("^%s*(.-)%s*$")
+            if WebhookURL == "" then status.Text="Enter a webhook URL first" return end
+            WebhookSending=true
+            test.Text="Sending..."
+            task.spawn(function()
+                local ok, result = pcall(function()
+                    return webhookSend(makePayload(true,nil,nil,getCurrentTotals()))
+                end)
+                WebhookSending=false
+                test.Text="Send Test Webhook"
+                status.Text=(ok and result==true) and "Test webhook sent successfully" or ("Test failed: "..tostring(result or "unknown error"))
+            end)
+        end)
+
+        -- Observe the existing recent-pet lists instead of scanning the entire
+        -- inventory again. This avoids a second Save.Get()/pairs() pass every 2s.
+        local function collectRecentEntries()
+            local result = {}
+            local lists = {
+                { category = "Huge", entries = recentHuges },
+                { category = "Secret", entries = recentSecrets },
+                { category = "Titanic", entries = recentTitanics },
+                { category = "Gargantuan", entries = recentGargantuans }
+            }
+            for _, data in ipairs(lists) do
+                for _, entry in ipairs(data.entries or {}) do
+                    if entry and entry.uid then
+                        result[tostring(entry.uid)] = {
+                            category = data.category,
+                            name = entry.name
+                        }
+                    end
+                end
+            end
+            return result
+        end
+
+        task.spawn(function()
+            while ui.Parent do
+                task.wait(3)
+                local current = collectRecentEntries()
+                local additions = {}
+
+                for uid, entry in pairs(current) do
+                    if not WebhookKnownPets[uid] then
+                        WebhookKnownPets[uid] = true
+                        if WebhookInitialized and WebhookEnabled then
+                            local category = entry.category
+                            if category and WebhookNotify[category] then
+                                table.insert(additions, {
+                                    category = category,
+                                    name = tostring(entry.name or "Unknown Pet")
+                                })
+                            end
+                        end
+                    end
+                end
+
+                if not WebhookInitialized then
+                    WebhookInitialized = true
+                end
+
+                if #additions > 0 and not WebhookSending then
+                    task.spawn(function()
+                        for _, item in ipairs(additions) do
+                            if WebhookEnabled and WebhookNotify[item.category] then
+                                WebhookSending = true
+                                local totals = getCurrentTotals()
+                                pcall(function()
+                                    webhookSend(makePayload(false, item.category, item.name, totals))
+                                end)
+                                WebhookSending = false
+                                task.wait(0.15)
+                            end
+                        end
+                    end)
+                end
+            end
+        end)
+    end)
 
     afkExit.MouseButton1Click:Connect(function()
         setAfkMode(false)
