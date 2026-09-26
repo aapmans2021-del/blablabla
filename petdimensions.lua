@@ -16,6 +16,14 @@ local SettingsFile = "MultiRobloxAccounts_settings.json"
 local CurrentThemeName = "Default Dark"
 local CurrentKeyName = "LeftControl"
 local CurrentToggleStates = {}
+local PersistedSettings = {
+    selectedEgg = nil,
+    webhook = {
+        url = "",
+        enabled = false,
+        notify = { Huge = true, Secret = true, Titanic = true, Gargantuan = true }
+    }
+}
 
 local function loadSettings()
     if type(readfile) ~= "function" or type(isfile) ~= "function" or not isfile(SettingsFile) then
@@ -30,14 +38,34 @@ end
 local SavedSettings = loadSettings()
 if SavedSettings.theme then CurrentThemeName = SavedSettings.theme end
 if SavedSettings.key then CurrentKeyName = SavedSettings.key end
+if type(SavedSettings.toggles) == "table" then
+    CurrentToggleStates = SavedSettings.toggles
+end
+if SavedSettings.selectedEgg ~= nil then
+    PersistedSettings.selectedEgg = tostring(SavedSettings.selectedEgg)
+end
+if type(SavedSettings.webhook) == "table" then
+    PersistedSettings.webhook.url = tostring(SavedSettings.webhook.url or "")
+    PersistedSettings.webhook.enabled = SavedSettings.webhook.enabled == true
+    if type(SavedSettings.webhook.notify) == "table" then
+        for _, key in ipairs({"Huge", "Secret", "Titanic", "Gargantuan"}) do
+            if SavedSettings.webhook.notify[key] ~= nil then
+                PersistedSettings.webhook.notify[key] = SavedSettings.webhook.notify[key] == true
+            end
+        end
+    end
+end
 
 local function saveSettings()
     if type(writefile) ~= "function" then return end
     pcall(function()
         writefile(SettingsFile, HttpService:JSONEncode({
+            version = 2,
             theme = CurrentThemeName,
             key = CurrentKeyName,
             toggles = CurrentToggleStates,
+            selectedEgg = PersistedSettings.selectedEgg,
+            webhook = PersistedSettings.webhook,
         }))
     end)
 end
@@ -2127,6 +2155,7 @@ task.spawn(function()
 
     -- UNIFIED TOGGLE GENERATOR HELPER
     local toggleRegistry = {}
+    local toggleCallbacks = {}
 
     local function createUnifiedToggle(parent, yPos, text, defaultState, callback)
         local btn = Instance.new("TextButton")
@@ -2149,8 +2178,9 @@ task.spawn(function()
         btnStroke.Transparency = 0.7
         btnStroke.Parent = btn
 
-        local state = defaultState
+        local state = CurrentToggleStates[text] == true and true or defaultState
         btn:SetAttribute("ToggleState", state)
+        toggleCallbacks[text] = callback
 
         local function updateVisuals(newState)
             state = newState
@@ -2163,6 +2193,8 @@ task.spawn(function()
         btn.MouseButton1Click:Connect(function()
             local newState = not state
             updateVisuals(newState)
+            CurrentToggleStates[text] = newState
+            saveSettings()
             callback(newState)
 
             if toggleRegistry[text] then
@@ -3005,6 +3037,14 @@ task.spawn(function()
     end)
 
     local SelectedEggId = EggList[1] and EggList[1].ID or "Spawn Egg"
+    if PersistedSettings.selectedEgg then
+        for _, egg in ipairs(EggList) do
+            if tostring(egg.ID) == PersistedSettings.selectedEgg then
+                SelectedEggId = egg.ID
+                break
+            end
+        end
+    end
     local function updateDropdown(filter)
         for _, child in ipairs(DropdownFrame:GetChildren()) do
             if child:IsA("TextButton") then child:Destroy() end
@@ -3030,6 +3070,8 @@ task.spawn(function()
 
                 button.MouseButton1Click:Connect(function()
                     SelectedEggId = egg.ID
+                    PersistedSettings.selectedEgg = tostring(SelectedEggId)
+                    saveSettings()
                     SelectedEggLabel.Text = "Selected: " .. egg.Name
                 end)
             end
@@ -3038,7 +3080,14 @@ task.spawn(function()
     end
 
     updateDropdown("")
-    SelectedEggLabel.Text = "Selected: " .. (EggList[1] and EggList[1].Name or "None")
+    local selectedEggName = "None"
+    for _, egg in ipairs(EggList) do
+        if tostring(egg.ID) == tostring(SelectedEggId) then
+            selectedEggName = egg.Name
+            break
+        end
+    end
+    SelectedEggLabel.Text = "Selected: " .. selectedEggName
 
     SearchBox.Changed:Connect(function(prop)
         if prop == "Text" then
@@ -3220,9 +3269,14 @@ task.spawn(function()
     -- prevent the main script from loading.
     -- =====================================================================
     pcall(function()
-        local WebhookURL = ""
-        local WebhookEnabled = false
-        local WebhookNotify = { Huge = true, Secret = true, Titanic = true, Gargantuan = true }
+        local WebhookURL = PersistedSettings.webhook.url or ""
+        local WebhookEnabled = PersistedSettings.webhook.enabled == true
+        local WebhookNotify = {
+            Huge = PersistedSettings.webhook.notify.Huge ~= false,
+            Secret = PersistedSettings.webhook.notify.Secret ~= false,
+            Titanic = PersistedSettings.webhook.notify.Titanic ~= false,
+            Gargantuan = PersistedSettings.webhook.notify.Gargantuan ~= false
+        }
         local WebhookSending = false
         local WebhookInitialized = false
         local WebhookKnownPets = {}
@@ -3302,7 +3356,7 @@ task.spawn(function()
         box.BorderSizePixel = 0
         box.ClearTextOnFocus = false
         box.PlaceholderText = "Paste Discord webhook URL here..."
-        box.Text = ""
+        box.Text = WebhookURL
         box.TextColor3 = Color3.fromRGB(255,255,255)
         box.Font = Enum.Font.Gotham
         box.TextSize = 11
@@ -3348,6 +3402,8 @@ task.spawn(function()
             end
         end
 
+        updateEnable()
+
         enable.MouseButton1Click:Connect(function()
             WebhookURL = tostring(box.Text or ""):match("^%s*(.-)%s*$")
             if not WebhookEnabled and WebhookURL == "" then
@@ -3355,6 +3411,10 @@ task.spawn(function()
                 return
             end
             WebhookEnabled = not WebhookEnabled
+            PersistedSettings.webhook.url = WebhookURL
+            PersistedSettings.webhook.enabled = WebhookEnabled
+            PersistedSettings.webhook.notify = WebhookNotify
+            saveSettings()
             updateEnable()
         end)
 
@@ -3377,6 +3437,10 @@ task.spawn(function()
             redraw()
             b.MouseButton1Click:Connect(function()
                 WebhookNotify[key] = not WebhookNotify[key]
+                PersistedSettings.webhook.url = WebhookURL
+                PersistedSettings.webhook.enabled = WebhookEnabled
+                PersistedSettings.webhook.notify = WebhookNotify
+                saveSettings()
                 redraw()
             end)
         end
@@ -3442,11 +3506,17 @@ task.spawn(function()
 
         box.FocusLost:Connect(function()
             WebhookURL = tostring(box.Text or ""):match("^%s*(.-)%s*$")
+            PersistedSettings.webhook.url = WebhookURL
+            PersistedSettings.webhook.enabled = WebhookEnabled
+            PersistedSettings.webhook.notify = WebhookNotify
+            saveSettings()
         end)
 
         test.MouseButton1Click:Connect(function()
             if WebhookSending then return end
             WebhookURL = tostring(box.Text or ""):match("^%s*(.-)%s*$")
+            PersistedSettings.webhook.url = WebhookURL
+            saveSettings()
             if WebhookURL == "" then status.Text="Enter a webhook URL first" return end
             WebhookSending=true
             test.Text="Sending..."
@@ -3526,6 +3596,20 @@ task.spawn(function()
             end
         end)
     end)
+
+    -- Apply saved toggle states only after every toggle has been created.
+    -- This is important for AFK CPU Reducer and Auto-Hatch because their
+    -- callbacks depend on UI/functions that are created later in the script.
+    for key, callback in pairs(toggleCallbacks) do
+        if CurrentToggleStates[key] == true then
+            pcall(callback, true)
+            if toggleRegistry[key] then
+                for _, syncFunc in ipairs(toggleRegistry[key]) do
+                    pcall(syncFunc, true)
+                end
+            end
+        end
+    end
 
     afkExit.MouseButton1Click:Connect(function()
         setAfkMode(false)
@@ -4010,6 +4094,8 @@ task.spawn(function()
         listeningForKey = true
         keybindBtn.Text = "Press any key..."
     end)
+
+    saveSettings()
 
     UserInputService.InputBegan:Connect(function(input, gameProcessed)
         if listeningForKey and input.UserInputType == Enum.UserInputType.Keyboard then
