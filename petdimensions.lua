@@ -9,6 +9,8 @@ local Workspace = game:GetService("Workspace")
 local Lighting = game:GetService("Lighting")
 local UserInputService = game:GetService("UserInputService")
 local HttpService = game:GetService("HttpService")
+local GuiService = game:GetService("GuiService")
+local VirtualInputManager = game:GetService("VirtualInputManager")
 local localPlayer = Players.LocalPlayer
 local playerGui = localPlayer:WaitForChild("PlayerGui")
 
@@ -79,6 +81,7 @@ end
 local AutoFarmRobot = false
 local AutoFarmTurkey = false
 local AutoFarmExpedition = false
+local AutoFarmChestRaid = false
 local AutoFarmHackerBoss = false
 local AutoTokens = false
 local PotatoMode = false
@@ -144,6 +147,14 @@ local LastPetSendTarget = nil
 local CurrentExpeditionTarget = nil
 local CurrentExpeditionTargetId = nil
 local LastExpeditionPetSendTarget = nil
+local CurrentChestRaidTarget = nil
+local CurrentChestRaidTargetId = nil
+local LastChestRaidPetSendTarget = nil
+local LastChestRaidRoom = nil
+local ChestRaidData = nil
+local ChestRaidPetsToggleRaidKey = nil
+local ChestRaidWasActive = false
+local ChestRaidDataCheckedAt = 0
 local CurrentHackerBoss = nil
 local CurrentHackerBossId = nil
 local DamageRemote = ReplicatedStorage:GetChildren()[66]
@@ -186,6 +197,317 @@ local function GetAllEquippedPetUIDs()
         end
     end
     return myPets
+end
+
+-- =====================================================================
+-- CHEST RAID FARM
+-- Chest Raid coin identification comes from the game's actual coin
+-- directory data. The supplied ChestRaid: 2 module has `chestRaid = true`,
+-- so we resolve each rendered coin ID through `Get Coins`, read its coin
+-- name (`n`), then check Library.Directory.Coins[n].chestRaid.
+-- =====================================================================
+local ChestRaidCoinsById = {}
+local ChestRaidCoinsCheckedAt = 0
+
+local function RefreshChestRaidData(force)
+    local now = os.clock()
+    if not force and now - ChestRaidDataCheckedAt < 1 then
+        return ChestRaidData
+    end
+    ChestRaidDataCheckedAt = now
+
+    local ok, key, endTime, joinWindow = pcall(function()
+        return Library.Network.Invoke("Chest Raid: Get Raid Data")
+    end)
+    if ok and tonumber(key) then
+        ChestRaidData = {
+            Key = tonumber(key),
+            EndTime = tonumber(endTime),
+            JoinWindow = tonumber(joinWindow) or 120,
+        }
+    else
+        ChestRaidData = nil
+    end
+    return ChestRaidData
+end
+
+-- The raid timing is deliberately NOT used by the farm. This remains here
+-- only because the rest of the script may use the data for status/debugging.
+local function IsChestRaidActive()
+    return true
+end
+
+-- The supplied ChestRaid: 2 module proves the authoritative marker is:
+--     Library.Directory.Coins[coinName].chestRaid == true
+-- Get Coins supplies the rendered coin ID -> coin name (`n`) mapping.
+-- Refresh frequently because a new room/chest can appear at any time.
+local function RefreshChestRaidCoinDirectory(force)
+    local now = os.clock()
+    if not force and now - ChestRaidCoinsCheckedAt < 0.20 then
+        return ChestRaidCoinsById
+    end
+    ChestRaidCoinsCheckedAt = now
+
+    local ok, coins = pcall(function()
+        return Library.Network.Invoke("Get Coins")
+    end)
+    if not ok or type(coins) ~= "table" then
+        return ChestRaidCoinsById
+    end
+
+    table.clear(ChestRaidCoinsById)
+
+    for id, coinData in pairs(coins) do
+        if type(coinData) == "table" then
+            local coinName = coinData.n
+            local directory = Library.Directory
+            local directoryCoins = directory and directory.Coins
+            local directoryCoin = coinName and directoryCoins and directoryCoins[coinName]
+
+            if type(directoryCoin) == "table" and directoryCoin.chestRaid == true then
+                ChestRaidCoinsById[tostring(id)] = true
+            end
+        end
+    end
+
+    return ChestRaidCoinsById
+end
+
+local function GetCoinRootFromInstance(instance)
+    if not instance then
+        return nil
+    end
+
+    local current = instance
+    while current and current.Parent do
+        if current:GetAttribute("ID") ~= nil then
+            return current
+        end
+        current = current.Parent
+    end
+
+    return nil
+end
+
+local function GetCoinPosition(coin)
+    if not coin then
+        return nil
+    end
+
+    local coinPart = coin:FindFirstChild("Coin", true)
+    if coinPart and coinPart:IsA("BasePart") then
+        return coinPart.Position
+    end
+
+    if coin:IsA("BasePart") then
+        return coin.Position
+    end
+
+    local ok, pivot = pcall(function()
+        return coin:GetPivot()
+    end)
+    if ok then
+        return pivot.Position
+    end
+
+    local part = coin:FindFirstChildWhichIsA("BasePart", true)
+    return part and part.Position or nil
+end
+
+local function IsChestRaidCoin(coin)
+    if not coin or not coin.Parent then
+        return false
+    end
+
+    local root = GetCoinRootFromInstance(coin) or coin
+    local id = root:GetAttribute("ID")
+    if id == nil then
+        return false
+    end
+
+    -- Do NOT require Health or a Coin child here. Both can be assigned after
+    -- the object is created, and that timing was causing missed spawns.
+    local health = tonumber(root:GetAttribute("Health"))
+    if health ~= nil and health <= 0 then
+        return false
+    end
+
+    local raidCoins = RefreshChestRaidCoinDirectory(false)
+    if raidCoins[tostring(id)] == true then
+        return true
+    end
+
+    -- Renderer/decompile fallbacks while the network mapping catches up.
+    local raidAttribute = root:GetAttribute("ChestRaid")
+    if raidAttribute == true or tostring(raidAttribute):lower() == "true" then
+        return true
+    end
+
+    local lowerName = tostring(root.Name):lower()
+    if lowerName:find("chestraid", 1, true) or lowerName:find("chest raid", 1, true) then
+        return true
+    end
+
+    return false
+end
+
+local function FindRenderedChestRaidCoinById(id)
+    local things = Workspace:FindFirstChild("__THINGS")
+    local coinsFolder = things and things:FindFirstChild("Coins")
+    if not coinsFolder or id == nil then
+        return nil
+    end
+
+    local wanted = tostring(id)
+
+    for _, instance in ipairs(coinsFolder:GetDescendants()) do
+        if instance:GetAttribute("ID") ~= nil
+            and tostring(instance:GetAttribute("ID")) == wanted then
+            local root = GetCoinRootFromInstance(instance) or instance
+            if IsChestRaidCoin(root) then
+                return root
+            end
+        end
+    end
+
+    return nil
+end
+
+local function FindNextChestRaidCoin(previous)
+    local things = Workspace:FindFirstChild("__THINGS")
+    local coinsFolder = things and things:FindFirstChild("Coins")
+    if not coinsFolder then
+        return nil
+    end
+
+    local raidCoins = RefreshChestRaidCoinDirectory(true)
+    local nearest = nil
+    local nearestDistance = math.huge
+
+    -- Match every rendered object by ID. Do not assume the chest is a direct
+    -- child, a Model, or already has its Coin part/Health attribute.
+    local checkedRoots = {}
+    for _, instance in ipairs(coinsFolder:GetDescendants()) do
+        local id = instance:GetAttribute("ID")
+        if id ~= nil and raidCoins[tostring(id)] == true then
+            local root = GetCoinRootFromInstance(instance) or instance
+            if root ~= previous and not checkedRoots[root] and IsChestRaidCoin(root) then
+                checkedRoots[root] = true
+                local position = GetCoinPosition(root)
+                local character = localPlayer.Character
+                local hrp = character and character:FindFirstChild("HumanoidRootPart")
+                if position and hrp then
+                    local distance = (hrp.Position - position).Magnitude
+                    if distance < nearestDistance then
+                        nearest = root
+                        nearestDistance = distance
+                    end
+                elseif position and not nearest then
+                    nearest = root
+                end
+            end
+        end
+    end
+
+    if nearest then
+        return nearest
+    end
+
+    -- If only one raid chest is alive, keep it even if it is the previous
+    -- target. This prevents a gap between renderer updates.
+    if previous and IsChestRaidCoin(previous) then
+        return previous
+    end
+
+    return nil
+end
+
+local function GetRaidTargetPosition(coin)
+    return GetCoinPosition(coin)
+end
+
+local function GetRaidTargetDistance(coin)
+    local character = localPlayer.Character
+    local hrp = character and character:FindFirstChild("HumanoidRootPart")
+    local position = GetRaidTargetPosition(coin)
+    if not hrp or not position then
+        return math.huge
+    end
+
+    return (hrp.Position - position).Magnitude
+end
+
+local function TeleportToRaidCoin(coin)
+    local character = localPlayer.Character
+    local hrp = character and character:FindFirstChild("HumanoidRootPart")
+    local position = GetRaidTargetPosition(coin)
+    if not hrp or not position then
+        return false
+    end
+
+    hrp.CFrame = CFrame.new(position + Vector3.new(0, 4, 0))
+    return true
+end
+
+local function ResetChestRaidFarmState()
+    CurrentChestRaidTarget = nil
+    CurrentChestRaidTargetId = nil
+    LastChestRaidPetSendTarget = nil
+    LastChestRaidRoom = nil
+end
+
+-- Toggle the game's Pets Control through the real UI-navigation flow.
+-- Open Settings -> UI navigation -> PetsControl.Toggle -> Enter -> close Settings.
+local function ToggleChestRaidPetsControl()
+    local ok = pcall(function()
+        local settings = playerGui:WaitForChild("Settings", 3)
+        local toggle = settings
+            :WaitForChild("Frame", 3)
+            :WaitForChild("Container", 3)
+            :WaitForChild("PetsControl", 3)
+            :WaitForChild("Toggle", 3)
+
+        if settings:IsA("ScreenGui") then
+            settings.Enabled = true
+        elseif settings:IsA("GuiObject") then
+            settings.Visible = true
+        end
+
+        task.wait(0.3)
+        GuiService.GuiNavigationEnabled = true
+        GuiService.SelectedObject = toggle
+
+        task.wait(0.3)
+        VirtualInputManager:SendKeyEvent(true, Enum.KeyCode.Return, false, game)
+        task.wait(0.05)
+        VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.Return, false, game)
+
+        task.wait(0.3)
+
+        -- Close Settings without Escape, so Roblox's ESC menu is not opened.
+        if settings:IsA("ScreenGui") then
+            settings.Enabled = false
+        elseif settings:IsA("GuiObject") then
+            settings.Visible = false
+        end
+
+        GuiService.SelectedObject = nil
+        GuiService.GuiNavigationEnabled = false
+    end)
+
+    if not ok then
+        pcall(function()
+            GuiService.SelectedObject = nil
+            GuiService.GuiNavigationEnabled = false
+        end)
+    end
+
+    return ok
+end
+
+local function HandleChestRaidPetsToggle(raidActive, raidKey)
+    -- Raid timing detection is intentionally unused. The Chest Raid Farm
+    -- toggle controls this feature directly.
 end
 
 local function GetNextRobot()
@@ -879,6 +1201,8 @@ task.spawn(function()
                 targetId = CurrentHackerBossId
             elseif AutoFarmExpedition then
                 targetId = CurrentExpeditionTargetId
+            elseif AutoFarmChestRaid then
+                targetId = CurrentChestRaidTargetId
             elseif AutoFarmRobot or AutoFarmTurkey then
                 targetId = CurrentTargetId
             end
@@ -1156,6 +1480,85 @@ task.spawn(function()
             pcall(function()
                 DamageRemote:FireServer(CurrentHackerBossId)
             end)
+        end
+    end
+end)
+
+-- Chest Raid farm loop. The toggle is the only gate now.
+-- No raid start/end timing is required. As soon as a rendered coin resolves
+-- to a directory entry with `chestRaid = true`, it becomes a target.
+task.spawn(function()
+    while true do
+        task.wait(0.15)
+
+        if AutoFarmChestRaid then
+            if not CurrentChestRaidTarget or not IsChestRaidCoin(CurrentChestRaidTarget) then
+                local previous = CurrentChestRaidTarget
+                CurrentChestRaidTarget = FindNextChestRaidCoin(previous)
+                CurrentChestRaidTargetId = CurrentChestRaidTarget
+                    and tostring(CurrentChestRaidTarget:GetAttribute("ID"))
+                    or nil
+                LastChestRaidPetSendTarget = nil
+
+                if CurrentChestRaidTarget then
+                    -- Always teleport to the exact chest being targeted.
+                    -- This naturally moves the player between raid rooms.
+                    TeleportToRaidCoin(CurrentChestRaidTarget)
+                    LastChestRaidRoom = CurrentChestRaidTarget.Parent
+                end
+            end
+
+            if CurrentChestRaidTarget and IsChestRaidCoin(CurrentChestRaidTarget) then
+                local targetId = tostring(CurrentChestRaidTarget:GetAttribute("ID"))
+                CurrentChestRaidTargetId = targetId
+
+                pcall(function()
+                    Library.Signal.Fire("Select Coin", CurrentChestRaidTarget)
+                end)
+
+                if LastChestRaidPetSendTarget ~= CurrentChestRaidTarget then
+                    local pets = GetAllEquippedPetUIDs()
+                    if #pets > 0 then
+                        pcall(function()
+                            Library.Network.Invoke("Join Coin", targetId, pets)
+                        end)
+                        for _, petUid in ipairs(pets) do
+                            pcall(function()
+                                Library.Network.Fire("Change Pet Target", petUid, "Coin", targetId)
+                            end)
+                        end
+                        LastChestRaidPetSendTarget = CurrentChestRaidTarget
+                    end
+                end
+            else
+                ResetChestRaidFarmState()
+            end
+        else
+            ResetChestRaidFarmState()
+        end
+    end
+end)
+
+-- Dedicated raid damage loop. This keeps raid farming independent from the
+-- ordinary robot/turkey/expedition loops.
+task.spawn(function()
+    while true do
+        task.wait(0.05)
+        if AutoFarmChestRaid and CurrentChestRaidTargetId then
+            pcall(function()
+                if DamageRemote then
+                    DamageRemote:FireServer(CurrentChestRaidTargetId)
+                end
+            end)
+
+            -- Keep the same pet/coin hit path used by the existing fast-attack
+            -- system, but scoped strictly to the current raid target.
+            local pets = GetAllEquippedPetUIDs()
+            for _, petUid in ipairs(pets) do
+                pcall(function()
+                    Library.Network.Fire("Farm Coin", CurrentChestRaidTargetId, petUid)
+                end)
+            end
         end
     end
 end)
@@ -2265,9 +2668,21 @@ task.spawn(function()
         end
     end)
 
+    createUnifiedToggle(farmFrame, 410, "🏴 Chest Raid Farm", false, function(state)
+        AutoFarmChestRaid = state
+        if state then
+            ChestRaidWasActive = true
+            task.spawn(ToggleChestRaidPetsControl)
+        else
+            ResetChestRaidFarmState()
+            ChestRaidWasActive = false
+            task.spawn(ToggleChestRaidPetsControl)
+        end
+    end)
+
     local farmStatus = Instance.new("TextLabel")
     farmStatus.Size = UDim2.new(1, 0, 0, 28)
-    farmStatus.Position = UDim2.new(0, 0, 0, 410)
+    farmStatus.Position = UDim2.new(0, 0, 0, 452)
     farmStatus.BackgroundTransparency = 1
     farmStatus.Text = "Status: Idle"
     farmStatus.TextColor3 = Color3.fromRGB(180, 180, 180)
@@ -2303,6 +2718,14 @@ task.spawn(function()
             elseif AutoFarmComet and CurrentCometId then
                 farmStatus.Text = "Status: ☄️ Farming Comet #" .. CurrentCometId
                 farmStatus.TextColor3 = Color3.fromRGB(180, 220, 255)
+            elseif AutoFarmChestRaid then
+                if IsChestRaidActive() then
+                    farmStatus.Text = "Status: 🏴 Chest Raid active - searching room"
+                    farmStatus.TextColor3 = Color3.fromRGB(210, 170, 255)
+                else
+                    farmStatus.Text = "Status: 🕒 Waiting for Chest Raid"
+                    farmStatus.TextColor3 = Color3.fromRGB(255, 200, 80)
+                end
             elseif AutoFarmTurkey or AutoFarmRobot then
                 farmStatus.Text = "Status: ⏳ Searching Target..."
                 farmStatus.TextColor3 = Color3.fromRGB(255, 200, 80)
