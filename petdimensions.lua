@@ -4340,7 +4340,7 @@ task.spawn(function()
     -- Tech World
     createTeleportSection(tpScroll, "Tech World")
     createTeleportButton(tpScroll, "Tech Spawn", {-9977, 16, 9601})
-    createTeleportButton(tpScroll, "Tech Last Area", {-7997, 16, 9609})
+    createTeleportButton(tpScroll, "Tech Last Area", {-5328, 18, 9626})
 
     -- =====================================================================
     -- SETTINGS TAB UI & EXTENDED THEME SWITCHER
