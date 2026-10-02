@@ -1413,7 +1413,7 @@ end)
 -- remainder of the 60-second cycle before starting over. The 60-second timer
 -- starts when the first teleport/E action of a cycle occurs.
 local TrickOrTreatDelay = 5
-local TrickOrTreatCycle = 70
+local TrickOrTreatCycle = 60
 
 local function GetTrickOrTreatPosition(instance)
     if not instance or not instance.Parent then
@@ -3581,16 +3581,10 @@ task.spawn(function()
 
             if enabled then
                 PotatoMode = true
-                RunService:Set3dRenderingEnabled(false)
-                settings().Rendering.QualityLevel = Enum.QualityLevel.Level01
-                Lighting.GlobalShadows = false
                 afkOverlay.Visible = true
                 autoHatchMain.Visible = false
             else
                 PotatoMode = false
-                RunService:Set3dRenderingEnabled(true)
-                settings().Rendering.QualityLevel = Enum.QualityLevel.Automatic
-                Lighting.GlobalShadows = true
                 afkOverlay.Visible = false
                 autoHatchMain.Visible = true
             end
