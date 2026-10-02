@@ -1443,7 +1443,7 @@ local function TeleportAndPressE(position)
     end
 
     hrp.CFrame = CFrame.new(position + Vector3.new(0, 3, 0))
-    task.wait(1)
+    task.wait(2)
 
     pcall(function()
         VirtualInputManager:SendKeyEvent(true, Enum.KeyCode.E, false, game)
