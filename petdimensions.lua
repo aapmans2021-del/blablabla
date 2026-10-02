@@ -1413,7 +1413,7 @@ end)
 -- remainder of the 60-second cycle before starting over. The 60-second timer
 -- starts when the first teleport/E action of a cycle occurs.
 local TrickOrTreatDelay = 5
-local TrickOrTreatCycle = 60
+local TrickOrTreatCycle = 70
 
 local function GetTrickOrTreatPosition(instance)
     if not instance or not instance.Parent then
