@@ -89,6 +89,7 @@ local AutoFarmHackerBoss = false
 local AutoTokens = false
 local PotatoMode = false
 local AutoFarmComet = false
+local AutoTrickOrTreat = false
 local FastPetSpeed = false
 local FastAttackSpeed = false
 local FastPetSpeedApplied = false
@@ -1406,6 +1407,103 @@ task.spawn(function()
     end
 end)
 
+-- AUTO TRICK OR TREAT
+-- Visits every current child under workspace.__TrickOrTreat, presses E once
+-- at each location, waits 5 seconds between locations, then waits for the
+-- remainder of the 60-second cycle before starting over. The 60-second timer
+-- starts when the first teleport/E action of a cycle occurs.
+local TrickOrTreatDelay = 5
+local TrickOrTreatCycle = 60
+
+local function GetTrickOrTreatPosition(instance)
+    if not instance or not instance.Parent then
+        return nil
+    end
+
+    if instance:IsA("BasePart") then
+        return instance.Position
+    end
+
+    local ok, pivot = pcall(function()
+        return instance:GetPivot()
+    end)
+    if ok and pivot then
+        return pivot.Position
+    end
+
+    local part = instance:FindFirstChildWhichIsA("BasePart", true)
+    return part and part.Position or nil
+end
+
+local function TeleportAndPressE(position)
+    local character = localPlayer.Character
+    local hrp = character and character:FindFirstChild("HumanoidRootPart")
+    if not hrp or not position then
+        return false
+    end
+
+    hrp.CFrame = CFrame.new(position + Vector3.new(0, 3, 0))
+    task.wait(1)
+
+    pcall(function()
+        VirtualInputManager:SendKeyEvent(true, Enum.KeyCode.E, false, game)
+        task.wait(0.1)
+        VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.E, false, game)
+    end)
+
+    return true
+end
+
+task.spawn(function()
+    while true do
+        if not AutoTrickOrTreat then
+            task.wait(0.25)
+        else
+            local cycleStart = nil
+            local folder = Workspace:FindFirstChild("__TrickOrTreat")
+
+            if folder then
+                local children = folder:GetChildren()
+
+                for index, child in ipairs(children) do
+                    if not AutoTrickOrTreat then
+                        break
+                    end
+
+                    local position = GetTrickOrTreatPosition(child)
+                    if position then
+                        if not cycleStart then
+                            cycleStart = os.clock()
+                        end
+
+                        TeleportAndPressE(position)
+
+                        if index < #children and AutoTrickOrTreat then
+                            local waited = 0
+                            while AutoTrickOrTreat and waited < TrickOrTreatDelay do
+                                local step = math.min(0.25, TrickOrTreatDelay - waited)
+                                task.wait(step)
+                                waited = waited + step
+                            end
+                        end
+                    end
+                end
+
+                if cycleStart and AutoTrickOrTreat then
+                    local remaining = TrickOrTreatCycle - (os.clock() - cycleStart)
+                    while AutoTrickOrTreat and remaining > 0 do
+                        local step = math.min(0.25, remaining)
+                        task.wait(step)
+                        remaining = TrickOrTreatCycle - (os.clock() - cycleStart)
+                    end
+                end
+            else
+                task.wait(0.5)
+            end
+        end
+    end
+end)
+
 -- ANTI-AFK
 -- Sends a real Space key press at the user-selected interval (minutes).
 task.spawn(function()
@@ -2537,7 +2635,11 @@ task.spawn(function()
         end
     end)
 
-    createUnifiedToggle(farmFrame, 410, "👆 Auto Tap", false, function(state)
+    createUnifiedToggle(farmFrame, 410, "🎃 Auto Trick or Treating", false, function(state)
+        AutoTrickOrTreat = state
+    end)
+
+    createUnifiedToggle(farmFrame, 452, "👆 Auto Tap", false, function(state)
         AutoTap = state
         if not state then
             ResetCoinTarget()
@@ -2557,7 +2659,7 @@ task.spawn(function()
 
     local antiAfkLabel = Instance.new("TextLabel")
     antiAfkLabel.Size = UDim2.new(0.58, 0, 0, 28)
-    antiAfkLabel.Position = UDim2.new(0, 0, 0, 536)
+    antiAfkLabel.Position = UDim2.new(0, 0, 0, 578)
     antiAfkLabel.BackgroundTransparency = 1
     antiAfkLabel.Text = "Anti AFK interval (minutes)"
     antiAfkLabel.TextColor3 = Color3.fromRGB(190, 190, 200)
@@ -2568,7 +2670,7 @@ task.spawn(function()
 
     local antiAfkBox = Instance.new("TextBox")
     antiAfkBox.Size = UDim2.new(0.32, 0, 0, 28)
-    antiAfkBox.Position = UDim2.new(0.68, 0, 0, 536)
+    antiAfkBox.Position = UDim2.new(0.68, 0, 0, 578)
     antiAfkBox.BackgroundColor3 = Color3.fromRGB(35, 35, 48)
     antiAfkBox.BorderSizePixel = 0
     antiAfkBox.ClearTextOnFocus = false
@@ -2595,7 +2697,7 @@ task.spawn(function()
 
     local farmStatus = Instance.new("TextLabel")
     farmStatus.Size = UDim2.new(1, 0, 0, 28)
-    farmStatus.Position = UDim2.new(0, 0, 0, 574)
+    farmStatus.Position = UDim2.new(0, 0, 0, 616)
     farmStatus.BackgroundTransparency = 1
     farmStatus.Text = "Status: Idle"
     farmStatus.TextColor3 = Color3.fromRGB(180, 180, 180)
