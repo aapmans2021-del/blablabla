@@ -2383,13 +2383,15 @@ task.spawn(function()
     mazeFrame.Parent = autoHatchMain
 
     -- =====================================================================
-    -- HALLOWEEN MAZE MODULE (isolated so a maze-side error cannot stop the main hub)
-    -- =====================================================================
-    task.spawn(function()
-        local ok, mazeError = xpcall(function()
-    -- =====================================================================
     -- HALLOWEEN MAZE MODULE (embedded into the existing hub)
     -- =====================================================================
+    -- These are the original Maze module dependencies.
+    -- Keep them local to the Maze code so the original movement/ESP logic
+    -- runs in the same environment as the standalone Maze script.
+    local PathfindingService = game:GetService("PathfindingService")
+    local Player = Players.LocalPlayer
+    local PlayerGui = Player:WaitForChild("PlayerGui")
+
 -- ============================================================
 -- CONFIG
 -- ============================================================
@@ -4556,14 +4558,6 @@ end)
 
 
 
-        end, function(err)
-            warn("[Pet Dimensions Hub] Maze module error: " .. tostring(err))
-            return err
-        end)
-        if not ok then
-            warn("[Pet Dimensions Hub] Maze module failed to initialize.")
-        end
-    end)
 
     -- =====================================================================
     -- FULL EXTENDED THEMES SYSTEM
