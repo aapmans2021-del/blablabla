@@ -81,11 +81,15 @@ end
 local AutoFarmRobot = false
 local AutoFarmTurkey = false
 local AutoFarmExpedition = false
-local AutoFarmChestRaid = false
+local AutoTap = false
+local AutoTeleportClosestCoin = false
+local AntiAFK = false
+local AntiAFKIntervalMinutes = 1
 local AutoFarmHackerBoss = false
 local AutoTokens = false
 local PotatoMode = false
 local AutoFarmComet = false
+local AutoTrickOrTreat = false
 local FastPetSpeed = false
 local FastAttackSpeed = false
 local FastPetSpeedApplied = false
@@ -147,17 +151,8 @@ local LastPetSendTarget = nil
 local CurrentExpeditionTarget = nil
 local CurrentExpeditionTargetId = nil
 local LastExpeditionPetSendTarget = nil
-local CurrentChestRaidTarget = nil
-local CurrentChestRaidTargetId = nil
-local LastChestRaidPetSendTarget = nil
-local LastChestRaidRoom = nil
-local ChestRaidData = nil
-local ChestRaidDoorTeleported = false
-local ChestRaidDoorTeleportAt = 0
-local ChestRaidDoorPosition = Vector3.new(-7429, 19, 9368)
-local ChestRaidPetsToggleRaidKey = nil
-local ChestRaidWasActive = false
-local ChestRaidDataCheckedAt = 0
+local CurrentCoinTarget = nil
+local CurrentCoinTargetId = nil
 local CurrentHackerBoss = nil
 local CurrentHackerBossId = nil
 local DamageRemote = ReplicatedStorage:GetChildren()[66]
@@ -202,85 +197,8 @@ local function GetAllEquippedPetUIDs()
     return myPets
 end
 
--- =====================================================================
--- CHEST RAID FARM
--- Chest Raid coin identification comes from the game's actual coin
--- directory data. The supplied ChestRaid: 2 module has `chestRaid = true`,
--- so we resolve each rendered coin ID through `Get Coins`, read its coin
--- name (`n`), then check Library.Directory.Coins[n].chestRaid.
--- =====================================================================
-local ChestRaidCoinsById = {}
-local ChestRaidCoinsCheckedAt = 0
-
-local function RefreshChestRaidData(force)
-    local now = os.clock()
-    if not force and now - ChestRaidDataCheckedAt < 1 then
-        return ChestRaidData
-    end
-    ChestRaidDataCheckedAt = now
-
-    local ok, key, endTime, joinWindow = pcall(function()
-        return Library.Network.Invoke("Chest Raid: Get Raid Data")
-    end)
-    if ok and tonumber(key) then
-        ChestRaidData = {
-            Key = tonumber(key),
-            EndTime = tonumber(endTime),
-            JoinWindow = tonumber(joinWindow) or 120,
-        }
-    else
-        ChestRaidData = nil
-    end
-    return ChestRaidData
-end
-
--- The raid timing is deliberately NOT used by the farm. This remains here
--- only because the rest of the script may use the data for status/debugging.
-local function IsChestRaidActive()
-    return true
-end
-
--- The supplied ChestRaid: 2 module proves the authoritative marker is:
---     Library.Directory.Coins[coinName].chestRaid == true
--- Get Coins supplies the rendered coin ID -> coin name (`n`) mapping.
--- Refresh frequently because a new room/chest can appear at any time.
-local function RefreshChestRaidCoinDirectory(force)
-    local now = os.clock()
-    if not force and now - ChestRaidCoinsCheckedAt < 0.20 then
-        return ChestRaidCoinsById
-    end
-    ChestRaidCoinsCheckedAt = now
-
-    local ok, coins = pcall(function()
-        return Library.Network.Invoke("Get Coins")
-    end)
-    if not ok or type(coins) ~= "table" then
-        return ChestRaidCoinsById
-    end
-
-    table.clear(ChestRaidCoinsById)
-
-    for id, coinData in pairs(coins) do
-        if type(coinData) == "table" then
-            local coinName = coinData.n
-            local directory = Library.Directory
-            local directoryCoins = directory and directory.Coins
-            local directoryCoin = coinName and directoryCoins and directoryCoins[coinName]
-
-            if type(directoryCoin) == "table" and directoryCoin.chestRaid == true then
-                ChestRaidCoinsById[tostring(id)] = true
-            end
-        end
-    end
-
-    return ChestRaidCoinsById
-end
-
 local function GetCoinRootFromInstance(instance)
-    if not instance then
-        return nil
-    end
-
+    if not instance then return nil end
     local current = instance
     while current and current.Parent do
         if current:GetAttribute("ID") ~= nil then
@@ -288,14 +206,11 @@ local function GetCoinRootFromInstance(instance)
         end
         current = current.Parent
     end
-
     return nil
 end
 
 local function GetCoinPosition(coin)
-    if not coin then
-        return nil
-    end
+    if not coin then return nil end
 
     local coinPart = coin:FindFirstChild("Coin", true)
     if coinPart and coinPart:IsA("BasePart") then
@@ -306,10 +221,8 @@ local function GetCoinPosition(coin)
         return coin.Position
     end
 
-    local ok, pivot = pcall(function()
-        return coin:GetPivot()
-    end)
-    if ok then
+    local ok, pivot = pcall(function() return coin:GetPivot() end)
+    if ok and pivot then
         return pivot.Position
     end
 
@@ -317,133 +230,78 @@ local function GetCoinPosition(coin)
     return part and part.Position or nil
 end
 
-local function IsChestRaidCoin(coin)
-    if not coin or not coin.Parent then
-        return false
-    end
-
-    local root = GetCoinRootFromInstance(coin) or coin
-    local id = root:GetAttribute("ID")
-    if id == nil then
-        return false
-    end
-
-    -- Do NOT require Health or a Coin child here. Both can be assigned after
-    -- the object is created, and that timing was causing missed spawns.
-    local health = tonumber(root:GetAttribute("Health"))
-    if health ~= nil and health <= 0 then
-        return false
-    end
-
-    local raidCoins = RefreshChestRaidCoinDirectory(false)
-    if raidCoins[tostring(id)] == true then
-        return true
-    end
-
-    -- Renderer/decompile fallbacks while the network mapping catches up.
-    local raidAttribute = root:GetAttribute("ChestRaid")
-    if raidAttribute == true or tostring(raidAttribute):lower() == "true" then
-        return true
-    end
-
-    local lowerName = tostring(root.Name):lower()
-    if lowerName:find("chestraid", 1, true) or lowerName:find("chest raid", 1, true) then
-        return true
-    end
-
-    return false
-end
-
-local function FindRenderedChestRaidCoinById(id)
+-- =====================================================================
+-- GENERIC CLOSEST-COIN TARGETING
+-- Finds any rendered coin under Workspace.__THINGS.Coins, regardless of
+-- coin type. The closest living coin to the player becomes the target.
+-- =====================================================================
+local function FindClosestCoin(previous)
     local things = Workspace:FindFirstChild("__THINGS")
     local coinsFolder = things and things:FindFirstChild("Coins")
-    if not coinsFolder or id == nil then
-        return nil
-    end
+    if not coinsFolder then return nil end
 
-    local wanted = tostring(id)
+    local character = localPlayer.Character
+    local hrp = character and character:FindFirstChild("HumanoidRootPart")
+    if not hrp then return nil end
 
-    for _, instance in ipairs(coinsFolder:GetDescendants()) do
-        if instance:GetAttribute("ID") ~= nil
-            and tostring(instance:GetAttribute("ID")) == wanted then
-            local root = GetCoinRootFromInstance(instance) or instance
-            if IsChestRaidCoin(root) then
-                return root
-            end
-        end
-    end
+    local closest, closestDistance = nil, math.huge
+    local checked = {}
 
-    return nil
-end
-
-local function FindNextChestRaidCoin(previous)
-    local things = Workspace:FindFirstChild("__THINGS")
-    local coinsFolder = things and things:FindFirstChild("Coins")
-    if not coinsFolder then
-        return nil
-    end
-
-    local raidCoins = RefreshChestRaidCoinDirectory(true)
-    local nearest = nil
-    local nearestDistance = math.huge
-
-    -- Match every rendered object by ID. Do not assume the chest is a direct
-    -- child, a Model, or already has its Coin part/Health attribute.
-    local checkedRoots = {}
-    for _, instance in ipairs(coinsFolder:GetDescendants()) do
-        local id = instance:GetAttribute("ID")
-        if id ~= nil and raidCoins[tostring(id)] == true then
-            local root = GetCoinRootFromInstance(instance) or instance
-            if root ~= previous and not checkedRoots[root] and IsChestRaidCoin(root) then
-                checkedRoots[root] = true
+    -- Normal coins are direct children of __THINGS.Coins, just like the
+    -- targets used by the Expedition and Turkey farms.
+    for _, coin in ipairs(coinsFolder:GetChildren()) do
+        if coin.Parent and not checked[coin] then
+            local root = coin:GetAttribute("ID") ~= nil and coin or GetCoinRootFromInstance(coin)
+            if root and root.Parent and not checked[root] then
+                checked[root] = true
+                local id = root:GetAttribute("ID")
                 local position = GetCoinPosition(root)
-                local character = localPlayer.Character
-                local hrp = character and character:FindFirstChild("HumanoidRootPart")
-                if position and hrp then
+                local health = tonumber(root:GetAttribute("Health"))
+                local coinPart = root:FindFirstChild("Coin", true)
+                local preventClick = coinPart and coinPart:GetAttribute("PreventClick")
+
+                if id ~= nil and position and not preventClick and (health == nil or health > 0) then
                     local distance = (hrp.Position - position).Magnitude
-                    if distance < nearestDistance then
-                        nearest = root
-                        nearestDistance = distance
+                    if distance < closestDistance then
+                        closestDistance = distance
+                        closest = root
                     end
-                elseif position and not nearest then
-                    nearest = root
                 end
             end
         end
     end
 
-    if nearest then
-        return nearest
+    -- Fallback for coins nested under another container.
+    if not closest then
+        for _, instance in ipairs(coinsFolder:GetDescendants()) do
+            local root = GetCoinRootFromInstance(instance)
+            if root and root.Parent and not checked[root] then
+                checked[root] = true
+                local id = root:GetAttribute("ID")
+                local position = GetCoinPosition(root)
+                local health = tonumber(root:GetAttribute("Health"))
+                local coinPart = root:FindFirstChild("Coin", true)
+                local preventClick = coinPart and coinPart:GetAttribute("PreventClick")
+                if id ~= nil and position and not preventClick and (health == nil or health > 0) then
+                    local distance = (hrp.Position - position).Magnitude
+                    if distance < closestDistance then
+                        closestDistance = distance
+                        closest = root
+                    end
+                end
+            end
+        end
     end
 
-    -- If only one raid chest is alive, keep it even if it is the previous
-    -- target. This prevents a gap between renderer updates.
-    if previous and IsChestRaidCoin(previous) then
-        return previous
-    end
-
+    if closest then return closest end
+    if previous and previous.Parent and previous:GetAttribute("ID") ~= nil then return previous end
     return nil
 end
 
-local function GetRaidTargetPosition(coin)
-    return GetCoinPosition(coin)
-end
-
-local function GetRaidTargetDistance(coin)
+local function TeleportToClosestCoin(coin)
     local character = localPlayer.Character
     local hrp = character and character:FindFirstChild("HumanoidRootPart")
-    local position = GetRaidTargetPosition(coin)
-    if not hrp or not position then
-        return math.huge
-    end
-
-    return (hrp.Position - position).Magnitude
-end
-
-local function TeleportToRaidCoin(coin)
-    local character = localPlayer.Character
-    local hrp = character and character:FindFirstChild("HumanoidRootPart")
-    local position = GetRaidTargetPosition(coin)
+    local position = GetCoinPosition(coin)
     if not hrp or not position then
         return false
     end
@@ -452,87 +310,9 @@ local function TeleportToRaidCoin(coin)
     return true
 end
 
-local function ResetChestRaidFarmState()
-    CurrentChestRaidTarget = nil
-    CurrentChestRaidTargetId = nil
-    LastChestRaidPetSendTarget = nil
-    LastChestRaidRoom = nil
-end
-
--- The raid must be entered through its normal door so the game can load
--- the raid instance correctly. Teleport to the supplied door position once
--- when the raid becomes active, then give the game time to load the raid
--- before searching for Chest Raid coins.
-local function TeleportToChestRaidDoor()
-    local character = localPlayer.Character
-    local hrp = character and character:FindFirstChild("HumanoidRootPart")
-    if not hrp then
-        return false
-    end
-
-    hrp.CFrame = CFrame.new(ChestRaidDoorPosition)
-    ChestRaidDoorTeleported = true
-    ChestRaidDoorTeleportAt = os.clock()
-    ResetChestRaidFarmState()
-    return true
-end
-
-local function ChestRaidDoorLoadFinished()
-    return ChestRaidDoorTeleported and (os.clock() - ChestRaidDoorTeleportAt) >= 3
-end
-
--- Toggle the game's Pets Control through the real UI-navigation flow.
--- Open Settings -> UI navigation -> PetsControl.Toggle -> Enter -> close Settings.
-local function ToggleChestRaidPetsControl()
-    local ok = pcall(function()
-        local settings = playerGui:WaitForChild("Settings", 3)
-        local toggle = settings
-            :WaitForChild("Frame", 3)
-            :WaitForChild("Container", 3)
-            :WaitForChild("PetsControl", 3)
-            :WaitForChild("Toggle", 3)
-
-        if settings:IsA("ScreenGui") then
-            settings.Enabled = true
-        elseif settings:IsA("GuiObject") then
-            settings.Visible = true
-        end
-
-        task.wait(0.3)
-        GuiService.GuiNavigationEnabled = true
-        GuiService.SelectedObject = toggle
-
-        task.wait(0.3)
-        VirtualInputManager:SendKeyEvent(true, Enum.KeyCode.Return, false, game)
-        task.wait(0.05)
-        VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.Return, false, game)
-
-        task.wait(0.3)
-
-        -- Close Settings without Escape, so Roblox's ESC menu is not opened.
-        if settings:IsA("ScreenGui") then
-            settings.Enabled = false
-        elseif settings:IsA("GuiObject") then
-            settings.Visible = false
-        end
-
-        GuiService.SelectedObject = nil
-        GuiService.GuiNavigationEnabled = false
-    end)
-
-    if not ok then
-        pcall(function()
-            GuiService.SelectedObject = nil
-            GuiService.GuiNavigationEnabled = false
-        end)
-    end
-
-    return ok
-end
-
-local function HandleChestRaidPetsToggle(raidActive, raidKey)
-    -- Raid timing detection is intentionally unused. The Chest Raid Farm
-    -- toggle controls this feature directly.
+local function ResetCoinTarget()
+    CurrentCoinTarget = nil
+    CurrentCoinTargetId = nil
 end
 
 local function GetNextRobot()
@@ -1226,8 +1006,6 @@ task.spawn(function()
                 targetId = CurrentHackerBossId
             elseif AutoFarmExpedition then
                 targetId = CurrentExpeditionTargetId
-            elseif AutoFarmChestRaid then
-                targetId = CurrentChestRaidTargetId
             elseif AutoFarmRobot or AutoFarmTurkey then
                 targetId = CurrentTargetId
             end
@@ -1509,87 +1287,245 @@ task.spawn(function()
     end
 end)
 
--- Chest Raid farm loop. The toggle is the only gate now.
--- No raid start/end timing is required. As soon as a rendered coin resolves
--- to a directory entry with `chestRaid = true`, it becomes a target.
+-- GENERIC CLOSEST-COIN FARM
+-- Target scanning is deliberately separated from attacking. This keeps the
+-- expensive Workspace scan from running at the same rate as the hit remotes.
+local ClosestCoinScanInterval = 0.10
+local ClosestCoinHitInterval = 0.05
+local CachedEquippedPets = {}
+local CachedPetsRefreshAt = 0
+local LastCoinInteractionTarget = nil
+local LastCoinTeleportTarget = nil
+
+local function RefreshCachedEquippedPets(force)
+    local now = os.clock()
+    if not force and now < CachedPetsRefreshAt then
+        return CachedEquippedPets
+    end
+
+    local pets = {}
+    pcall(function()
+        pets = GetAllEquippedPetUIDs()
+    end)
+
+    CachedEquippedPets = pets or {}
+    CachedPetsRefreshAt = now + 0.50
+    return CachedEquippedPets
+end
+
+-- Find and select the target at a lower rate than the actual attack loop.
 task.spawn(function()
     while true do
-        task.wait(0.15)
+        if AutoTap or AutoTeleportClosestCoin then
+            local previous = CurrentCoinTarget
+            local target = FindClosestCoin(previous)
 
-        if AutoFarmChestRaid then
-            if not ChestRaidDoorTeleported then
-                TeleportToChestRaidDoor()
-            end
+            if target and target.Parent then
+                local targetId = target:GetAttribute("ID")
+                if targetId ~= nil then
+                    targetId = tostring(targetId)
+                    local changed = target ~= CurrentCoinTarget
 
-            if not CurrentChestRaidTarget or not IsChestRaidCoin(CurrentChestRaidTarget) then
-                local previous = CurrentChestRaidTarget
-                CurrentChestRaidTarget = FindNextChestRaidCoin(previous)
-                CurrentChestRaidTargetId = CurrentChestRaidTarget
-                    and tostring(CurrentChestRaidTarget:GetAttribute("ID"))
-                    or nil
-                LastChestRaidPetSendTarget = nil
+                    CurrentCoinTarget = target
+                    CurrentCoinTargetId = targetId
 
-                if CurrentChestRaidTarget then
-                    -- Always teleport to the exact chest being targeted.
-                    -- This naturally moves the player between raid rooms.
-                    TeleportToRaidCoin(CurrentChestRaidTarget)
-                    LastChestRaidRoom = CurrentChestRaidTarget.Parent
-                end
-            end
-
-            if CurrentChestRaidTarget and IsChestRaidCoin(CurrentChestRaidTarget) then
-                local targetId = tostring(CurrentChestRaidTarget:GetAttribute("ID"))
-                CurrentChestRaidTargetId = targetId
-
-                pcall(function()
-                    Library.Signal.Fire("Select Coin", CurrentChestRaidTarget)
-                end)
-
-                if LastChestRaidPetSendTarget ~= CurrentChestRaidTarget then
-                    local pets = GetAllEquippedPetUIDs()
-                    if #pets > 0 then
+                    -- Selection is only sent when the target changes. Sending
+                    -- it every frame is unnecessary and causes extra client work.
+                    if changed or LastCoinInteractionTarget ~= target then
                         pcall(function()
-                            Library.Network.Invoke("Join Coin", targetId, pets)
+                            Library.Signal.Fire("Select Coin", target)
                         end)
-                        for _, petUid in ipairs(pets) do
-                            pcall(function()
-                                Library.Network.Fire("Change Pet Target", petUid, "Coin", targetId)
-                            end)
+                        LastCoinInteractionTarget = target
+
+                        if AutoTap then
+                            local pets = RefreshCachedEquippedPets(true)
+                            if #pets > 0 then
+                                pcall(function()
+                                    Library.Network.Invoke("Join Coin", targetId, pets)
+                                end)
+
+                                for _, petUid in ipairs(pets) do
+                                    pcall(function()
+                                        Library.Network.Fire("Change Pet Target", petUid, "Coin", targetId)
+                                    end)
+                                end
+                            end
                         end
-                        LastChestRaidPetSendTarget = CurrentChestRaidTarget
+                    end
+
+                    -- Teleport only when the target changes instead of
+                    -- repeatedly setting CFrame every frame.
+                    if AutoTeleportClosestCoin and (changed or LastCoinTeleportTarget ~= target) then
+                        TeleportToClosestCoin(target)
+                        LastCoinTeleportTarget = target
+                    elseif not AutoTeleportClosestCoin then
+                        LastCoinTeleportTarget = nil
+                    end
+                else
+                    ResetCoinTarget()
+                    LastCoinInteractionTarget = nil
+                    LastCoinTeleportTarget = nil
+                end
+            else
+                ResetCoinTarget()
+                LastCoinInteractionTarget = nil
+                LastCoinTeleportTarget = nil
+            end
+        else
+            ResetCoinTarget()
+            LastCoinInteractionTarget = nil
+            LastCoinTeleportTarget = nil
+        end
+
+        task.wait(ClosestCoinScanInterval)
+    end
+end)
+
+-- Dedicated hit loop. It uses the same direct damage/Farm Coin calls as the
+-- existing Expedition/Turkey/Comet attack paths, but avoids rebuilding the
+-- pet list on every hit.
+task.spawn(function()
+    while true do
+        if AutoTap and CurrentCoinTargetId then
+            local targetId = CurrentCoinTargetId
+            local pets = RefreshCachedEquippedPets(false)
+
+            if DamageRemote then
+                pcall(function()
+                    DamageRemote:FireServer(targetId)
+                end)
+            end
+
+            for _, petUid in ipairs(pets) do
+                pcall(function()
+                    Library.Network.Fire("Farm Coin", targetId, petUid)
+                end)
+            end
+        end
+
+        task.wait(ClosestCoinHitInterval)
+    end
+end)
+
+-- AUTO TRICK OR TREAT
+-- Visits every current child under workspace.__TrickOrTreat, presses E once
+-- at each location, waits 5 seconds between locations, then waits for the
+-- remainder of the 60-second cycle before starting over. The 60-second timer
+-- starts when the first teleport/E action of a cycle occurs.
+local TrickOrTreatDelay = 5
+local TrickOrTreatCycle = 65
+
+local function GetTrickOrTreatPosition(instance)
+    if not instance or not instance.Parent then
+        return nil
+    end
+
+    if instance:IsA("BasePart") then
+        return instance.Position
+    end
+
+    local ok, pivot = pcall(function()
+        return instance:GetPivot()
+    end)
+    if ok and pivot then
+        return pivot.Position
+    end
+
+    local part = instance:FindFirstChildWhichIsA("BasePart", true)
+    return part and part.Position or nil
+end
+
+local function TeleportAndPressE(position)
+    local character = localPlayer.Character
+    local hrp = character and character:FindFirstChild("HumanoidRootPart")
+    if not hrp or not position then
+        return false
+    end
+
+    hrp.CFrame = CFrame.new(position + Vector3.new(0, 3, 0))
+    task.wait(1)
+
+    pcall(function()
+        VirtualInputManager:SendKeyEvent(true, Enum.KeyCode.E, false, game)
+        task.wait(0.1)
+        VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.E, false, game)
+    end)
+
+    return true
+end
+
+task.spawn(function()
+    while true do
+        if not AutoTrickOrTreat then
+            task.wait(0.25)
+        else
+            local cycleStart = nil
+            local folder = Workspace:FindFirstChild("__TrickOrTreat")
+
+            if folder then
+                local children = folder:GetChildren()
+
+                for index, child in ipairs(children) do
+                    if not AutoTrickOrTreat then
+                        break
+                    end
+
+                    local position = GetTrickOrTreatPosition(child)
+                    if position then
+                        if not cycleStart then
+                            cycleStart = os.clock()
+                        end
+
+                        TeleportAndPressE(position)
+
+                        if index < #children and AutoTrickOrTreat then
+                            local waited = 0
+                            while AutoTrickOrTreat and waited < TrickOrTreatDelay do
+                                local step = math.min(0.25, TrickOrTreatDelay - waited)
+                                task.wait(step)
+                                waited = waited + step
+                            end
+                        end
+                    end
+                end
+
+                if cycleStart and AutoTrickOrTreat then
+                    local remaining = TrickOrTreatCycle - (os.clock() - cycleStart)
+                    while AutoTrickOrTreat and remaining > 0 do
+                        local step = math.min(0.25, remaining)
+                        task.wait(step)
+                        remaining = TrickOrTreatCycle - (os.clock() - cycleStart)
                     end
                 end
             else
-                ResetChestRaidFarmState()
+                task.wait(0.5)
             end
-        else
-            ResetChestRaidFarmState()
-            ChestRaidDoorTeleported = false
-            ChestRaidDoorTeleportAt = 0
         end
     end
 end)
 
--- Dedicated raid damage loop. This keeps raid farming independent from the
--- ordinary robot/turkey/expedition loops.
+-- ANTI-AFK
+-- Sends a real Space key press at the user-selected interval (minutes).
 task.spawn(function()
     while true do
-        task.wait(0.05)
-        if AutoFarmChestRaid and CurrentChestRaidTargetId then
-            pcall(function()
-                if DamageRemote then
-                    DamageRemote:FireServer(CurrentChestRaidTargetId)
-                end
-            end)
+        if AntiAFK then
+            local interval = math.max(0.1, tonumber(AntiAFKIntervalMinutes) or 1) * 60
+            local elapsed = 0
+            while AntiAFK and elapsed < interval do
+                local step = math.min(1, interval - elapsed)
+                task.wait(step)
+                elapsed += step
+            end
 
-            -- Keep the same pet/coin hit path used by the existing fast-attack
-            -- system, but scoped strictly to the current raid target.
-            local pets = GetAllEquippedPetUIDs()
-            for _, petUid in ipairs(pets) do
+            if AntiAFK then
                 pcall(function()
-                    Library.Network.Fire("Farm Coin", CurrentChestRaidTargetId, petUid)
+                    VirtualInputManager:SendKeyEvent(true, Enum.KeyCode.Space, false, game)
+                    task.wait(0.1)
+                    VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.Space, false, game)
                 end)
             end
+        else
+            task.wait(0.25)
         end
     end
 end)
@@ -2305,7 +2241,7 @@ task.spawn(function()
 
     local function createTabButton(text, position)
         local btn = Instance.new("TextButton")
-        btn.Size = UDim2.new(0.158, 0, 1, 0)
+        btn.Size = UDim2.new(0.192, 0, 1, 0)
         btn.Position = UDim2.new(position, 0, 0, 0)
         btn.Text = text
         btn.BackgroundColor3 = Color3.fromRGB(32, 32, 42)
@@ -2328,11 +2264,10 @@ task.spawn(function()
     end
 
     local hatchTab = createTabButton("Hatch", 0)
-    local tpTab = createTabButton("Teleport", 0.168)
-    local settingsTab = createTabButton("Settings", 0.336)
-    local eggTab = createTabButton("Egg Chances", 0.504)
-    local farmTab = createTabButton("Farm", 0.672)
-    local mazeTab = createTabButton("Maze", 0.84)
+    local tpTab = createTabButton("Teleport", 0.202)
+    local settingsTab = createTabButton("Settings", 0.404)
+    local eggTab = createTabButton("Egg Chances", 0.606)
+    local farmTab = createTabButton("Farm", 0.808)
 
     local hatchFrame = Instance.new("ScrollingFrame")
     hatchFrame.Size = UDim2.new(1, -24, 1, -96)
@@ -2372,2192 +2307,6 @@ task.spawn(function()
     farmFrame.BackgroundTransparency = 1
     farmFrame.Visible = false
     farmFrame.Parent = autoHatchMain
-
-    local mazeFrame = Instance.new("Frame")
-    mazeFrame.Name = "MazeFrame"
-    mazeFrame.Size = UDim2.new(1, -24, 1, -96)
-    mazeFrame.Position = UDim2.new(0, 12, 0, 90)
-    mazeFrame.BackgroundTransparency = 1
-    mazeFrame.Visible = false
-    mazeFrame.ClipsDescendants = true
-    mazeFrame.Parent = autoHatchMain
-
-    -- =====================================================================
-    -- HALLOWEEN MAZE MODULE (embedded into the existing hub)
-    -- =====================================================================
-    -- These are the original Maze module dependencies.
-    -- Keep them local to the Maze code so the original movement/ESP logic
-    -- runs in the same environment as the standalone Maze script.
-    local PathfindingService = game:GetService("PathfindingService")
-    local Player = Players.LocalPlayer
-    local PlayerGui = Player:WaitForChild("PlayerGui")
-
--- ============================================================
--- CONFIG
--- ============================================================
-
-local SAFETY_SCAN_DELAY = 2
-
-local LUCK_COLOR = Color3.fromRGB(255, 215, 0)
-local EGG_COLOR = Color3.fromRGB(0, 255, 100)
-local EXIT_COLOR = Color3.fromRGB(255, 80, 80)
-local SCARECROW_COLOR = Color3.fromRGB(180, 100, 255)
-
--- ============================================================
--- SPEED
--- ============================================================
-
-local MOVE_SPEED = 16
-
--- This is now the ONLY speed value that matters.
--- It gets changed by the SET button and then continuously
--- enforced on the current Humanoid.
-local desiredWalkSpeed = MOVE_SPEED
-
--- ------------------------------------------------------------
--- SCARECROW SAFETY
--- ------------------------------------------------------------
-
-local SCARECROW_AVOID_DISTANCE = 14
-local SCARECROW_PATH_PADDING = 2
-local SCARECROW_EMERGENCY_DISTANCE = 10
-
--- ------------------------------------------------------------
--- TARGET DISTANCES
--- ------------------------------------------------------------
-
-local EGG_STOP_DISTANCE = 5
-local EXIT_STOP_DISTANCE = 0
-
--- ------------------------------------------------------------
--- PATHFINDING
--- ------------------------------------------------------------
-
-local AGENT_RADIUS = 3
-local AGENT_HEIGHT = 5
-local AGENT_CAN_JUMP = true
-local AGENT_JUMP_HEIGHT = 8
-local AGENT_MAX_SLOPE = 45
-local WAYPOINT_SPACING = 2
-
--- ------------------------------------------------------------
--- MOVEMENT
--- ------------------------------------------------------------
-
-local WAYPOINT_REACHED_DISTANCE = 2.5
-local STUCK_TIME = 1.75
-local MIN_PROGRESS_DISTANCE = 0.12
-local PATH_REFRESH_TIME = 3
-local WAYPOINT_TIMEOUT = 8
-
--- ============================================================
--- STATE
--- ============================================================
-
-local moving = false
-local movementToken = 0
-
-local currentExit = nil
-local currentScarecrow = nil
-
-local eggEntries = {}
-local activeESP = {}
-
-local luckSign = nil
-local luckConnections = {}
-
--- ============================================================
--- CHARACTER
--- ============================================================
-
-local function getCharacter()
-    return Player.Character
-end
-
-local function getHumanoid()
-    local character = getCharacter()
-
-    if not character then
-        return nil
-    end
-
-    return character:FindFirstChildOfClass("Humanoid")
-end
-
-local function getRoot()
-    local character = getCharacter()
-
-    if not character then
-        return nil
-    end
-
-    return character:FindFirstChild("HumanoidRootPart")
-end
-
--- ============================================================
--- SPEED APPLICATION
--- ============================================================
-
-local function applySpeed()
-    local humanoid = getHumanoid()
-
-    if humanoid then
-        humanoid.WalkSpeed = desiredWalkSpeed
-    end
-end
-
-local function setPlayerSpeed(value)
-    if not value then
-        return false
-    end
-
-    value = tonumber(value)
-
-    if not value or value <= 0 then
-        return false
-    end
-
-    -- Keep the requested speed.
-    desiredWalkSpeed = value
-    MOVE_SPEED = value
-
-    -- Apply immediately.
-    applySpeed()
-
-    return true
-end
-
--- ============================================================
--- MAP
--- ============================================================
-
-local function getHmaze()
-    local ok, result = pcall(function()
-        return workspace.__MAP.Eggs.__HMAZE
-    end)
-
-    if ok then
-        return result
-    end
-
-    return nil
-end
-
-local function getEggFolder()
-    local hmaze = getHmaze()
-
-    if not hmaze then
-        return nil
-    end
-
-    return hmaze:FindFirstChild("Eggs")
-end
-
-local function getHalloweenMaze()
-    local ok, result = pcall(function()
-        return workspace.__THINGS.__INSTANCE_CONTAINER.Active.HalloweenMaze
-    end)
-
-    if ok then
-        return result
-    end
-
-    return nil
-end
-
--- ============================================================
--- INSTANCE POSITION
--- ============================================================
-
-local function getMovePart(instance)
-    if not instance then
-        return nil
-    end
-
-    if instance:IsA("BasePart") then
-        return instance
-    end
-
-    if instance:IsA("Model") then
-        if instance.PrimaryPart then
-            return instance.PrimaryPart
-        end
-
-        local part = instance:FindFirstChildWhichIsA(
-            "BasePart",
-            true
-        )
-
-        if part then
-            return part
-        end
-    end
-
-    return instance:FindFirstChildWhichIsA(
-        "BasePart",
-        true
-    )
-end
-
-local function getInstancePosition(instance)
-    if not instance then
-        return nil
-    end
-
-    if instance:IsA("BasePart") then
-        return instance.Position
-    end
-
-    if instance:IsA("Model") then
-        local ok, pivot = pcall(function()
-            return instance:GetPivot()
-        end)
-
-        if ok and pivot then
-            return pivot.Position
-        end
-    end
-
-    local part = getMovePart(instance)
-
-    if part then
-        return part.Position
-    end
-
-    return nil
-end
-
--- ============================================================
--- WALK TARGET
--- ============================================================
-
-local function getWalkTarget(instance)
-    local position = getInstancePosition(instance)
-
-    if not position then
-        return nil
-    end
-
-    local params = RaycastParams.new()
-
-    params.FilterType = Enum.RaycastFilterType.Exclude
-
-    local character = getCharacter()
-
-    if character then
-        params.FilterDescendantsInstances = {
-            character
-        }
-    end
-
-    local result = workspace:Raycast(
-        position + Vector3.new(0, 10, 0),
-        Vector3.new(0, -30, 0),
-        params
-    )
-
-    if result then
-        return Vector3.new(
-            position.X,
-            result.Position.Y + 2.5,
-            position.Z
-        )
-    end
-
-    return position
-end
-
--- ============================================================
--- DISTANCE
--- ============================================================
-
-local function getHorizontalDistance(a, b)
-    if not a or not b then
-        return math.huge
-    end
-
-    local a2 = Vector3.new(
-        a.X,
-        0,
-        a.Z
-    )
-
-    local b2 = Vector3.new(
-        b.X,
-        0,
-        b.Z
-    )
-
-    return (a2 - b2).Magnitude
-end
-
--- ============================================================
--- LUCK SIGN
--- ============================================================
-
-local function findLuckSign(hmaze)
-    if not hmaze then
-        return nil
-    end
-
-    for _, obj in ipairs(hmaze:GetDescendants()) do
-        if obj.Name == "LuckSign" then
-            return obj
-        end
-    end
-
-    return nil
-end
-
-local function getLuckSignText(sign)
-    if not sign then
-        return "Unknown"
-    end
-
-    for _, obj in ipairs(sign:GetDescendants()) do
-        if obj:IsA("TextLabel")
-            or obj:IsA("TextButton")
-            or obj:IsA("TextBox") then
-
-            if obj.Text and obj.Text ~= "" then
-                return obj.Text
-            end
-        end
-    end
-
-    local attributes = {
-        "Text",
-        "Luck",
-        "LuckText",
-        "Value"
-    }
-
-    for _, attributeName in ipairs(attributes) do
-        local value = sign:GetAttribute(attributeName)
-
-        if value ~= nil then
-            return tostring(value)
-        end
-    end
-
-    return "Unknown"
-end
-
--- ============================================================
--- ESP
--- ============================================================
-
-local function getAdornee(instance)
-    if not instance then
-        return nil
-    end
-
-    if instance:IsA("BasePart") then
-        return instance
-    end
-
-    if instance:IsA("Model") then
-        if instance.PrimaryPart then
-            return instance.PrimaryPart
-        end
-
-        return instance:FindFirstChildWhichIsA(
-            "BasePart",
-            true
-        )
-    end
-
-    return instance:FindFirstChildWhichIsA(
-        "BasePart",
-        true
-    )
-end
-
-local function removeESP(instance)
-    local esp = activeESP[instance]
-
-    if esp then
-        pcall(function()
-            esp:Destroy()
-        end)
-
-        activeESP[instance] = nil
-    end
-end
-
-local function createESP(instance, text, color)
-    if not instance then
-        return
-    end
-
-    local adornee = getAdornee(instance)
-
-    if not adornee then
-        return
-    end
-
-    local existing = activeESP[instance]
-
-    if existing then
-        existing.Adornee = adornee
-
-        local label = existing:FindFirstChild("Label")
-
-        if label then
-            label.Text = text
-            label.TextColor3 = color
-        end
-
-        return
-    end
-
-    local billboard = Instance.new("BillboardGui")
-
-    billboard.Name = "HalloweenMazeESP"
-    billboard.Adornee = adornee
-    billboard.Size = UDim2.new(0, 180, 0, 45)
-    billboard.StudsOffset = Vector3.new(0, 3, 0)
-    billboard.AlwaysOnTop = true
-    billboard.MaxDistance = 10000
-    billboard.Parent = PlayerGui
-
-    local label = Instance.new("TextLabel")
-
-    label.Name = "Label"
-    label.Size = UDim2.fromScale(1, 1)
-    label.BackgroundTransparency = 1
-    label.Text = text
-    label.TextColor3 = color
-    label.TextStrokeTransparency = 0
-    label.TextScaled = true
-    label.Font = Enum.Font.GothamBold
-    label.Parent = billboard
-
-    activeESP[instance] = billboard
-end
-
-
--- ============================================================
--- MAZE TAB UI
--- ============================================================
-
-local Main = Instance.new("Frame")
-Main.Name = "HalloweenMazeMain"
-Main.Size = UDim2.new(0, 500, 0, 600)
-Main.AnchorPoint = Vector2.new(0.5, 0.5)
-Main.Position = UDim2.new(0.5, 0, 0.5, 0)
-Main.BackgroundColor3 = Color3.fromRGB(20, 20, 25)
-Main.BorderSizePixel = 0
-Main.Parent = mazeFrame
-
-local Corner = Instance.new("UICorner")
-Corner.CornerRadius = UDim.new(0, 12)
-Corner.Parent = Main
-
--- ============================================================
--- TITLE
--- ============================================================
-
-local Title = Instance.new("TextLabel")
-Title.Size = UDim2.new(1, -20, 0, 45)
-Title.Position = UDim2.new(0, 10, 0, 5)
-Title.BackgroundTransparency = 1
-Title.Text = "🎃 HALLOWEEN MAZE"
-Title.TextColor3 = Color3.new(1, 1, 1)
-Title.TextSize = 22
-Title.Font = Enum.Font.GothamBold
-Title.Parent = Main
-
--- ============================================================
--- LUCK UI
--- ============================================================
-
-local LuckFrame = Instance.new("Frame")
-LuckFrame.Size = UDim2.new(1, -20, 0, 55)
-LuckFrame.Position = UDim2.new(0, 10, 0, 55)
-LuckFrame.BackgroundColor3 = Color3.fromRGB(35, 35, 40)
-LuckFrame.BorderSizePixel = 0
-LuckFrame.Parent = Main
-
-local LuckCorner = Instance.new("UICorner")
-LuckCorner.CornerRadius = UDim.new(0, 8)
-LuckCorner.Parent = LuckFrame
-
-local LuckLabel = Instance.new("TextLabel")
-LuckLabel.Size = UDim2.new(1, -20, 1, 0)
-LuckLabel.Position = UDim2.new(0, 10, 0, 0)
-LuckLabel.BackgroundTransparency = 1
-LuckLabel.Text = "🍀 Luck: Unknown"
-LuckLabel.TextColor3 = LUCK_COLOR
-LuckLabel.TextSize = 18
-LuckLabel.Font = Enum.Font.GothamBold
-LuckLabel.TextXAlignment = Enum.TextXAlignment.Left
-LuckLabel.Parent = LuckFrame
-
--- ============================================================
--- EXIT UI
--- ============================================================
-
-local ExitFrame = Instance.new("Frame")
-ExitFrame.Size = UDim2.new(1, -20, 0, 50)
-ExitFrame.Position = UDim2.new(0, 10, 0, 120)
-ExitFrame.BackgroundColor3 = Color3.fromRGB(35, 35, 40)
-ExitFrame.BorderSizePixel = 0
-ExitFrame.Parent = Main
-
-local ExitCorner = Instance.new("UICorner")
-ExitCorner.CornerRadius = UDim.new(0, 8)
-ExitCorner.Parent = ExitFrame
-
-local ExitLabel = Instance.new("TextLabel")
-ExitLabel.Size = UDim2.new(1, -100, 1, 0)
-ExitLabel.Position = UDim2.new(0, 10, 0, 0)
-ExitLabel.BackgroundTransparency = 1
-ExitLabel.Text = "🚪 Exit: Not Found"
-ExitLabel.TextColor3 = EXIT_COLOR
-ExitLabel.TextSize = 16
-ExitLabel.Font = Enum.Font.GothamBold
-ExitLabel.TextXAlignment = Enum.TextXAlignment.Left
-ExitLabel.Parent = ExitFrame
-
-local ExitButton = Instance.new("TextButton")
-ExitButton.Size = UDim2.new(0, 80, 0, 35)
-ExitButton.Position = UDim2.new(1, -90, 0.5, -17)
-ExitButton.BackgroundColor3 = Color3.fromRGB(80, 45, 45)
-ExitButton.Text = "MOVE"
-ExitButton.TextColor3 = Color3.new(1, 1, 1)
-ExitButton.TextSize = 14
-ExitButton.Font = Enum.Font.GothamBold
-ExitButton.BorderSizePixel = 0
-ExitButton.Parent = ExitFrame
-
-local ExitButtonCorner = Instance.new("UICorner")
-ExitButtonCorner.CornerRadius = UDim.new(0, 6)
-ExitButtonCorner.Parent = ExitButton
-
--- ============================================================
--- SCARECROW UI
--- ============================================================
-
-local ScareFrame = Instance.new("Frame")
-ScareFrame.Size = UDim2.new(1, -20, 0, 45)
-ScareFrame.Position = UDim2.new(0, 10, 0, 180)
-ScareFrame.BackgroundColor3 = Color3.fromRGB(35, 35, 40)
-ScareFrame.BorderSizePixel = 0
-ScareFrame.Parent = Main
-
-local ScareCorner = Instance.new("UICorner")
-ScareCorner.CornerRadius = UDim.new(0, 8)
-ScareCorner.Parent = ScareFrame
-
-local ScareLabel = Instance.new("TextLabel")
-ScareLabel.Size = UDim2.new(1, -20, 1, 0)
-ScareLabel.Position = UDim2.new(0, 10, 0, 0)
-ScareLabel.BackgroundTransparency = 1
-ScareLabel.Text = "🎃 Scarecrow: Not Found"
-ScareLabel.TextColor3 = SCARECROW_COLOR
-ScareLabel.TextSize = 15
-ScareLabel.Font = Enum.Font.GothamBold
-ScareLabel.TextXAlignment = Enum.TextXAlignment.Left
-ScareLabel.Parent = ScareFrame
-
--- ============================================================
--- SPEED UI
--- ============================================================
-
-local SpeedFrame = Instance.new("Frame")
-SpeedFrame.Size = UDim2.new(1, -20, 0, 50)
-SpeedFrame.Position = UDim2.new(0, 10, 0, 235)
-SpeedFrame.BackgroundColor3 = Color3.fromRGB(35, 35, 40)
-SpeedFrame.BorderSizePixel = 0
-SpeedFrame.Parent = Main
-
-local SpeedCorner = Instance.new("UICorner")
-SpeedCorner.CornerRadius = UDim.new(0, 8)
-SpeedCorner.Parent = SpeedFrame
-
-local SpeedLabel = Instance.new("TextLabel")
-SpeedLabel.Size = UDim2.new(0, 100, 1, 0)
-SpeedLabel.Position = UDim2.new(0, 10, 0, 0)
-SpeedLabel.BackgroundTransparency = 1
-SpeedLabel.Text = "Speed:"
-SpeedLabel.TextColor3 = Color3.new(1, 1, 1)
-SpeedLabel.TextSize = 16
-SpeedLabel.Font = Enum.Font.GothamBold
-SpeedLabel.TextXAlignment = Enum.TextXAlignment.Left
-SpeedLabel.Parent = SpeedFrame
-
-local SpeedBox = Instance.new("TextBox")
-SpeedBox.Size = UDim2.new(0, 100, 0, 32)
-SpeedBox.Position = UDim2.new(0, 110, 0.5, -16)
-SpeedBox.BackgroundColor3 = Color3.fromRGB(25, 25, 30)
-SpeedBox.Text = tostring(MOVE_SPEED)
-SpeedBox.TextColor3 = Color3.new(1, 1, 1)
-SpeedBox.TextSize = 15
-SpeedBox.Font = Enum.Font.Gotham
-SpeedBox.ClearTextOnFocus = false
-SpeedBox.Parent = SpeedFrame
-
-local SpeedBoxCorner = Instance.new("UICorner")
-SpeedBoxCorner.CornerRadius = UDim.new(0, 6)
-SpeedBoxCorner.Parent = SpeedBox
-
-local SpeedButton = Instance.new("TextButton")
-SpeedButton.Size = UDim2.new(0, 80, 0, 32)
-SpeedButton.Position = UDim2.new(0, 220, 0.5, -16)
-SpeedButton.BackgroundColor3 = Color3.fromRGB(60, 80, 60)
-SpeedButton.Text = "SET"
-SpeedButton.TextColor3 = Color3.new(1, 1, 1)
-SpeedButton.TextSize = 14
-SpeedButton.Font = Enum.Font.GothamBold
-SpeedButton.BorderSizePixel = 0
-SpeedButton.Parent = SpeedFrame
-
-local SpeedButtonCorner = Instance.new("UICorner")
-SpeedButtonCorner.CornerRadius = UDim.new(0, 6)
-SpeedButtonCorner.Parent = SpeedButton
-
--- ============================================================
--- SPEED SET
--- ============================================================
-
-local function applySpeedFromBox()
-    local value = tonumber(
-        SpeedBox.Text
-    )
-
-    if value and value > 0 then
-
-        value = math.floor(
-            value * 100
-        ) / 100
-
-        if setPlayerSpeed(value) then
-            SpeedBox.Text = tostring(value)
-        end
-
-    else
-
-        SpeedBox.Text =
-            tostring(desiredWalkSpeed)
-    end
-end
-
-SpeedButton.MouseButton1Click:Connect(
-    applySpeedFromBox
-)
-
--- Also allow pressing ENTER while typing.
-SpeedBox.FocusLost:Connect(
-    function(enterPressed)
-
-        if enterPressed then
-            applySpeedFromBox()
-        end
-    end
-)
-
--- ============================================================
--- EGG LIST
--- ============================================================
-
-local EggTitle = Instance.new("TextLabel")
-EggTitle.Size = UDim2.new(1, -20, 0, 35)
-EggTitle.Position = UDim2.new(0, 10, 0, 295)
-EggTitle.BackgroundTransparency = 1
-EggTitle.Text = "🥚 EGGS"
-EggTitle.TextColor3 = EGG_COLOR
-EggTitle.TextSize = 18
-EggTitle.Font = Enum.Font.GothamBold
-EggTitle.TextXAlignment = Enum.TextXAlignment.Left
-EggTitle.Parent = Main
-
-local EggScroll = Instance.new("ScrollingFrame")
-EggScroll.Size = UDim2.new(1, -20, 0, 225)
-EggScroll.Position = UDim2.new(0, 10, 0, 335)
-EggScroll.BackgroundColor3 = Color3.fromRGB(25, 25, 30)
-EggScroll.BorderSizePixel = 0
-EggScroll.ScrollBarThickness = 6
-EggScroll.CanvasSize = UDim2.new(0, 0, 0, 0)
-EggScroll.Parent = Main
-
-local EggCorner = Instance.new("UICorner")
-EggCorner.CornerRadius = UDim.new(0, 8)
-EggCorner.Parent = EggScroll
-
-local EggLayout = Instance.new("UIListLayout")
-EggLayout.Padding = UDim.new(0, 5)
-EggLayout.SortOrder = Enum.SortOrder.LayoutOrder
-EggLayout.Parent = EggScroll
-
-EggLayout:GetPropertyChangedSignal(
-    "AbsoluteContentSize"
-):Connect(function()
-
-    EggScroll.CanvasSize = UDim2.new(
-        0,
-        0,
-        0,
-        EggLayout.AbsoluteContentSize.Y + 10
-    )
-end)
-
--- ============================================================
--- EGG ID
--- ============================================================
-
-local function getEggID(egg)
-    if not egg then
-        return "Unknown"
-    end
-
-    local id = egg:GetAttribute("ID")
-
-    if id ~= nil then
-        return tostring(id)
-    end
-
-    return "Unknown"
-end
-
--- ============================================================
--- EGG ENTRY UPDATE
--- ============================================================
-
-local function updateEggEntry(egg)
-    local entry = eggEntries[egg]
-
-    if not entry then
-        return
-    end
-
-    local eggID = getEggID(egg)
-
-    entry.label.Text = "🥚 " .. eggID
-
-    createESP(
-        egg,
-        "🥚 " .. eggID,
-        EGG_COLOR
-    )
-end
-
--- ============================================================
--- ADD EGG
--- ============================================================
-
-local function addEgg(egg)
-    if eggEntries[egg] then
-        updateEggEntry(egg)
-        return
-    end
-
-    local row = Instance.new("Frame")
-
-    row.Size = UDim2.new(1, -10, 0, 40)
-    row.BackgroundColor3 = Color3.fromRGB(35, 35, 40)
-    row.BorderSizePixel = 0
-    row.Parent = EggScroll
-
-    local corner = Instance.new("UICorner")
-    corner.CornerRadius = UDim.new(0, 6)
-    corner.Parent = row
-
-    local label = Instance.new("TextLabel")
-
-    label.Size = UDim2.new(1, -100, 1, 0)
-    label.Position = UDim2.new(0, 10, 0, 0)
-    label.BackgroundTransparency = 1
-    label.Text = "🥚 " .. getEggID(egg)
-    label.TextColor3 = EGG_COLOR
-    label.TextSize = 14
-    label.Font = Enum.Font.GothamBold
-    label.TextXAlignment = Enum.TextXAlignment.Left
-    label.Parent = row
-
-    local button = Instance.new("TextButton")
-
-    button.Size = UDim2.new(0, 75, 0, 30)
-    button.Position = UDim2.new(1, -85, 0.5, -15)
-    button.BackgroundColor3 = Color3.fromRGB(50, 80, 60)
-    button.Text = "MOVE"
-    button.TextColor3 = Color3.new(1, 1, 1)
-    button.TextSize = 13
-    button.Font = Enum.Font.GothamBold
-    button.BorderSizePixel = 0
-    button.Parent = row
-
-    local buttonCorner = Instance.new("UICorner")
-    buttonCorner.CornerRadius = UDim.new(0, 5)
-    buttonCorner.Parent = button
-
-    eggEntries[egg] = {
-        row = row,
-        label = label,
-        button = button
-    }
-
-    button.MouseButton1Click:Connect(function()
-        if egg and egg.Parent then
-            moveTo(egg)
-        end
-    end)
-
-    pcall(function()
-        egg:GetAttributeChangedSignal(
-            "ID"
-        ):Connect(function()
-            updateEggEntry(egg)
-        end)
-    end)
-
-    updateEggEntry(egg)
-end
-
--- ============================================================
--- REMOVE EGG
--- ============================================================
-
-local function removeEgg(egg)
-    local entry = eggEntries[egg]
-
-    if entry then
-        if entry.row then
-            entry.row:Destroy()
-        end
-
-        eggEntries[egg] = nil
-    end
-
-    removeESP(egg)
-end
-
--- ============================================================
--- SCAN EGGS
--- ============================================================
-
-local function scanEggs()
-    local folder = getEggFolder()
-
-    if not folder then
-        return
-    end
-
-    local found = {}
-
-    for _, egg in ipairs(folder:GetChildren()) do
-        found[egg] = true
-
-        if not eggEntries[egg] then
-            addEgg(egg)
-        else
-            updateEggEntry(egg)
-        end
-    end
-
-    for egg in pairs(eggEntries) do
-        if not found[egg]
-            or not egg.Parent then
-
-            removeEgg(egg)
-        end
-    end
-end
-
--- ============================================================
--- EGG FOLDER
--- ============================================================
-
-local function connectEggFolder()
-    local folder = getEggFolder()
-
-    if not folder then
-        return
-    end
-
-    folder.ChildAdded:Connect(function()
-        task.wait(0.05)
-        scanEggs()
-    end)
-
-    folder.ChildRemoved:Connect(function(egg)
-        removeEgg(egg)
-    end)
-
-    folder.DescendantAdded:Connect(function()
-        task.wait(0.05)
-        scanEggs()
-    end)
-
-    scanEggs()
-end
-
--- ============================================================
--- LUCK UPDATE
--- ============================================================
-
-local function updateLuckSign()
-    local hmaze = getHmaze()
-
-    if not hmaze then
-        LuckLabel.Text = "🍀 Luck: Unknown"
-        return
-    end
-
-    local sign = findLuckSign(hmaze)
-
-    if not sign then
-        LuckLabel.Text = "🍀 Luck: Unknown"
-        return
-    end
-
-    luckSign = sign
-
-    local text = getLuckSignText(sign)
-
-    LuckLabel.Text = "🍀 Luck: " .. text
-
-    createESP(
-        sign,
-        "🍀 LUCK: " .. text,
-        LUCK_COLOR
-    )
-end
-
--- ============================================================
--- LUCK CONNECTION
--- ============================================================
-
-local function connectLuckSign()
-    for _, connection in ipairs(luckConnections) do
-        pcall(function()
-            connection:Disconnect()
-        end)
-    end
-
-    table.clear(luckConnections)
-
-    local hmaze = getHmaze()
-
-    if not hmaze then
-        return
-    end
-
-    local sign = findLuckSign(hmaze)
-
-    if not sign then
-        return
-    end
-
-    luckSign = sign
-
-    for _, obj in ipairs(sign:GetDescendants()) do
-
-        if obj:IsA("TextLabel")
-            or obj:IsA("TextButton")
-            or obj:IsA("TextBox") then
-
-            table.insert(
-                luckConnections,
-                obj:GetPropertyChangedSignal(
-                    "Text"
-                ):Connect(function()
-
-                    updateLuckSign()
-                end)
-            )
-        end
-    end
-
-    table.insert(
-        luckConnections,
-        sign.AttributeChanged:Connect(
-            function()
-                updateLuckSign()
-            end
-        )
-    )
-
-    updateLuckSign()
-end
-
--- ============================================================
--- EXIT
--- ============================================================
-
-local function findExit()
-    local maze = getHalloweenMaze()
-
-    if not maze then
-        return nil
-    end
-
-    local mazeFloor =
-        maze:FindFirstChild("MazeFloor")
-
-    if mazeFloor then
-
-        local exit =
-            mazeFloor:FindFirstChild(
-                "Exit",
-                true
-            )
-
-        if exit then
-            return exit
-        end
-    end
-
-    return maze:FindFirstChild(
-        "Exit",
-        true
-    )
-end
-
-local function updateExit()
-    local exit = findExit()
-
-    currentExit = exit
-
-    if exit then
-
-        ExitLabel.Text =
-            "🚪 Exit: Found"
-
-        createESP(
-            exit,
-            "🚪 EXIT",
-            EXIT_COLOR
-        )
-    else
-
-        ExitLabel.Text =
-            "🚪 Exit: Not Found"
-    end
-end
-
--- ============================================================
--- SCARECROW
--- ============================================================
-
-local function findScarecrow()
-    local maze = getHalloweenMaze()
-
-    if not maze then
-        return nil
-    end
-
-    return maze:FindFirstChild(
-        "Scarecrow",
-        true
-    )
-end
-
-local function updateScarecrow()
-    local scarecrow =
-        findScarecrow()
-
-    currentScarecrow =
-        scarecrow
-
-    if scarecrow then
-
-        ScareLabel.Text =
-            "🎃 Scarecrow: Detected"
-
-        createESP(
-            scarecrow,
-            "🎃 SCARECROW",
-            SCARECROW_COLOR
-        )
-    else
-
-        ScareLabel.Text =
-            "🎃 Scarecrow: Not Found"
-    end
-end
-
--- ============================================================
--- SCARECROW POSITION
--- ============================================================
-
-local function getScarecrowPosition()
-    if not currentScarecrow
-        or not currentScarecrow.Parent then
-
-        currentScarecrow =
-            findScarecrow()
-    end
-
-    return getInstancePosition(
-        currentScarecrow
-    )
-end
-
-local function getScarecrowDistance(position)
-    local scarePosition =
-        getScarecrowPosition()
-
-    if not scarePosition
-        or not position then
-
-        return math.huge
-    end
-
-    return getHorizontalDistance(
-        position,
-        scarePosition
-    )
-end
-
-local function isNearScarecrow(position)
-    return getScarecrowDistance(
-        position
-    ) <= SCARECROW_AVOID_DISTANCE
-end
-
-local function isEmergencyScarecrow(position)
-    return getScarecrowDistance(
-        position
-    ) <= SCARECROW_EMERGENCY_DISTANCE
-end
-
--- ============================================================
--- POINT TO SEGMENT DISTANCE
--- ============================================================
-
-local function pointToSegmentDistance(
-    point,
-    segmentStart,
-    segmentEnd
-)
-
-    local a = Vector3.new(
-        segmentStart.X,
-        0,
-        segmentStart.Z
-    )
-
-    local b = Vector3.new(
-        segmentEnd.X,
-        0,
-        segmentEnd.Z
-    )
-
-    local p = Vector3.new(
-        point.X,
-        0,
-        point.Z
-    )
-
-    local ab = b - a
-
-    local lengthSquared =
-        ab:Dot(ab)
-
-    if lengthSquared <= 0.001 then
-        return (p - a).Magnitude
-    end
-
-    local t = math.clamp(
-        (p - a):Dot(ab) / lengthSquared,
-        0,
-        1
-    )
-
-    local closest =
-        a + ab * t
-
-    return (p - closest).Magnitude
-end
-
--- ============================================================
--- SAFE SEGMENT CHECK
--- ============================================================
-
-local function segmentIsSafe(
-    startPosition,
-    endPosition
-)
-
-    local scarePosition =
-        getScarecrowPosition()
-
-    if not scarePosition then
-        return true
-    end
-
-    local safeDistance =
-        SCARECROW_AVOID_DISTANCE
-        + SCARECROW_PATH_PADDING
-
-    local distance =
-        pointToSegmentDistance(
-            scarePosition,
-            startPosition,
-            endPosition
-        )
-
-    if distance <= safeDistance then
-        return false
-    end
-
-    local length =
-        getHorizontalDistance(
-            startPosition,
-            endPosition
-        )
-
-    local samples =
-        math.max(
-            2,
-            math.ceil(length / 2)
-        )
-
-    for i = 0, samples do
-
-        local alpha =
-            i / samples
-
-        local position =
-            startPosition:Lerp(
-                endPosition,
-                alpha
-            )
-
-        if getScarecrowDistance(
-            position
-        ) <= safeDistance then
-
-            return false
-        end
-    end
-
-    return true
-end
-
--- ============================================================
--- COMPLETE PATH SAFETY CHECK
--- ============================================================
-
-local function pathIsSafe(
-    startPosition,
-    waypoints
-)
-
-    if not waypoints
-        or #waypoints == 0 then
-
-        return false
-    end
-
-    local previous =
-        startPosition
-
-    for _, waypoint in ipairs(waypoints) do
-
-        if not segmentIsSafe(
-            previous,
-            waypoint.Position
-        ) then
-
-            return false
-        end
-
-        previous =
-            waypoint.Position
-    end
-
-    return true
-end
-
--- ============================================================
--- COMPUTE PATH
--- ============================================================
-
-local function computePath(
-    startPosition,
-    targetPosition
-)
-
-    if not startPosition
-        or not targetPosition then
-
-        return nil, nil
-    end
-
-    local path
-
-    local success =
-        pcall(function()
-
-            path =
-                PathfindingService:CreatePath({
-                    AgentRadius = AGENT_RADIUS,
-                    AgentHeight = AGENT_HEIGHT,
-                    AgentCanJump = AGENT_CAN_JUMP,
-                    AgentJumpHeight = AGENT_JUMP_HEIGHT,
-                    AgentMaxSlope = AGENT_MAX_SLOPE,
-                    WaypointSpacing = WAYPOINT_SPACING
-                })
-
-            path:ComputeAsync(
-                startPosition,
-                targetPosition
-            )
-        end)
-
-    if not success
-        or not path then
-
-        return nil, nil
-    end
-
-    if path.Status
-        ~= Enum.PathStatus.Success then
-
-        return nil, nil
-    end
-
-    local waypoints =
-        path:GetWaypoints()
-
-    if #waypoints == 0 then
-        return nil, nil
-    end
-
-    return path, waypoints
-end
-
--- ============================================================
--- DETOUR POINTS AROUND SCARECROW
--- ============================================================
-
-local function getScarecrowDetours(
-    startPosition
-)
-
-    local scarePosition =
-        getScarecrowPosition()
-
-    if not scarePosition then
-        return {}
-    end
-
-    local direction =
-        startPosition - scarePosition
-
-    direction =
-        Vector3.new(
-            direction.X,
-            0,
-            direction.Z
-        )
-
-    if direction.Magnitude < 0.1 then
-        direction =
-            Vector3.new(1, 0, 0)
-    else
-        direction =
-            direction.Unit
-    end
-
-    local side =
-        Vector3.new(
-            -direction.Z,
-            0,
-            direction.X
-        )
-
-    local distance =
-        SCARECROW_AVOID_DISTANCE + 7
-
-    return {
-        scarePosition + side * distance,
-        scarePosition - side * distance,
-
-        scarePosition
-            + side * distance
-            + direction * 8,
-
-        scarePosition
-            - side * distance
-            + direction * 8,
-
-        scarePosition
-            + side * distance
-            - direction * 8,
-
-        scarePosition
-            - side * distance
-            - direction * 8,
-
-        scarePosition
-            + side * (distance + 8),
-
-        scarePosition
-            - side * (distance + 8)
-    }
-end
-
--- ============================================================
--- SAFE PATH FINDER
--- ============================================================
-
-local function getSafePath(
-    startPosition,
-    targetPosition
-)
-
-    if isEmergencyScarecrow(
-        startPosition
-    ) then
-
-        return nil, nil, "emergency"
-    end
-
-    local path, waypoints =
-        computePath(
-            startPosition,
-            targetPosition
-        )
-
-    if path
-        and waypoints
-        and pathIsSafe(
-            startPosition,
-            waypoints
-        ) then
-
-        return path,
-            waypoints,
-            "normal"
-    end
-
-    local detours =
-        getScarecrowDetours(
-            startPosition
-        )
-
-    for _, detour in ipairs(detours) do
-
-        if segmentIsSafe(
-            startPosition,
-            detour
-        ) then
-
-            local firstPath,
-            firstWaypoints =
-                computePath(
-                    startPosition,
-                    detour
-                )
-
-            if firstPath
-                and firstWaypoints
-                and pathIsSafe(
-                    startPosition,
-                    firstWaypoints
-                ) then
-
-                local secondPath,
-                secondWaypoints =
-                    computePath(
-                        detour,
-                        targetPosition
-                    )
-
-                if secondPath
-                    and secondWaypoints
-                    and pathIsSafe(
-                        detour,
-                        secondWaypoints
-                    ) then
-
-                    return secondPath,
-                        secondWaypoints,
-                        "detour"
-                end
-            end
-        end
-    end
-
-    return nil, nil, "no_safe_path"
-end
-
--- ============================================================
--- STOP
--- ============================================================
-
-local function stopHumanoid()
-    local humanoid =
-        getHumanoid()
-
-    local root =
-        getRoot()
-
-    if humanoid
-        and root then
-
-        humanoid:MoveTo(
-            root.Position
-        )
-    end
-end
-
--- ============================================================
--- WAIT FOR SAFE SCARECROW ROUTE
--- ============================================================
-
-local function waitForSafePath(
-    targetInstance,
-    token
-)
-
-    while movementToken == token do
-
-        if not targetInstance
-            or not targetInstance.Parent then
-
-            return nil, nil
-        end
-
-        local root =
-            getRoot()
-
-        if not root then
-            task.wait(0.1)
-            continue
-        end
-
-        if isEmergencyScarecrow(
-            root.Position
-        ) then
-
-            stopHumanoid()
-
-            task.wait(0.15)
-
-            continue
-        end
-
-        local target =
-            getWalkTarget(
-                targetInstance
-            )
-
-        if not target then
-            task.wait(0.1)
-            continue
-        end
-
-        local path,
-        waypoints,
-        status =
-            getSafePath(
-                root.Position,
-                target
-            )
-
-        if path
-            and waypoints then
-
-            return path, waypoints
-        end
-
-        stopHumanoid()
-
-        task.wait(0.15)
-    end
-
-    return nil, nil
-end
-
--- ============================================================
--- FOLLOW SAFE PATH
--- ============================================================
-
-local function followPath(
-    targetInstance,
-    token,
-    stopDistance
-)
-
-    local humanoid =
-        getHumanoid()
-
-    local root =
-        getRoot()
-
-    if not humanoid
-        or not root then
-
-        return false, "character"
-    end
-
-    local path,
-    waypoints =
-        waitForSafePath(
-            targetInstance,
-            token
-        )
-
-    if not path
-        or not waypoints then
-
-        return false, "no_path"
-    end
-
-    local pathBlocked = false
-
-    local blockedConnection =
-        path.Blocked:Connect(
-            function(blockedIndex)
-
-                if blockedIndex >= 1 then
-                    pathBlocked = true
-                end
-            end
-        )
-
-    local pathStart =
-        os.clock()
-
-    for index, waypoint in ipairs(waypoints) do
-
-        if movementToken ~= token then
-
-            blockedConnection:Disconnect()
-
-            return false, "cancelled"
-        end
-
-        if not targetInstance
-            or not targetInstance.Parent then
-
-            blockedConnection:Disconnect()
-
-            return false, "target"
-        end
-
-        humanoid.WalkSpeed =
-            desiredWalkSpeed
-
-        local latestTarget =
-            getWalkTarget(
-                targetInstance
-            )
-
-        if latestTarget then
-
-            local distance =
-                getHorizontalDistance(
-                    root.Position,
-                    latestTarget
-                )
-
-            if distance <= stopDistance then
-
-                stopHumanoid()
-
-                blockedConnection:Disconnect()
-
-                return true, "reached"
-            end
-        end
-
-        if not segmentIsSafe(
-            root.Position,
-            waypoint.Position
-        ) then
-
-            stopHumanoid()
-
-            blockedConnection:Disconnect()
-
-            return false, "unsafe"
-        end
-
-        if isEmergencyScarecrow(
-            root.Position
-        ) then
-
-            stopHumanoid()
-
-            blockedConnection:Disconnect()
-
-            return false, "emergency"
-        end
-
-        if waypoint.Action
-            == Enum.PathWaypointAction.Jump then
-
-            humanoid.Jump = true
-        end
-
-        local waypointStart =
-            os.clock()
-
-        local lastPosition =
-            root.Position
-
-        local lastProgress =
-            os.clock()
-
-        while movementToken == token do
-
-            if not targetInstance
-                or not targetInstance.Parent then
-
-                blockedConnection:Disconnect()
-
-                return false, "target"
-            end
-
-            humanoid.WalkSpeed =
-                desiredWalkSpeed
-
-            latestTarget =
-                getWalkTarget(
-                    targetInstance
-                )
-
-            if latestTarget then
-
-                local targetDistance =
-                    getHorizontalDistance(
-                        root.Position,
-                        latestTarget
-                    )
-
-                if targetDistance <= stopDistance then
-
-                    stopHumanoid()
-
-                    blockedConnection:Disconnect()
-
-                    return true, "reached"
-                end
-            end
-
-            if isEmergencyScarecrow(
-                root.Position
-            ) then
-
-                stopHumanoid()
-
-                blockedConnection:Disconnect()
-
-                return false, "emergency"
-            end
-
-            if not segmentIsSafe(
-                root.Position,
-                waypoint.Position
-            ) then
-
-                stopHumanoid()
-
-                blockedConnection:Disconnect()
-
-                return false, "unsafe"
-            end
-
-            if pathBlocked then
-
-                stopHumanoid()
-
-                blockedConnection:Disconnect()
-
-                return false, "blocked"
-            end
-
-            local waypointDistance =
-                getHorizontalDistance(
-                    root.Position,
-                    waypoint.Position
-                )
-
-            if waypointDistance
-                <= WAYPOINT_REACHED_DISTANCE then
-
-                break
-            end
-
-            local progress =
-                getHorizontalDistance(
-                    root.Position,
-                    lastPosition
-                )
-
-            if progress >=
-                MIN_PROGRESS_DISTANCE then
-
-                lastPosition =
-                    root.Position
-
-                lastProgress =
-                    os.clock()
-            end
-
-            if os.clock() - lastProgress
-                >= STUCK_TIME then
-
-                stopHumanoid()
-
-                blockedConnection:Disconnect()
-
-                return false, "stuck"
-            end
-
-            if os.clock() - pathStart
-                >= PATH_REFRESH_TIME then
-
-                stopHumanoid()
-
-                blockedConnection:Disconnect()
-
-                return false, "refresh"
-            end
-
-            if os.clock() - waypointStart
-                >= WAYPOINT_TIMEOUT then
-
-                stopHumanoid()
-
-                blockedConnection:Disconnect()
-
-                return false, "timeout"
-            end
-
-            humanoid:MoveTo(
-                waypoint.Position
-            )
-
-            RunService.Heartbeat:Wait()
-        end
-    end
-
-    blockedConnection:Disconnect()
-
-    -- ========================================================
-    -- FINAL APPROACH
-    -- ========================================================
-
-    local finalStart =
-        os.clock()
-
-    local lastPosition =
-        root.Position
-
-    local lastProgress =
-        os.clock()
-
-    while movementToken == token do
-
-        if not targetInstance
-            or not targetInstance.Parent then
-
-            return false, "target"
-        end
-
-        humanoid.WalkSpeed =
-            desiredWalkSpeed
-
-        local latestTarget =
-            getWalkTarget(
-                targetInstance
-            )
-
-        if not latestTarget then
-            return false, "target"
-        end
-
-        local distance =
-            getHorizontalDistance(
-                root.Position,
-                latestTarget
-            )
-
-        if distance <= stopDistance then
-
-            stopHumanoid()
-
-            return true, "reached"
-        end
-
-        if isEmergencyScarecrow(
-            root.Position
-        ) then
-
-            stopHumanoid()
-
-            return false, "emergency"
-        end
-
-        if not segmentIsSafe(
-            root.Position,
-            latestTarget
-        ) then
-
-            stopHumanoid()
-
-            return false, "unsafe"
-        end
-
-        local progress =
-            getHorizontalDistance(
-                root.Position,
-                lastPosition
-            )
-
-        if progress >=
-            MIN_PROGRESS_DISTANCE then
-
-            lastPosition =
-                root.Position
-
-            lastProgress =
-                os.clock()
-        end
-
-        if os.clock() - lastProgress
-            >= STUCK_TIME then
-
-            stopHumanoid()
-
-            return false, "stuck"
-        end
-
-        if os.clock() - finalStart >= 5 then
-
-            stopHumanoid()
-
-            return false, "final_timeout"
-        end
-
-        humanoid:MoveTo(
-            latestTarget
-        )
-
-        RunService.Heartbeat:Wait()
-    end
-
-    return false, "cancelled"
-end
-
--- ============================================================
--- MOVE TO
--- ============================================================
-
-function moveTo(instance)
-
-    if not instance
-        or not instance.Parent then
-
-        return
-    end
-
-    if moving then
-        return
-    end
-
-    local initialTarget =
-        getWalkTarget(instance)
-
-    if not initialTarget then
-        return
-    end
-
-    local isEgg =
-        eggEntries[instance] ~= nil
-
-    local stopDistance
-
-    if isEgg then
-        stopDistance =
-            EGG_STOP_DISTANCE
-    else
-        stopDistance =
-            EXIT_STOP_DISTANCE
-    end
-
-    moving = true
-
-    movementToken += 1
-
-    local token =
-        movementToken
-
-    task.spawn(function()
-
-        while movementToken == token
-            and instance
-            and instance.Parent do
-
-            local humanoid =
-                getHumanoid()
-
-            local root =
-                getRoot()
-
-            if not humanoid
-                or not root then
-
-                task.wait(0.2)
-
-                continue
-            end
-
-            -- Always use the selected speed.
-            humanoid.WalkSpeed =
-                desiredWalkSpeed
-
-            local target =
-                getWalkTarget(instance)
-
-            if not target then
-                break
-            end
-
-            local distance =
-                getHorizontalDistance(
-                    root.Position,
-                    target
-                )
-
-            if distance <= stopDistance then
-
-                stopHumanoid()
-
-                break
-            end
-
-            if isEmergencyScarecrow(
-                root.Position
-            ) then
-
-                stopHumanoid()
-
-                task.wait(0.15)
-
-                continue
-            end
-
-            local success, reason =
-                followPath(
-                    instance,
-                    token,
-                    stopDistance
-                )
-
-            if success then
-                break
-            end
-
-            if movementToken ~= token then
-                break
-            end
-
-            if reason == "unsafe"
-                or reason == "emergency"
-                or reason == "scarecrow"
-                or reason == "no_path" then
-
-                stopHumanoid()
-
-                task.wait(0.12)
-
-            elseif reason == "blocked"
-                or reason == "stuck"
-                or reason == "timeout"
-                or reason == "refresh" then
-
-                stopHumanoid()
-
-                task.wait(0.06)
-
-            else
-
-                task.wait(0.1)
-            end
-        end
-
-        if movementToken == token then
-            stopHumanoid()
-        end
-
-        moving = false
-
-        -- Keep the user's selected speed.
-        applySpeed()
-    end)
-end
-
--- ============================================================
--- EXIT BUTTON
--- ============================================================
-
-ExitButton.MouseButton1Click:Connect(function()
-
-    if currentExit
-        and currentExit.Parent then
-
-        moveTo(currentExit)
-
-    else
-
-        updateExit()
-
-        if currentExit then
-            moveTo(currentExit)
-        end
-    end
-end)
-
--- ============================================================
--- PERIODIC SCANS
--- ============================================================
-
-task.spawn(function()
-
-    while true do
-
-        updateLuckSign()
-        updateExit()
-        updateScarecrow()
-        scanEggs()
-        connectLuckSign()
-
-        task.wait(
-            SAFETY_SCAN_DELAY
-        )
-    end
-end)
-
--- ============================================================
--- INITIALIZE
--- ============================================================
-
-task.spawn(function()
-
-    task.wait(1)
-
-    connectEggFolder()
-
-    updateLuckSign()
-    updateExit()
-    updateScarecrow()
-    scanEggs()
-    connectLuckSign()
-
-    -- Apply selected speed after initialization.
-    applySpeed()
-end)
-
-
-
-
 
     -- =====================================================================
     -- FULL EXTENDED THEMES SYSTEM
@@ -4725,7 +2474,7 @@ end)
         autoHatchShadow.Color = activeTheme.accent
         autoTitle.TextColor3 = Color3.fromRGB(60, 140, 220)
 
-        for _, btn in ipairs({hatchTab, tpTab, settingsTab, eggTab, farmTab, mazeTab}) do
+        for _, btn in ipairs({hatchTab, tpTab, settingsTab, eggTab, farmTab}) do
             if btn == currentTabBtn then
                 btn.BackgroundColor3 = activeTheme.accent
                 btn.TextColor3 = Color3.fromRGB(255, 255, 255)
@@ -4753,9 +2502,8 @@ end)
         settingsFrame.Visible = false
         eggFrame.Visible = false
         farmFrame.Visible = false
-        mazeFrame.Visible = false
         
-        for _, btn in ipairs({hatchTab, tpTab, settingsTab, eggTab, farmTab, mazeTab}) do
+        for _, btn in ipairs({hatchTab, tpTab, settingsTab, eggTab, farmTab}) do
             btn.BackgroundColor3 = activeTheme.surface
             btn.TextColor3 = Color3.fromRGB(180, 180, 190)
         end
@@ -4772,7 +2520,6 @@ end)
     settingsTab.MouseButton1Click:Connect(function() switchTab(settingsTab, settingsFrame) end)
     eggTab.MouseButton1Click:Connect(function() switchTab(eggTab, eggFrame) end)
     farmTab.MouseButton1Click:Connect(function() switchTab(farmTab, farmFrame) end)
-    mazeTab.MouseButton1Click:Connect(function() switchTab(mazeTab, mazeFrame) end)
 
     switchTab(hatchTab, hatchFrame)
 
@@ -4888,25 +2635,69 @@ end)
         end
     end)
 
-    createUnifiedToggle(farmFrame, 410, "🏴 Chest Raid Farm", false, function(state)
-        AutoFarmChestRaid = state
-        if state then
-            ChestRaidWasActive = true
-            ChestRaidDoorTeleported = false
-            ChestRaidDoorTeleportAt = 0
-            task.spawn(ToggleChestRaidPetsControl)
-        else
-            ResetChestRaidFarmState()
-            ChestRaidWasActive = false
-            ChestRaidDoorTeleported = false
-            ChestRaidDoorTeleportAt = 0
-            task.spawn(ToggleChestRaidPetsControl)
+    createUnifiedToggle(farmFrame, 410, "🎃 Auto Trick or Treating", false, function(state)
+        AutoTrickOrTreat = state
+    end)
+
+    createUnifiedToggle(farmFrame, 452, "👆 Auto Tap", false, function(state)
+        AutoTap = state
+        if not state then
+            ResetCoinTarget()
         end
+    end)
+
+    createUnifiedToggle(farmFrame, 452, "📍 Auto Teleport to Closest Coin", false, function(state)
+        AutoTeleportClosestCoin = state
+        if not state and not AutoTap then
+            ResetCoinTarget()
+        end
+    end)
+
+    createUnifiedToggle(farmFrame, 494, "🛡️ Anti AFK", false, function(state)
+        AntiAFK = state
+    end)
+
+    local antiAfkLabel = Instance.new("TextLabel")
+    antiAfkLabel.Size = UDim2.new(0.58, 0, 0, 28)
+    antiAfkLabel.Position = UDim2.new(0, 0, 0, 578)
+    antiAfkLabel.BackgroundTransparency = 1
+    antiAfkLabel.Text = "Anti AFK interval (minutes)"
+    antiAfkLabel.TextColor3 = Color3.fromRGB(190, 190, 200)
+    antiAfkLabel.Font = Enum.Font.GothamBold
+    antiAfkLabel.TextSize = 12
+    antiAfkLabel.TextXAlignment = Enum.TextXAlignment.Left
+    antiAfkLabel.Parent = farmFrame
+
+    local antiAfkBox = Instance.new("TextBox")
+    antiAfkBox.Size = UDim2.new(0.32, 0, 0, 28)
+    antiAfkBox.Position = UDim2.new(0.68, 0, 0, 578)
+    antiAfkBox.BackgroundColor3 = Color3.fromRGB(35, 35, 48)
+    antiAfkBox.BorderSizePixel = 0
+    antiAfkBox.ClearTextOnFocus = false
+    antiAfkBox.Text = tostring(AntiAFKIntervalMinutes)
+    antiAfkBox.PlaceholderText = "Minutes"
+    antiAfkBox.TextColor3 = Color3.fromRGB(255, 255, 255)
+    antiAfkBox.Font = Enum.Font.GothamBold
+    antiAfkBox.TextSize = 12
+    antiAfkBox.Parent = farmFrame
+
+    local antiAfkCorner = Instance.new("UICorner")
+    antiAfkCorner.CornerRadius = UDim.new(0, 6)
+    antiAfkCorner.Parent = antiAfkBox
+
+    antiAfkBox.FocusLost:Connect(function()
+        local value = tonumber(antiAfkBox.Text)
+        if not value then
+            value = 1
+        end
+        value = math.clamp(value, 0.1, 1440)
+        AntiAFKIntervalMinutes = value
+        antiAfkBox.Text = tostring(value)
     end)
 
     local farmStatus = Instance.new("TextLabel")
     farmStatus.Size = UDim2.new(1, 0, 0, 28)
-    farmStatus.Position = UDim2.new(0, 0, 0, 452)
+    farmStatus.Position = UDim2.new(0, 0, 0, 616)
     farmStatus.BackgroundTransparency = 1
     farmStatus.Text = "Status: Idle"
     farmStatus.TextColor3 = Color3.fromRGB(180, 180, 180)
@@ -4942,14 +2733,18 @@ end)
             elseif AutoFarmComet and CurrentCometId then
                 farmStatus.Text = "Status: ☄️ Farming Comet #" .. CurrentCometId
                 farmStatus.TextColor3 = Color3.fromRGB(180, 220, 255)
-            elseif AutoFarmChestRaid then
-                if IsChestRaidActive() then
-                    farmStatus.Text = "Status: 🏴 Chest Raid active - searching room"
-                    farmStatus.TextColor3 = Color3.fromRGB(210, 170, 255)
+            elseif (AutoTap or AutoTeleportClosestCoin) and CurrentCoinTargetId then
+                if AutoTap and AutoTeleportClosestCoin then
+                    farmStatus.Text = "Status: 👆📍 Tapping + teleporting to coin #" .. CurrentCoinTargetId
+                elseif AutoTap then
+                    farmStatus.Text = "Status: 👆 Auto tapping coin #" .. CurrentCoinTargetId
                 else
-                    farmStatus.Text = "Status: 🕒 Waiting for Chest Raid"
-                    farmStatus.TextColor3 = Color3.fromRGB(255, 200, 80)
+                    farmStatus.Text = "Status: 📍 Teleporting to closest coin #" .. CurrentCoinTargetId
                 end
+                farmStatus.TextColor3 = Color3.fromRGB(120, 220, 255)
+            elseif AntiAFK then
+                farmStatus.Text = "Status: 🛡️ Anti AFK every " .. tostring(AntiAFKIntervalMinutes) .. " minute(s)"
+                farmStatus.TextColor3 = Color3.fromRGB(120, 255, 180)
             elseif AutoFarmTurkey or AutoFarmRobot then
                 farmStatus.Text = "Status: ⏳ Searching Target..."
                 farmStatus.TextColor3 = Color3.fromRGB(255, 200, 80)
@@ -5786,16 +3581,10 @@ end)
 
             if enabled then
                 PotatoMode = true
-                RunService:Set3dRenderingEnabled(false)
-                settings().Rendering.QualityLevel = Enum.QualityLevel.Level01
-                Lighting.GlobalShadows = false
                 afkOverlay.Visible = true
                 autoHatchMain.Visible = false
             else
                 PotatoMode = false
-                RunService:Set3dRenderingEnabled(true)
-                settings().Rendering.QualityLevel = Enum.QualityLevel.Automatic
-                Lighting.GlobalShadows = true
                 afkOverlay.Visible = false
                 autoHatchMain.Visible = true
             end
@@ -6647,7 +4436,7 @@ end)
     -- Tech World
     createTeleportSection(tpScroll, "Tech World")
     createTeleportButton(tpScroll, "Tech Spawn", {-9977, 16, 9601})
-    createTeleportButton(tpScroll, "Tech Last Area", {-7997, 16, 9609})
+    createTeleportButton(tpScroll, "Tech Last Area", {-5328, 18, 9626})
 
     -- =====================================================================
     -- SETTINGS TAB UI & EXTENDED THEME SWITCHER
