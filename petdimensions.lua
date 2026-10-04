@@ -4610,7 +4610,7 @@ task.spawn(function()
             break
         end
     end
--- ======================================================================
+		-- ======================================================================
 -- 🎃 HALLOWEEN MAZE TAB (v3 + fast pathing) -- paste this block into the hub script,
 -- on its own lines, directly ABOVE the very last `end)` of the file.
 -- It runs inside its own task.spawn closure, so it adds no locals to the hub's scope.
@@ -4968,7 +4968,7 @@ local function racePath(g, me, goal, dm, sP, sS, margin)
 			end
 		end
 	end
-	if steps[goal] == nil then return nil end
+	if steps[goal] == nil then return nil, steps, prev end
 	return pathTo(prev, me, goal), steps[goal]
 end
 -- does a route from cell c to goal exist that avoids the scarecrow's shortest path to c?
@@ -5039,7 +5039,7 @@ local function plan(st, g, me, goal, ps)
 	local dme = dm[me] or 99
 	local sP, sS = speeds(st, hunting, dme)
 	-- 1) can we get to the goal (by any route) staying ahead of the scarecrow? re-checked every tick
-	local route = racePath(g, me, goal, dm, sP, sS, (hunting and 2.0 or 1.2) / sP)
+	local route, rsteps, rprev = racePath(g, me, goal, dm, sP, sS, (hunting and 2.0 or 1.2) / sP)
 	if route then
 		ps.waitSince = nil; ps.fleeTo = nil
 		return route, dme <= 10 and "racing" or "normal", dme
@@ -5053,10 +5053,25 @@ local function plan(st, g, me, goal, ps)
 	if dme / sS <= (hunting and 3.0 or 2.0) then
 		local r = flee(); if r then return r, "FLEEING", dme end
 	end
-	-- 3) scarecrow still away from us but blocking the way: hold position, leave the moment it approaches
+	-- 2b) NEW: scarecrow near the route but not on top of us -> don't stand still, walk to the safe cell
+	-- (one we still reach before it) that is closest to the goal. Re-planned every tick, so it keeps
+	-- advancing as the scarecrow moves off the route.
+	if type(rsteps) == "table" then
+		local gd = bfsCached(g, goal)
+		local bestC, bestD, bestS = nil, gd[me] or 1e9, nil
+		for c, s in pairs(rsteps) do
+			local d = gd[c]
+			if d and c ~= me and (d < bestD or (d == bestD and bestC and s < bestS)) then bestC, bestD, bestS = c, d, s end
+		end
+		if bestC then
+			local r = pathTo(rprev, me, bestC)
+			if r then ps.waitSince = nil; ps.fleeTo = nil; return r, "advancing", dme end
+		end
+	end
+	-- 3) already at the closest safe cell: hold position, leave the moment it approaches
 	ps.fleeTo = nil
 	ps.waitSince = ps.waitSince or os.clock()
-	if os.clock() - ps.waitSince < 25 then return nil, "waiting for path", dme end
+	if os.clock() - ps.waitSince < 8 then return nil, "waiting for path", dme end
 	local _, p2 = dijkstra(g, me, dm, false, hunting and HUNT_R or AVOID_R)
 	return pathTo(p2, me, goal), "risky", dme
 end
