@@ -4957,13 +4957,35 @@ local function dangerCtx(st, g)
 	local ct = st.cs / math.max(O.speed, 1) * TURN_PENALTY
 	local clearA = 0
 	if m.a ~= m.b and m.f < 0.8 then clearA = (0.8 - m.f) * math.max(m.seg, mt) end
-	return {m = m, dist = bfsCached(g, b), a = m.a, b = b, tb = m.tb, mt = mt, ct = ct, clearA = clearA,
-		pad = 0.5 * ct + scareMargin(st, m, me) * mt + SAFETY_BUF, hunting = m.hunting, face = scareMargin(st, m, me) > MARGIN_BASE}
+	local margin = scareMargin(st, m, me)
+	local cfgM = getCfg().Monster or {}
+	local mins = math.max(0, (Workspace:GetServerTimeNow() - (tonumber(st.runStartedAt) or Workspace:GetServerTimeNow())) / 60)
+	local los = not m.hunting -- wandering: only being SEEN (straight wall-free line, within sense range) matters; hunting: it knows where we are
+	return {m = m, st = st, g = g, dist = bfsCached(g, b), a = m.a, b = b, tb = m.tb, mt = mt, ct = ct, clearA = clearA, vd = {}, los = los,
+		margin = margin, S = (tonumber(cfgM.SenseStart) or 2) + (tonumber(cfgM.SensePerMinute) or 0.6) * math.min(mins, 20) + 2,
+		pad = los and (0.5 * ct + SAFETY_BUF) or (0.5 * ct + margin * mt + SAFETY_BUF), hunting = m.hunting, face = margin > MARGIN_BASE}
 end
-local function eta(ctx, c)
+local LOS_NEAR = 3 -- cells: unseen but this close, it can still walk into us
+local function eta(ctx, c) -- earliest time (s from now) cell c becomes unsafe
 	local d = ctx.dist[c]
-	if d == nil then return 1e9 end
-	return ctx.tb + d * ctx.mt
+	if not ctx.los then
+		if d == nil then return 1e9 end
+		return ctx.tb + d * ctx.mt
+	end
+	local e = ctx.vd[c]
+	if e == nil then
+		e = 1e9
+		if d ~= nil and d <= LOS_NEAR then e = ctx.tb + (d - ctx.margin) * ctx.mt end
+		for x, k in pairs((sightCells(ctx.st, ctx.g, c))) do
+			local dx = ctx.dist[x]
+			if dx and k <= ctx.S then
+				local tv = ctx.tb + dx * ctx.mt
+				if tv < e then e = tv end
+			end
+		end
+		ctx.vd[c] = e
+	end
+	return e
 end
 local function slack(ctx, c, t)
 	if c == ctx.a and ctx.a ~= ctx.b and t < ctx.clearA + ctx.pad * 0.6 then return -1 end
@@ -5096,15 +5118,6 @@ local function decide(st, g, me, goal, ps, opts)
 	local stay, enter = opts.stay or STAY_SLACK, opts.enter or 0
 	local s0 = slack(ctx, me, 0)
 	local steps, prev = safeSearch(g, me, ctx, 60)
-	-- hallway logic: if the scarecrow is in a hallway our route needs, HOLD (retreat off the route) until it has left it for good
-	local _, pp = bfsPrev(g, me)
-	local plain = pathTo(pp, me, goal)
-	local nowT = os.clock()
-	if plain and #plain > 1 and routeBlocked(g, plain, ctx, me) then ps.hold, ps.clearAt = true, nil
-	elseif ps.hold then
-		ps.clearAt = ps.clearAt or nowT
-		if nowT - ps.clearAt > 0.6 then ps.hold, ps.clearAt = false, nil end
-	end
 	-- dead-end goal (corner egg): only commit if, once hunted, we can get in AND back out to the mouth in time
 	local mouth, depth = branchInfo(g, goal)
 	local trapOk = true
@@ -5112,10 +5125,18 @@ local function decide(st, g, me, goal, ps, opts)
 		local inT = goal == me and 0 or ((bfsCached(g, me)[mouth] or 0) + depth) * ctx.ct
 		trapOk = eta(ctx, mouth) - inT - depth * ctx.ct - ctx.pad >= (goal == me and 1 or 3)
 	end
-	if steps[goal] ~= nil and trapOk and not ps.hold then
+	if steps[goal] ~= nil and trapOk then
 		local ok
-		if goal == me then ok = s0 >= stay else ok = slack(ctx, goal, steps[goal] * ctx.ct) >= enter end
+		if goal == me then ok = s0 >= stay
+		else
+			ok = slack(ctx, goal, steps[goal] * ctx.ct) >= enter
+			if ok and not ps.moving then -- hysteresis: starting to walk needs a bit more margin than continuing
+				local p = pathTo(prev, me, goal)
+				for i = 2, #(p or {}) do if slack(ctx, p[i], (i - 1) * ctx.ct) < 1 then ok = false; break end end
+			end
+		end
 		if ok then
+			ps.moving = true
 			ps.refuge, ps.advance, ps.slip, ps.blocked, ps.fleeing, ps.hold = nil, nil, false, nil, false, false
 			return pathTo(prev, me, goal), (s0 < 4 and "racing" or "normal"), s0, ctx
 		end
@@ -5123,7 +5144,7 @@ local function decide(st, g, me, goal, ps, opts)
 	local gd = bfsCached(g, goal)
 	-- too close to stand still (or trapped in a dead end while hunted): run to the best refuge / dodge cell
 	if s0 < math.max(stay, 1.2) or not trapOk or (ps.fleeing and s0 < 2.5) then
-		ps.fleeing = true
+		ps.fleeing, ps.moving = true, false
 		-- commit to the current refuge while it is still safely reachable (stops left/right flip-flopping)
 		local r = ps.refuge
 		if not (r and r ~= me and steps[r] ~= nil and slack(ctx, r, steps[r] * ctx.ct) >= 0.5) then
@@ -5140,7 +5161,7 @@ local function decide(st, g, me, goal, ps, opts)
 		if bestN then return {me, bestN}, "desperate", s0, ctx end
 		return {me}, "trapped", s0, ctx
 	end
-	ps.fleeing = false
+	ps.fleeing, ps.moving = false, false
 	local now = os.clock()
 	ps.blocked = ps.blocked or now
 	if ctx.hunting then
@@ -5161,19 +5182,20 @@ local function decide(st, g, me, goal, ps, opts)
 		end
 		if l then return pathTo(prev, me, l), "LURING", s0, ctx end
 	end
-	if ps.hold and not ctx.hunting and now - ps.blocked < BLOCK_HIDE then
+	if not ctx.hunting and now - ps.blocked < BLOCK_HIDE then
 		-- blocked: back off far, out of the scarecrow's line of sight, so it wanders away from the goal
 		local vis, dang = sightCells(st, g, ctx.b), dangling(g)
-		local zone, z2, onRoute = zoneOf(g, ctx.b), zoneOf(g, ctx.a), {}
-		for _, c in ipairs(plain or {}) do onRoute[c] = true end
-		local function off(c) return not (zone[c] or z2[c] or onRoute[c]) end
+		local plainP = select(2, bfsPrev(g, me))
+		local onRoute = {}
+		for _, c in ipairs(pathTo(plainP, me, goal) or {}) do onRoute[c] = true end
+		local function off(c) return c == me or not onRoute[c] end
 		local r = ps.retreat
 		if not (r and steps[r] ~= nil and off(r) and slack(ctx, r, steps[r] * ctx.ct) >= 1) then
 			r = nil
 			local bs
 			for c, n in pairs(steps) do
 				if off(c) and slack(ctx, c, n * ctx.ct) >= 1 then
-					local sc = math.min(ctx.dist[c] or 20, 10) + dodgeShape(g, c) - n * 0.3
+					local sc = math.min(slack(ctx, c, n * ctx.ct), 8) + dodgeShape(g, c) - n * 0.5 + (c == me and 2 or 0)
 					if vis[c] ~= nil then sc -= 4 end
 					if dang[c] then sc -= 8 end
 					if not bs or sc > bs then r, bs = c, sc end
