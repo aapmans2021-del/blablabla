@@ -4629,9 +4629,9 @@ local PlayerGui = Player:WaitForChild("PlayerGui")
 
 local COL = {
 	luck = Color3.fromRGB(255, 215, 0), egg = Color3.fromRGB(0, 255, 100),
-	exit = Color3.fromRGB(255, 120, 60), scare = Color3.fromRGB(190, 110, 255),
-	path = Color3.fromRGB(0, 140, 255), candy = Color3.fromRGB(255, 220, 90),
-	bg = Color3.fromRGB(20, 20, 25), card = Color3.fromRGB(35, 35, 40), white = Color3.new(1, 1, 1),
+        exit = Color3.fromRGB(255, 135, 85), scare = Color3.fromRGB(245, 105, 95),
+        path = Color3.fromRGB(75, 180, 220), candy = Color3.fromRGB(255, 220, 110),
+        bg = Color3.fromRGB(18, 27, 26), card = Color3.fromRGB(31, 44, 40), white = Color3.new(1, 1, 1),
 }
 local AVOID_R, HUNT_R = 5, 7
 local EGG_STOP, EXIT_STOP, CANDY_STOP = 6, 3, 3.5
@@ -4642,6 +4642,8 @@ local avoidOn, candyFirst, candyEsp, autoOn = true, true, true, false
 local hatchOn, escapeOn, scoutOn = true, true, true
 local minLuck, hatchSeconds = 10, 60 -- hatchSeconds 0 = until the lucky eggs run out
 local eggSel, eggNames = {}, {}
+local eggSettings = {}
+local savedEggSettings = {}
 local rejected = setmetatable({}, {__mode = "k"})
 local hatchOwned = false
 local conns, esp, pools, ddLists = {}, {}, {}, {}
@@ -4695,16 +4697,35 @@ do
 		if type(s.eggSel) == "table" then
 			for n in pairs(eggSel) do if s.eggSel[n] ~= nil then eggSel[n] = s.eggSel[n] == true end end
 		end
+        if type(s.eggSettings) == "table" then savedEggSettings = s.eggSettings end
 	end
+end
+for _, name in ipairs(eggNames) do
+    local saved = savedEggSettings[name]
+    local enabled = eggSel[name] ~= false
+    if type(saved) == "table" and saved.enabled ~= nil then enabled = saved.enabled == true end
+    eggSettings[name] = {
+        enabled = enabled,
+        minLuck = type(saved) == "table" and (tonumber(saved.minLuck) or minLuck) or minLuck,
+        hatchSeconds = type(saved) == "table" and (tonumber(saved.hatchSeconds) or hatchSeconds) or hatchSeconds,
+    }
 end
 local function saveSettings()
 	pcall(function()
 		if writefile then
 			writefile(SFILE, HttpService:JSONEncode({speed = desiredSpeed, avoid = avoidOn, candyFirst = candyFirst,
 				candyEsp = candyEsp, zoom = zoomOn, hatchOn = hatchOn, escapeOn = escapeOn, scoutOn = scoutOn,
-				minLuck = minLuck, hatchSeconds = hatchSeconds, eggSel = eggSel}))
+                minLuck = minLuck, hatchSeconds = hatchSeconds, eggSel = eggSel, eggSettings = eggSettings}))
 		end
 	end)
+end
+local function settingsForEgg(name)
+    local settings = eggSettings[name]
+    if not settings then
+        settings = {enabled = true, minLuck = minLuck, hatchSeconds = hatchSeconds}
+        eggSettings[name] = settings
+    end
+    return settings
 end
 
 local function getMaze()
@@ -4889,7 +4910,7 @@ local function dijkstra(g, src, dm, hard, R)
 				local cost = 1
 				if dm then
 					local d = dm[nb] or 99
-					if hard and d <= 1 then cost = nil
+                    if hard and d == 0 then cost = nil
 					elseif d < R then cost = 1 + (R - d) ^ 2 * 0.6 end
 				end
 				if cost then
@@ -5036,17 +5057,30 @@ local function plan(st, g, me, goal, ps)
 		local _, prev = dijkstra(g, me, nil, false, 0)
 		return pathTo(prev, me, goal), "normal", nil
 	end
+    local routeGoal = goal
+    if (dm[goal] or 99) == 0 then
+        local approachDist = dijkstra(g, me, dm, true, AVOID_R)
+        local best, bestScore
+        for _, cell in ipairs(nbrs(g, goal)) do
+            local d = dm[cell] or 99
+            if d > 0 and approachDist[cell] then
+                local score = approachDist[cell] - math.min(d, 12) * 0.05
+                if not bestScore or score < bestScore then best, bestScore = cell, score end
+            end
+        end
+        if best then routeGoal = best end
+    end
 	local dme = dm[me] or 99
 	local sP, sS = speeds(st, hunting, dme)
 	-- 1) can we get to the goal (by any route) staying ahead of the scarecrow? re-checked every tick
-	local route, rsteps, rprev = racePath(g, me, goal, dm, sP, sS, (hunting and 2.0 or 1.2) / sP)
+    local route, rsteps, rprev = racePath(g, me, routeGoal, dm, sP, sS, (hunting and 2.0 or 1.2) / sP)
 	if route then
 		ps.waitSince = nil; ps.fleeTo = nil
 		return route, dme <= 10 and "racing" or "normal", dme
 	end
 	-- 2) can't win the race: scarecrow close -> retreat to a safe cell that lures it off the goal path
 	local function flee()
-		local r, t = safeFlee(g, me, dm, sP, sS, goal, ps.fleeTo)
+        local r, t = safeFlee(g, me, dm, sP, sS, routeGoal, ps.fleeTo)
 		if r then ps.fleeTo = t end
 		return r
 	end
@@ -5057,7 +5091,7 @@ local function plan(st, g, me, goal, ps)
 	-- (one we still reach before it) that is closest to the goal. Re-planned every tick, so it keeps
 	-- advancing as the scarecrow moves off the route.
 	if type(rsteps) == "table" then
-		local gd = bfsCached(g, goal)
+        local gd = bfsCached(g, routeGoal)
 		local bestC, bestD, bestS = nil, gd[me] or 1e9, nil
 		for c, s in pairs(rsteps) do
 			local d = gd[c]
@@ -5074,10 +5108,10 @@ local function plan(st, g, me, goal, ps)
 	ps.fleeTo = nil
 	local R = hunting and HUNT_R or AVOID_R
 	local _, p2 = dijkstra(g, me, dm, true, R) -- cells right next to the scarecrow blocked
-	local r2 = pathTo(p2, me, goal)
+    local r2 = pathTo(p2, me, routeGoal)
 	if not r2 then
 		_, p2 = dijkstra(g, me, dm, false, R)
-		r2 = pathTo(p2, me, goal)
+        r2 = pathTo(p2, me, routeGoal)
 	end
 	if r2 then return r2, "cautious", dme end
 	return nil, "no route", dme
@@ -5159,7 +5193,11 @@ end
 
 -- ───────── movement ─────────
 local function aimPoint(st, route, root, tp)
-	if #route == 1 then return Vector3.new(tp.X, root.Position.Y, tp.Z) end
+    if #route == 1 then
+        local targetCell = posCell(st, tp)
+        local p = targetCell == route[1] and tp or cellPos(st, route[1])
+        return Vector3.new(p.X, root.Position.Y, p.Z)
+    end
 	local p2 = cellPos(st, route[2])
 	if #route >= 3 then
 		local a, b, c = route[1], route[2], route[3]
@@ -5175,7 +5213,8 @@ end
 local function walk(token, getTarget, stop, label)
 	local s0 = getState()
 	local floor0 = s0 and s0.floor
-	local ps, lastPos, lastT = {}, nil, os.clock()
+    local ps, lastPos, lastT = {}, nil, os.clock()
+    local route, plannedAt, plannedMe, plannedGoal, plannedTarget, activeAim
 	while running and token == moveToken do
 		local st, root, hum = getState(), getRoot(), getHum()
 		if not (st and root and hum) then task.wait(0.15); continue end
@@ -5186,14 +5225,27 @@ local function walk(token, getTarget, stop, label)
 		local g = grid(st)
 		local me, goal = posCell(st, root.Position), posCell(st, tp)
 		if not (me and goal) then task.wait(0.15); continue end
-		local route, mode, dme = plan(st, g, me, goal, ps)
+        local now = os.clock()
+        local needsPlan = not plannedAt or now - plannedAt >= 0.25 or me ~= plannedMe or goal ~= plannedGoal
+            or not plannedTarget or hdist(tp, plannedTarget) >= 0.75
+        local mode, dme
+        if needsPlan then
+            route, mode, dme = plan(st, g, me, goal, ps)
+            plannedAt, plannedMe, plannedGoal, plannedTarget = now, me, goal, tp
+        end
 		if not route then
-			hum:MoveTo(root.Position); setStatus("⏳ " .. tostring(mode)); task.wait(0.05); continue
+            if activeAim then hum:MoveTo(root.Position); activeAim = nil end
+            setStatus("⏳ " .. tostring(mode or "no route")); task.wait(0.12); continue
 		end
-		drawRoute(st, route, tp, root.Position.Y)
-		setStatus(("→ %s  [%s%s]"):format(label, mode, dme and (" · scarecrow " .. dme) or ""))
-		hum.WalkSpeed = desiredSpeed
-		hum:MoveTo(aimPoint(st, route, root, tp))
+        if needsPlan then
+            drawRoute(st, route, tp, root.Position.Y)
+            setStatus(("→ %s  [%s%s]"):format(label, mode, dme and (" · scarecrow " .. dme) or ""))
+        end
+        if hum.WalkSpeed ~= desiredSpeed then hum.WalkSpeed = desiredSpeed end
+        local aim = aimPoint(st, route, root, tp)
+        if not activeAim or (aim - activeAim).Magnitude >= 0.75 then
+            hum:MoveTo(aim); activeAim = aim
+        end
 		if os.clock() - lastT > 1.2 then
 			if lastPos and (root.Position - lastPos).Magnitude < 1 then hum.Jump = true end
 			lastPos, lastT = root.Position, os.clock()
@@ -5301,6 +5353,7 @@ end
 local function hatchAt(token, egg, force)
 	local name = egg:GetAttribute("ID")
 	if not name then return "gone" end
+    local eggConfig = settingsForEgg(name)
 	local st0 = getState(); local floor0 = st0 and st0.floor
 	local tHatch, reasserts, last = 0, 0, os.clock()
 	local result = "cancelled"
@@ -5321,8 +5374,8 @@ local function hatchAt(token, egg, force)
 		local now = os.clock(); local dt = now - last; last = now
 		local mult, left = eggLuck(st, egg)
 		if not force then
-			if mult > 0 and mult < minLuck then rejected[egg] = ("x%d below x%d"):format(mult, minLuck); result = "rejected"; break end
-			if mult == 0 and minLuck > 1 and tHatch > 20 then rejected[egg] = "luck unknown"; result = "rejected"; break end
+            if mult > 0 and mult < eggConfig.minLuck then rejected[egg] = ("x%d below x%d"):format(mult, eggConfig.minLuck); result = "rejected"; break end
+            if mult == 0 and eggConfig.minLuck > 1 and tHatch > 20 then rejected[egg] = "luck unknown"; result = "rejected"; break end
 		end
 		if left and left <= 0 then rejected[egg] = "empty"; result = "done"; break end
 		local g = grid(st)
@@ -5350,9 +5403,9 @@ local function hatchAt(token, egg, force)
 			setAutoHatch(true, name)
 		end
 		tHatch += dt
-		setStatus(("🥚 hatching %s%s  [%ds%s]"):format(name, luckText(mult, left), tHatch,
-			hatchSeconds > 0 and ("/" .. hatchSeconds) or ""))
-		if hatchSeconds > 0 and tHatch >= hatchSeconds then rejected[egg] = "done"; result = "done"; break end
+        setStatus(("🥚 hatching %s%s  [%ds%s]"):format(name, luckText(mult, left), tHatch,
+            eggConfig.hatchSeconds > 0 and ("/" .. eggConfig.hatchSeconds) or ""))
+        if eggConfig.hatchSeconds > 0 and tHatch >= eggConfig.hatchSeconds then rejected[egg] = "done"; result = "done"; break end
 		task.wait(0.2)
 	end
 	setAutoHatch(false)
@@ -5366,9 +5419,10 @@ local function pickEgg(st, g, me)
 	local best, bs
 	for _, egg in ipairs(getEggs()) do
 		local name = egg:GetAttribute("ID")
-		if name and eggSel[name] and not rejected[egg] then
+        local eggConfig = name and settingsForEgg(name)
+        if name and eggConfig.enabled and not rejected[egg] then
 			local mult, left = eggLuck(st, egg)
-			if not ((mult > 0 and mult < minLuck) or (left and left <= 0)) then
+            if not ((mult > 0 and mult < eggConfig.minLuck) or (left and left <= 0)) then
 				local p = posOf(egg); local cell = p and posCell(st, p)
 				local d = cell and dist[cell]
 				if d then
@@ -5397,7 +5451,7 @@ local function scoutEggs(token)
 		local bEgg, bCell, bScore
 		for _, egg in ipairs(getEggs()) do
 			local name = egg:GetAttribute("ID")
-			if name and eggSel[name] and not rejected[egg] and eggLuck(st, egg) == 0 then
+            if name and settingsForEgg(name).enabled and not rejected[egg] and eggLuck(st, egg) == 0 then
 				local p = posOf(egg); local ec = p and posCell(st, p)
 				local tried = scoutTried[egg]
 				if not tried then tried = {n = 0}; scoutTried[egg] = tried end
@@ -5553,9 +5607,29 @@ local function button(parent, text, size, color, cb)
 	corner(b, 6); bind(b.MouseButton1Click, cb); return b
 end
 
-local Content = new("Frame", {Name = "Content", Position = UDim2.fromOffset(0, 0), Size = UDim2.fromOffset(340, H),
+local pageNav = new("Frame", {Name = "MazePages", Size = UDim2.fromOffset(340, 30), BackgroundTransparency = 1}, Root)
+local overviewTab = button(pageNav, "OVERVIEW", UDim2.new(0.5, -2, 1, 0), Color3.fromRGB(48, 105, 83), function() end)
+local eggSettingsTab = button(pageNav, "EGG SETTINGS", UDim2.new(0.5, -2, 1, 0), Color3.fromRGB(38, 49, 46), function() end)
+eggSettingsTab.Position = UDim2.new(0.5, 2, 0, 0)
+
+local Content = new("Frame", {Name = "Content", Position = UDim2.fromOffset(0, 34), Size = UDim2.new(0, 340, 1, -34),
 	BackgroundTransparency = 1}, Root)
 new("UIListLayout", {Padding = UDim.new(0, 5), SortOrder = Enum.SortOrder.LayoutOrder}, Content)
+local eggSettingsPage = new("Frame", {Name = "EggSettingsPage", Position = UDim2.fromOffset(0, 34), Size = UDim2.new(0, 340, 1, -34),
+    BackgroundTransparency = 1, Visible = false}, Root)
+local eggConfigScroll = new("ScrollingFrame", {Name = "EggConfigList", Size = UDim2.fromScale(1, 1),
+    BackgroundTransparency = 1, BorderSizePixel = 0, ScrollBarThickness = 4, CanvasSize = UDim2.new(),
+    AutomaticCanvasSize = Enum.AutomaticSize.Y}, eggSettingsPage)
+new("UIListLayout", {Padding = UDim.new(0, 6), SortOrder = Enum.SortOrder.LayoutOrder}, eggConfigScroll)
+new("UIPadding", {PaddingRight = UDim.new(0, 6), PaddingBottom = UDim.new(0, 4)}, eggConfigScroll)
+local function showEggSettings(show)
+    Content.Visible = not show
+    eggSettingsPage.Visible = show
+    overviewTab.BackgroundColor3 = show and Color3.fromRGB(38, 49, 46) or Color3.fromRGB(48, 105, 83)
+    eggSettingsTab.BackgroundColor3 = show and Color3.fromRGB(48, 105, 83) or Color3.fromRGB(38, 49, 46)
+end
+bind(overviewTab.MouseButton1Click, function() showEggSettings(false) end)
+bind(eggSettingsTab.MouseButton1Click, function() showEggSettings(true) end)
 local order = 0
 local function row(h, horizontal)
 	order += 1
@@ -5565,7 +5639,9 @@ local function row(h, horizontal)
 	return f
 end
 local function card(h)
-	local f = row(h); f.BackgroundTransparency = 0; f.BackgroundColor3 = COL.card; corner(f, 8); return f
+    local f = row(h); f.BackgroundTransparency = 0; f.BackgroundColor3 = COL.card; corner(f, 8)
+    new("UIStroke", {Color = Color3.fromRGB(100, 145, 125), Thickness = 1, Transparency = 0.78}, f)
+    return f
 end
 
 local openList
@@ -5734,20 +5810,7 @@ toggle(tg2, "HATCH", hatchOn, function(v) hatchOn = v; saveSettings() end, third
 toggle(tg2, "ESCAPE", escapeOn, function(v) escapeOn = v; saveSettings() end, third)
 toggle(tg2, "SCOUT", scoutOn, function(v) scoutOn = v; saveSettings() end, third)
 
--- egg / luck / time dropdowns
-local dr = row(28, true)
-dropdown(dr, UDim2.new(0.4, -3, 1, 0),
-	function()
-		local n = 0
-		for _, nm in ipairs(eggNames) do if eggSel[nm] then n += 1 end end
-		return ("🥚 Eggs %d/%d ▼"):format(n, #eggNames)
-	end,
-	function()
-		local items = {}
-		for _, nm in ipairs(eggNames) do items[#items + 1] = {key = nm, text = nm, checked = eggSel[nm] == true} end
-		return items
-	end,
-	function(k) eggSel[k] = not eggSel[k]; saveSettings() end, true)
+-- Per-egg configuration options
 local luckOptions = {}
 do
 	local seen = {}
@@ -5758,28 +5821,60 @@ do
 	if #luckOptions == 0 then luckOptions = {1, 2, 5, 10, 100, 1000} end
 	table.sort(luckOptions)
 end
-dropdown(dr, UDim2.new(0.28, -3, 1, 0),
-	function() return ("Min x%d+ ▼"):format(minLuck) end,
-	function()
-		local items = {}
-		for _, m in ipairs(luckOptions) do items[#items + 1] = {key = m, text = "x" .. m .. " or better", checked = minLuck == m} end
-		return items
-	end,
-	function(k) minLuck = k; saveSettings() end, false)
 local timeOptions = {{15, "15 seconds"}, {30, "30 seconds"}, {60, "1 minute"}, {120, "2 minutes"}, {300, "5 minutes"},
 	{600, "10 minutes"}, {0, "Until lucky eggs run out"}}
-local function timeLabel()
-	for _, o in ipairs(timeOptions) do if o[1] == hatchSeconds then return o[1] == 0 and "∞" or o[2]:gsub(" seconds", "s"):gsub(" minutes?", "m") end end
-	return tostring(hatchSeconds)
+local function timeLabel(seconds)
+    for _, option in ipairs(timeOptions) do
+        if option[1] == seconds then
+            return seconds == 0 and "∞" or option[2]:gsub(" seconds", "s"):gsub(" minutes?", "m")
+        end
+    end
+    return tostring(seconds) .. "s"
 end
-dropdown(dr, UDim2.new(0.32, -3, 1, 0),
-	function() return "⏱ " .. timeLabel() .. " ▼" end,
-	function()
-		local items = {}
-		for _, o in ipairs(timeOptions) do items[#items + 1] = {key = o[1], text = o[2], checked = hatchSeconds == o[1]} end
-		return items
-	end,
-	function(k) hatchSeconds = k; saveSettings() end, false)
+label(eggConfigScroll, "EGG TARGETS  /  individual automation rules", UDim2.new(1, -4, 0, 26), COL.luck, 12)
+local function addEggConfig(name, index)
+    local config = settingsForEgg(name)
+    local frame = new("Frame", {Name = "EggConfig_" .. tostring(index), Size = UDim2.new(1, -8, 0, 60),
+        BackgroundColor3 = COL.card, BorderSizePixel = 0, LayoutOrder = index}, eggConfigScroll)
+    corner(frame, 6)
+    new("UIStroke", {Color = Color3.fromRGB(100, 145, 125), Thickness = 1, Transparency = 0.82}, frame)
+    local nameLabel = label(frame, name, UDim2.new(1, -10, 0, 21), COL.white, 11)
+    nameLabel.Position = UDim2.fromOffset(6, 1)
+    local enabledButton
+    local function paintEnabled()
+        enabledButton.Text = config.enabled and "ON" or "OFF"
+        enabledButton.BackgroundColor3 = config.enabled and Color3.fromRGB(45, 110, 78) or Color3.fromRGB(82, 55, 49)
+    end
+    enabledButton = button(frame, "", UDim2.fromOffset(50, 26), COL.card, function()
+        config.enabled = not config.enabled
+        paintEnabled(); saveSettings()
+    end)
+    enabledButton.Position = UDim2.fromOffset(6, 28)
+    paintEnabled()
+    local luckButton = dropdown(frame, UDim2.fromOffset(100, 26),
+        function() return ("LUCK x%d+ ▼"):format(config.minLuck) end,
+        function()
+            local items = {}
+            for _, value in ipairs(luckOptions) do
+                items[#items + 1] = {key = value, text = "x" .. value .. " or better", checked = config.minLuck == value}
+            end
+            return items
+        end,
+        function(value) config.minLuck = value; saveSettings() end, false)
+    luckButton.Position = UDim2.fromOffset(62, 28)
+    local durationButton = dropdown(frame, UDim2.fromOffset(162, 26),
+        function() return "TIME " .. timeLabel(config.hatchSeconds) .. " ▼" end,
+        function()
+            local items = {}
+            for _, option in ipairs(timeOptions) do
+                items[#items + 1] = {key = option[1], text = option[2], checked = config.hatchSeconds == option[1]}
+            end
+            return items
+        end,
+        function(value) config.hatchSeconds = value; saveSettings() end, false)
+    durationButton.Position = UDim2.fromOffset(166, 28)
+end
+for index, name in ipairs(eggNames) do addEggConfig(name, index) end
 
 -- actions
 local ac = row(32, true)
@@ -6003,7 +6098,8 @@ env.HMV2 = {Destroy = destroy, GetState = getState,
 			if d and (not bd or d < bd) then best, bd = e, d end
 		end
 		if not best then return "no egg" end
-		hatchSeconds = sec or hatchSeconds
+        local eggConfig = settingsForEgg(best:GetAttribute("ID"))
+        eggConfig.hatchSeconds = sec or eggConfig.hatchSeconds
 		startJob(function(t)
 			local r = walk(t, function() if best.Parent then return posOf(best) end end, EGG_STOP, "Egg")
 			if r == "arrived" then hatchAt(t, best, true) end
