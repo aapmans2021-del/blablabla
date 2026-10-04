@@ -5108,66 +5108,193 @@ local function routeBlocked(g, route, ctx, me)
 end
 
 -- returns route (starting at `me`), mode, spare seconds on our own cell, ctx
-local function bfsAvoid(g, me, bad)
-	local prev, depth, q, h = {}, {[me] = 0}, {me}, 1
-	while q[h] do
-		local c = q[h]; h += 1
-		for _, nb in ipairs(nbrs(g, c)) do
-			if depth[nb] == nil and not bad(nb) then depth[nb] = depth[c] + 1; prev[nb] = c; q[#q + 1] = nb end
+-- Safer planner: it still uses the existing time-aware Scarecrow model, but scores
+-- every reachable cell instead of blindly taking the first shortest BFS route.
+local function dangerCost(ctx, c, stepTime)
+	if not ctx then return 0 end
+	local d = ctx.dist[c]
+	if d == nil then return 0 end
+
+	local spare = slack(ctx, c, stepTime)
+	if spare < 0 then
+		return 1e6
+	end
+
+	-- The less time we have before the Scarecrow can reach the cell, the more
+	-- expensive it becomes. This makes the planner prefer a slightly longer,
+	-- safer hallway over a short hallway that is about to become dangerous.
+	local urgency = math.max(0, 4 - spare)
+	local proximity = 1 / math.max(0.5, d + 0.5)
+	local cost = urgency * urgency * 7 + proximity * 2
+
+	if ctx.hunting then
+		cost += proximity * 4
+	end
+
+	return cost
+end
+
+local function weightedPath(g, me, goal, ctx)
+	if me == goal then return {me} end
+
+	local dist, prev, closed = {[me] = 0}, {}, {}
+	local heap = {}
+
+	local function push(node, priority)
+		heap[#heap + 1] = {node = node, priority = priority}
+		local i = #heap
+		while i > 1 do
+			local parent = math.floor(i / 2)
+			if heap[parent].priority <= heap[i].priority then break end
+			heap[parent], heap[i] = heap[i], heap[parent]
+			i = parent
 		end
 	end
-	return prev, depth
+
+	local function pop()
+		if #heap == 0 then return nil end
+		local result = heap[1]
+		local last = table.remove(heap)
+		if #heap > 0 then
+			heap[1] = last
+			local i = 1
+			while true do
+				local l, r = i * 2, i * 2 + 1
+				local best = i
+				if l <= #heap and heap[l].priority < heap[best].priority then best = l end
+				if r <= #heap and heap[r].priority < heap[best].priority then best = r end
+				if best == i then break end
+				heap[i], heap[best] = heap[best], heap[i]
+				i = best
+			end
+		end
+		return result.node
+	end
+
+	local gx, gz = Common.CellXZ(g.n, goal)
+	local function heuristic(c)
+		local x, z = Common.CellXZ(g.n, c)
+		return math.abs(x - gx) + math.abs(z - gz)
+	end
+
+	push(me, 0)
+
+	while #heap > 0 do
+		local c = pop()
+		if closed[c] then continue end
+		closed[c] = true
+
+		if c == goal then
+			return pathTo(prev, me, goal)
+		end
+
+		local base = dist[c] or math.huge
+		for _, nb in ipairs(nbrs(g, c)) do
+			if not closed[nb] then
+				local nextTime = base + 1
+				local dc = dangerCost(ctx, nb, nextTime * (ctx and ctx.ct or 1))
+
+				-- Never enter a cell that is already predicted unsafe unless it is
+				-- the destination and we have no safer alternative.
+				if dc < 1e6 or nb == goal then
+					local extra = 1 + dc
+
+					-- Prefer junctions over dead-end branches while the Scarecrow
+					-- is hunting. This greatly reduces getting trapped in a pocket.
+					if ctx and ctx.hunting then
+						if dangling(g)[nb] then
+							extra += 5
+						elseif #nbrs(g, nb) >= 3 then
+							extra -= 0.35
+						end
+					end
+
+					local nd = base + extra
+					if nd < (dist[nb] or math.huge) then
+						dist[nb] = nd
+						prev[nb] = c
+						push(nb, nd + heuristic(nb) * 0.8)
+					end
+				end
+			end
+		end
+	end
 end
--- simple + fast: walk the shortest route that avoids a small bubble around the scarecrow; break away if inside it
+
 local function decide(st, g, me, goal, ps, opts)
 	local ctx = dangerCtx(st, g)
+
 	if not ctx then
 		ps.blocked = nil
 		local _, p = bfsPrev(g, me)
 		return pathTo(p, me, goal), "clear", nil, nil
 	end
+
 	local now = os.clock()
-	local R = ctx.hunting and 3 or (ctx.face and 2.2 or 2)  -- bubble radius in cells (path distance)
-	if ps.blocked and now - ps.blocked > 5 then R = math.min(R, 1.2) end -- never wait long
 	local d = ctx.dist
-	local function bad(c) return (d[c] or 99) <= R end
-	if bad(me) then
+
+	-- If we are already inside the danger area, do not try to continue toward
+	-- the objective. Get to a cell farther from the Scarecrow first.
+	local currentSlack = slack(ctx, me, 0)
+	if currentSlack < 0 then
 		local ep = escapePath(g, me, ctx)
-		if ep and #ep > 1 then return ep, "ESCAPING", nil, ctx end
+		if ep and #ep > 1 then
+			return ep, "ESCAPING", nil, ctx
+		end
 	end
+
 	local mouth, depth = branchInfo(g, goal)
-	local trapBad = mouth and ctx.hunting and goal ~= me and (d[mouth] or 99) <= depth + 4
-	local prev, dep = bfsAvoid(g, me, bad)
-	if not trapBad and dep[goal] ~= nil then
-		ps.blocked = nil
-		return pathTo(prev, me, goal), "go", nil, ctx
+	local trapBad = mouth and ctx.hunting and goal ~= me
+		and (d[mouth] or 99) <= depth + 4
+
+	-- First attempt: danger-weighted route. This is intentionally allowed to
+	-- be longer than BFS if it buys meaningful Scarecrow safety.
+	if not trapBad then
+		local route = weightedPath(g, me, goal, ctx)
+		if route and #route > 1 then
+			ps.blocked = nil
+			return route, "SAFE ROUTE", nil, ctx
+		end
 	end
+
+	-- If the objective is a dangerous dead-end while hunting, back out to a
+	-- junction instead of repeatedly trying the same doomed route.
 	ps.blocked = ps.blocked or now
 	local dang, best, bs = dangling(g), nil, nil
+	local _, dep = bfsAvoid(g, me, function(c)
+		return (d[c] or 99) <= (ctx.hunting and 3 or 2)
+	end)
+
 	for c, n in pairs(dep) do
-		local sc = math.min(d[c] or 20, 8) - n * 0.3 + dodgeShape(g, c) - (dang[c] and 8 or 0) + (c == me and 2 or 0) + (c == ps.retreat and 3 or 0)
+		local sc = math.min(d[c] or 20, 12) - n * 0.35
+			+ dodgeShape(g, c)
+			- (dang[c] and 9 or 0)
+			+ (#nbrs(g, c) >= 3 and 2 or 0)
+
+		if c == ps.retreat then sc += 3 end
 		if not bs or sc > bs then best, bs = c, sc end
 	end
+
 	ps.retreat = best
-	if best and best ~= me then return pathTo(prev, me, best), "BACKING OFF", nil, ctx end
+	if best and best ~= me then
+		local prev = bfsAvoid(g, me, function(c)
+			return (d[c] or 99) <= (ctx.hunting and 3 or 2)
+		end)
+		local route = pathTo(prev, me, best)
+		if route and #route > 1 then
+			return route, "BACKING OFF", nil, ctx
+		end
+	end
+
 	return {me}, "waiting", nil, ctx
 end
 -- cells we can walk to (plain BFS; the scarecrow bubble only matters for the main route)
 local function reachSteps(st, g, me)
 	return bfsCached(g, me), dangerCtx(st, g)
 end
--- sprint lane: while passing the scarecrow, run the far-wall lane (>5 studs from its path = outside CatchRadius), at full speed
+-- sprint lane: retained for compatibility, but never offsets the player into a wall.
 local function slipAim(st, aim, root)
-	local m = monsterModel(st)
-	if not m or hdist(root.Position, m.pos) > 2.2 * st.cs then return aim end
-	local d = Vector3.new(aim.X - root.Position.X, 0, aim.Z - root.Position.Z)
-	if d.Magnitude < 1e-3 then return aim end
-	d = d.Unit
-	local perp = Vector3.new(-d.Z, 0, d.X)
-	local side = perp:Dot(Vector3.new(m.pos.X - root.Position.X, 0, m.pos.Z - root.Position.Z)) >= 0 and -1 or 1
-	local c = cellPos(st, posCell(st, root.Position))
-	local lat = perp:Dot(Vector3.new(root.Position.X - c.X, 0, root.Position.Z - c.Z))
-	return aim + perp * (side * SLIP_LANE - lat)
+	return Vector3.new(aim.X, root.Position.Y, aim.Z)
 end
 -- blue path (pooled) ---------------------------------------------------------------------------
 local pathFolder = new("Folder", {Name = "HMV2_Path"}, Workspace)
@@ -5267,131 +5394,191 @@ local function refreshESP()
 end
 
 -- movement -------------------------------------------------------------------------------------
--- aim at the end of the straight run that starts at route[1]; re-centre first if we hug a wall
-local function aimPoint(st, route, root, tp, routeIndex)
-    local first = routeIndex or 1
-    if #route - first < 1 then return Vector3.new(tp.X, root.Position.Y, tp.Z) end
-    local nextIndex = first + 1
-    local x0, z0 = Common.CellXZ(st.n, route[first])
-    local x1, z1 = Common.CellXZ(st.n, route[nextIndex])
-	local dx, dz = x1 - x0, z1 - z0
-    local last = nextIndex
-    for i = nextIndex + 1, #route do
-		local px, pz = Common.CellXZ(st.n, route[i - 1])
-		local cx, cz = Common.CellXZ(st.n, route[i])
-		if math.abs(cx - px - dx) > 1e-3 or math.abs(cz - pz - dz) > 1e-3 then break end
-		last = i
+-- Movement deliberately follows one maze cell at a time. The old controller
+-- aimed at the end of long straight runs and could keep a stale MoveTo target
+-- after the route changed, which is exactly what caused wall hugging/sticking.
+local function routeIndexFor(route, cell, firstIndex)
+	if not route then return nil end
+	for i = firstIndex or 1, #route do
+		if route[i] == cell then return i end
 	end
-	local p = cellPos(st, route[last])
-	if last == #route and posCell(st, tp) == route[last] then p = tp end
-    if last > nextIndex then
-		local horizontal = math.abs(dx) > 1e-3
-		local lateral = horizontal and math.abs(root.Position.Z - p.Z) or math.abs(root.Position.X - p.X)
-		if lateral <= math.max(st.cs * 0.5 - 2.5, 0.5) then
-			if horizontal then p = Vector3.new(p.X, p.Y, root.Position.Z) else p = Vector3.new(root.Position.X, p.Y, p.Z) end
-		else
-			p = cellPos(st, route[nextIndex])
-		end
-	end
+	return nil
+end
+
+local function cellCenterTarget(st, cell, root)
+	local p = cellPos(st, cell)
 	return Vector3.new(p.X, root.Position.Y, p.Z)
 end
 
-local function routeIndexFor(route, cell, firstIndex)
-    for i = firstIndex or 1, #route do
-        if route[i] == cell then return i end
-    end
-    return nil
-end
-
--- returns "arrived" | "lost" | "cancelled" | "floor" | "reconsider" | "timeout" | whatever opts.onHold returns
--- opts: stay/enter (spare seconds), onHold(st, root) -> terminal result or nil, onMove(), interrupt(st, root), timeout
+-- returns "arrived" | "lost" | "cancelled" | "floor" | "reconsider" | "timeout"
 local function walk(token, getTarget, stop, label, opts)
 	opts = opts or {}
-	local s0 = getState()
-	local floor0 = s0 and s0.floor
-	local ps, lastPos, lastT, lastInt, lastDraw, waitStart = {}, nil, os.clock(), 0, 0, os.clock()
-    local route, routeMode, routeSpare, plannedGoal, plannedAt, routeCursor, activeAim
-    routeCursor = 1
+
+	local initial = getState()
+	local floor0 = initial and initial.floor
+	local route, routeMode, routeSpare = nil, "", nil
+	local plannedGoal, plannedAt = nil, 0
+	local plannerState = {}
+	local routeCursor = 1
+	local lastPosition, lastProgress = nil, os.clock()
+	local lastInterrupt, lastDraw = 0, 0
+	local waitStart = os.clock()
+
 	while running and token == moveToken do
 		local st, root, hum = getState(), getRoot(), getHum()
-		if not (st and root and hum) then task.wait(0.15); continue end
-		if st.floor ~= floor0 then return "floor" end
+		if not (st and root and hum) then
+			task.wait(0.1)
+			continue
+		end
+
+		if st.floor ~= floor0 then
+			hum:MoveTo(root.Position)
+			return "floor"
+		end
+
 		local tp = getTarget(st)
-		if not tp then return "lost" end
+		if not tp then
+			hum:MoveTo(root.Position)
+			return "lost"
+		end
+
 		local g = grid(st)
 		local me, goal = posCell(st, root.Position), posCell(st, tp)
-		if not (me and goal) then task.wait(0.1); continue end
+		if not (me and goal) then
+			task.wait(0.05)
+			continue
+		end
+
 		local now = os.clock()
-		if opts.interrupt and now - lastInt >= 0.3 then
-			lastInt = now
-			if opts.interrupt(st, root) then hum:MoveTo(root.Position); return "reconsider" end
+
+		if opts.interrupt and now - lastInterrupt >= 0.2 then
+			lastInterrupt = now
+			if opts.interrupt(st, root) then
+				hum:MoveTo(root.Position)
+				return "reconsider"
+			end
 		end
+
 		local atGoal
-		if type(stop) == "function" then atGoal = stop(st, root, tp) else atGoal = hdist(root.Position, tp) <= stop end
-		if atGoal and not opts.onHold then hum:MoveTo(root.Position); return "arrived" end
-        local routeIndex = route and routeIndexFor(route, me, routeCursor)
-        if not routeIndex and route then
-            routeIndex = routeIndexFor(route, me, 1)
-        end
-        if routeIndex then routeCursor = routeIndex end
-        local replanInterval = 0.35
-        local needsPlan = not plannedAt or now - plannedAt >= replanInterval or goal ~= plannedGoal
-            or (route and not routeIndex)
-        if needsPlan then
-            route, routeMode, routeSpare = decide(st, g, me, goal, ps, opts)
-            plannedGoal, plannedAt, routeCursor = goal, now, 1
-            routeIndex = route and routeIndexFor(route, me, 1)
-        end
-		if not route then
-            if activeAim then hum:MoveTo(root.Position); activeAim = nil end
-            setStatus("⏳ no route"); task.wait(0.15); continue
-        end
-        if not routeIndex then
-            if activeAim then hum:MoveTo(root.Position); activeAim = nil end
-            setStatus("⏳ replanning route"); task.wait(0.1); continue
+		if type(stop) == "function" then
+			atGoal = stop(st, root, tp)
+		else
+			atGoal = hdist(root.Position, tp) <= stop
 		end
-		if hum.WalkSpeed ~= O.speed then hum.WalkSpeed = O.speed end
-        local mode, s0v = routeMode, routeSpare
-        local holding = atGoal and opts.onHold and (goal == me or (#route - (routeCursor or 1) <= 0))
-		if holding then
+
+		if atGoal and not opts.onHold then
+			hum:MoveTo(root.Position)
+			return "arrived"
+		end
+
+		-- Replan often. The Scarecrow is dynamic, so a route that was safe a
+		-- fraction of a second ago may no longer be safe.
+		local currentIndex = route and routeIndexFor(route, me, math.max(1, routeCursor - 1))
+		if currentIndex then
+			routeCursor = currentIndex
+		end
+
+		local needsPlan =
+			not route
+			or goal ~= plannedGoal
+			or now - plannedAt >= 0.20
+			or not currentIndex
+
+		if needsPlan then
+			route, routeMode, routeSpare = decide(st, g, me, goal, plannerState, opts)
+
+			plannedGoal = goal
+			plannedAt = now
+			routeCursor = route and routeIndexFor(route, me, 1) or 1
+		end
+
+		if not route or #route == 0 then
+			hum:MoveTo(root.Position)
+			setStatus("⏳ no safe route")
+			task.wait(0.08)
+			continue
+		end
+
+		-- If we are no longer on the route, stop rather than letting Humanoid
+		-- continue toward an old waypoint. The next loop will calculate a fresh one.
+		if not routeCursor or not route[routeCursor] or route[routeCursor] ~= me then
+			routeCursor = routeIndexFor(route, me, 1)
+			if not routeCursor then
+				hum:MoveTo(root.Position)
+				route = nil
+				task.wait(0.04)
+				continue
+			end
+		end
+
+		if atGoal and opts.onHold and (routeCursor >= #route or goal == me) then
 			waitStart = now
 			hum:MoveTo(root.Position)
-			if lastRoute then clearPath() end
+			clearPath()
+
 			local res = opts.onHold(st, root)
 			if res then return res end
-			task.wait(0.1); continue
+
+			task.wait(0.08)
+			continue
 		end
+
 		if opts.onMove then opts.onMove() end
-		if opts.timeout and now - waitStart > opts.timeout then hum:MoveTo(root.Position); return "timeout" end
+		if opts.timeout and now - waitStart > opts.timeout then
+			hum:MoveTo(root.Position)
+			return "timeout"
+		end
+
+		-- ALWAYS target the next cell centre. Do not use lateral offsets and do
+		-- not skip multiple cells. This keeps the character in the walkable lane.
 		local aim
-        local movementTarget = tp
-        if #route - routeCursor >= 1 then aim = aimPoint(st, route, root, movementTarget, routeCursor)
-		elseif mode == "waiting" or mode == "trapped" or mode == "hiding" or mode == "waiting for hallway" then aim = nil
-        else aim = Vector3.new(movementTarget.X, root.Position.Y, movementTarget.Z) end
-        if aim and ps.slip then aim = slipAim(st, aim, root) end
-        local activeCell = activeAim and posCell(st, activeAim)
-        local activeIndex = activeCell and routeIndexFor(route, activeCell, routeCursor)
-        local activeStillValid = activeAim and activeIndex and activeIndex > routeCursor
-            and hdist(root.Position, activeAim) > st.cs * 0.35
-        if activeStillValid then aim = activeAim end
-        if aim then
-            if not activeAim or (aim - activeAim).Magnitude >= 0.75 then
-                hum:MoveTo(aim); activeAim = aim
-            end
-        elseif activeAim then
-            hum:MoveTo(root.Position); activeAim = nil
-        end
-        if needsPlan and now - lastDraw >= 0.2 then
+		if routeCursor < #route then
+			aim = cellCenterTarget(st, route[routeCursor + 1], root)
+		else
+			aim = Vector3.new(tp.X, root.Position.Y, tp.Z)
+		end
+
+		if hum.WalkSpeed ~= O.speed then
+			hum.WalkSpeed = O.speed
+		end
+
+		hum:MoveTo(aim)
+
+		if now - lastDraw >= 0.2 then
 			lastDraw = now
-            drawRoute(st, route, movementTarget, root.Position.Y, routeCursor)
-			setStatus(("→ %s  [%s%s]"):format(label, mode, s0v and (" · spare %.1fs"):format(s0v) or ""))
+			drawRoute(st, route, tp, root.Position.Y, routeCursor)
+			setStatus(("→ %s [%s%s]"):format(
+				label,
+				routeMode,
+				routeSpare and (" · spare %.1fs"):format(routeSpare) or ""
+			))
 		end
-		if aim and now - lastT > 1.2 then
-            if lastPos and hdist(root.Position, lastPos) < 1 and activeAim then hum:MoveTo(activeAim) end
-			lastPos, lastT = root.Position, now
+
+		-- Progress watchdog. If the character has barely moved for a short
+		-- period, cancel the current MoveTo and force a fresh route.
+		if not lastPosition then
+			lastPosition = root.Position
+			lastProgress = now
+		else
+			local moved = hdist(root.Position, lastPosition)
+			if moved >= 1.0 then
+				lastPosition = root.Position
+				lastProgress = now
+			elseif now - lastProgress >= 0.85 then
+				hum:MoveTo(root.Position)
+				route = nil
+				routeCursor = 1
+				plannedAt = 0
+				lastPosition = root.Position
+				lastProgress = now
+				task.wait(0.04)
+				continue
+			end
 		end
-		task.wait(0.08)
+
+		task.wait(0.05)
 	end
+
 	return "cancelled"
 end
 
