@@ -4927,6 +4927,7 @@ end
 -- ── v5 scarecrow avoidance ────────────────────────────────────────────────────────────────────
 local MARGIN_BASE, MARGIN_FACING = 1.0, 1.2 -- cells we keep from the scarecrow; larger if it faces / heads for us
 local FACE_SIGN = 1                          -- verified: the client pivots the model with lookAt(pos, pos+heading), so LookVector = facing
+local BLOCK_HIDE = 14                     -- seconds we hide out of sight before creeping back to slip past
 local SLIP_LANE, SLIP_AFTER = 5.9, 3          -- game: CatchRadius 5, corridor half-width 7 (cell 16, wall 2) -> only a lane ~5.9 studs off-centre clears it
 local function scareMargin(st, m, me)
 	if m.hunting then return MARGIN_FACING end
@@ -5029,11 +5030,34 @@ local function pickRefuge(g, me, ctx, steps, prevTarget, gd)
 	return best
 end
 
+-- decisive escape when no cell is "safe": best cell within 10 steps, only ever moving away from the scarecrow
+local function escapePath(g, me, ctx)
+	local dang = dangling(g)
+	local depth, prev, order, h = {[me] = 0}, {}, {me}, 1
+	local best, bs
+	while order[h] do
+		local c = order[h]; h += 1
+		local d = depth[c]
+		if c ~= me then
+			local sc = math.min(ctx.dist[c] or 20, 16) - d * 0.4 + dodgeShape(g, c) - (dang[c] and 10 or 0)
+			if not bs or sc > bs then best, bs = c, sc end
+		end
+		if d < 10 then
+			for _, nb in ipairs(nbrs(g, c)) do
+				if depth[nb] == nil and (ctx.dist[nb] or 99) >= (ctx.dist[c] or 99) and (ctx.dist[nb] or 99) > 0 then
+					depth[nb] = d + 1; prev[nb] = c; order[#order + 1] = nb
+				end
+			end
+		end
+	end
+	if best then return pathTo(prev, me, best) end
+end
+
 -- returns route (starting at `me`), mode, spare seconds on our own cell, ctx
 local function decide(st, g, me, goal, ps, opts)
 	local ctx = dangerCtx(st, g)
 	if not ctx then
-		ps.refuge, ps.advance, ps.slip, ps.blocked = nil, nil, false, nil
+		ps.refuge, ps.advance, ps.slip, ps.blocked, ps.fleeing = nil, nil, false, nil, false
 		local _, prev = bfsPrev(g, me)
 		return pathTo(prev, me, goal), "clear", nil, nil
 	end
@@ -5051,15 +5075,22 @@ local function decide(st, g, me, goal, ps, opts)
 		local ok
 		if goal == me then ok = s0 >= stay else ok = slack(ctx, goal, steps[goal] * ctx.ct) >= enter end
 		if ok then
-			ps.refuge, ps.advance, ps.slip, ps.blocked = nil, nil, false, nil
+			ps.refuge, ps.advance, ps.slip, ps.blocked, ps.fleeing = nil, nil, false, nil, false
 			return pathTo(prev, me, goal), (s0 < 4 and "racing" or "normal"), s0, ctx
 		end
 	end
 	local gd = bfsCached(g, goal)
 	-- too close to stand still (or trapped in a dead end while hunted): run to the best refuge / dodge cell
-	if s0 < math.max(stay, 1.2) or not trapOk then
-		local r = pickRefuge(g, me, ctx, steps, ps.refuge, gd)
+	if s0 < math.max(stay, 1.2) or not trapOk or (ps.fleeing and s0 < 2.5) then
+		ps.fleeing = true
+		-- commit to the current refuge while it is still safely reachable (stops left/right flip-flopping)
+		local r = ps.refuge
+		if not (r and r ~= me and steps[r] ~= nil and slack(ctx, r, steps[r] * ctx.ct) >= 0.5) then
+			r = pickRefuge(g, me, ctx, steps, ps.refuge, gd)
+		end
 		if r then ps.refuge, ps.advance, ps.slip = r, nil, false; return pathTo(prev, me, r), "FLEEING", s0, ctx end
+		local ep = escapePath(g, me, ctx)
+		if ep then return ep, "ESCAPING", s0, ctx end
 		local bestN, bestV
 		for _, nb in ipairs(nbrs(g, me)) do
 			local v = eta(ctx, nb)
@@ -5068,9 +5099,30 @@ local function decide(st, g, me, goal, ps, opts)
 		if bestN then return {me, bestN}, "desperate", s0, ctx end
 		return {me}, "trapped", s0, ctx
 	end
-	-- safe now but the goal is blocked: creep to the best safe cell near it (prefer dodge-shaped cells)
+	ps.fleeing = false
 	local now = os.clock()
 	ps.blocked = ps.blocked or now
+	if now - ps.blocked < BLOCK_HIDE then
+		-- blocked: back off far, out of the scarecrow's line of sight, so it wanders away from the goal
+		local vis, dang = sightCells(st, g, ctx.b), dangling(g)
+		local r = ps.retreat
+		if not (r and steps[r] ~= nil and vis[r] == nil and slack(ctx, r, steps[r] * ctx.ct) >= 1) then
+			r = nil
+			local bs
+			for c, n in pairs(steps) do
+				if slack(ctx, c, n * ctx.ct) >= 1 then
+					local sc = math.min(ctx.dist[c] or 20, 14) + dodgeShape(g, c) - n * 0.3
+					if vis[c] ~= nil then sc -= 100 end
+					if dang[c] then sc -= 8 end
+					if not bs or sc > bs then r, bs = c, sc end
+				end
+			end
+			ps.retreat = r
+		end
+		if r and r ~= me then return pathTo(prev, me, r), "BACKING OFF", s0, ctx end
+		return {me}, "hiding", s0, ctx
+	end
+	ps.retreat = nil
 	local best, bScore
 	for c, s in pairs(steps) do
 		local d = gd[c]
@@ -5314,7 +5366,7 @@ local function walk(token, getTarget, stop, label, opts)
 		local aim
         local movementTarget = tp
         if #route - routeCursor >= 1 then aim = aimPoint(st, route, root, movementTarget, routeCursor)
-		elseif mode == "waiting" or mode == "trapped" then aim = nil
+		elseif mode == "waiting" or mode == "trapped" or mode == "hiding" then aim = nil
         else aim = Vector3.new(movementTarget.X, root.Position.Y, movementTarget.Z) end
         if aim and ps.slip then aim = slipAim(st, aim, root) end
         local activeCell = activeAim and posCell(st, activeAim)
@@ -5553,9 +5605,13 @@ local function autoLoop(token)
 		if token ~= moveToken or not autoOn then return end
 		local eggsBefore = {}
 		for _, e in ipairs(getEggs()) do eggsBefore[e] = true end
-		local r = walk(token, exitTarget, EXIT_STOP, "EXIT", {interrupt = function(state) return O.hatch and hasEligibleEgg(state) end})
+		local r = walk(token, exitTarget, EXIT_STOP, "EXIT", {interrupt = function(state)
+		if not O.hatch then return false end
+		local rt = getRoot(); local m = rt and posCell(state, rt.Position)
+		return m and pickEgg(state, grid(state), m, not O.scout) ~= nil
+	end})
 		if r == "cancelled" then return end
-		if r == "reconsider" then continue end
+		if r == "reconsider" then task.wait(0.3); continue end
 		local t = os.clock()
 		local eggsAppeared = false
 		while running and token == moveToken do
@@ -5866,7 +5922,7 @@ do
 	toggle(tg2, "SCOUT", "scout", nil, third)
 	local tg3 = row(28, true)
 	toggle(tg3, "PATH", "path", refreshPathVisibility, half)
-	toggle(tg3, "PIN MAP", "pin", nil, half)
+	toggle(tg3, "MAP WHEN HIDDEN", "pin", nil, half)
 
 	local ac = row(32, true)
 	button(ac, "🍬 CANDY", third, Color3.fromRGB(110, 90, 30), function() startJob(collectCandy) end)
@@ -5975,7 +6031,7 @@ do
 		BorderSizePixel = 0, ClipsDescendants = true}, MM)
 	wallLayer = new("Frame", {Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1}, canvas)
 	dotLayer = new("Frame", {Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1, ZIndex = 5}, canvas)
-	speedCard = new("Frame", {Position = UDim2.fromOffset(346, 300), Size = UDim2.fromOffset(250, 96), BackgroundColor3 = COL.card, BorderSizePixel = 0}, Root)
+	speedCard = new("Frame", {Position = UDim2.fromOffset(346, 300), Size = UDim2.fromOffset(250, 122), BackgroundColor3 = COL.card, BorderSizePixel = 0}, Root)
 	corner(speedCard, 10)
 	speedLbl = label(speedCard, "⚙ Speeds: -", UDim2.new(1, -16, 1, -12), Color3.fromRGB(190, 200, 215), 12)
 	speedLbl.Position = UDim2.fromOffset(8, 6); speedLbl.TextYAlignment = Enum.TextYAlignment.Top
@@ -5983,9 +6039,9 @@ do
 	mapOverlayGui = new("ScreenGui", {Name = "HMV2_Pin", ResetOnSpawn = false, IgnoreGuiInset = true, DisplayOrder = 1000,
 		ZIndexBehavior = Enum.ZIndexBehavior.Sibling, Enabled = false}, PlayerGui)
 	local overlayScale = new("UIScale", {Scale = 1}, mapOverlayGui)
-	mapOverlayRoot = new("Frame", {Name = "Overlay", Size = UDim2.fromOffset(250, 450), AnchorPoint = Vector2.new(1, 0),
+	mapOverlayRoot = new("Frame", {Name = "Overlay", Size = UDim2.fromOffset(250, 476), AnchorPoint = Vector2.new(1, 0),
 		Position = UDim2.new(1, -12, 0, 12), BackgroundTransparency = 1, Active = true}, mapOverlayGui)
-	local statusCard = new("Frame", {Name = "NavigationStatus", Position = UDim2.fromOffset(0, 402), Size = UDim2.fromOffset(250, 48),
+	local statusCard = new("Frame", {Name = "NavigationStatus", Position = UDim2.fromOffset(0, 428), Size = UDim2.fromOffset(250, 48),
 		BackgroundColor3 = COL.card, BorderSizePixel = 0}, mapOverlayRoot)
 	corner(statusCard, 8)
 	minimapStatusLbl = label(statusCard, "Idle", UDim2.new(1, -16, 1, -8), Color3.fromRGB(150, 210, 255), 13)
@@ -5996,7 +6052,7 @@ do
 		local cam = Workspace.CurrentCamera
 		if not cam then return end
 		local v = cam.ViewportSize
-		overlayScale.Scale = math.max(math.min((v.X - 24) / 250, (v.Y - 24) / 450, 1), 0.35)
+		overlayScale.Scale = math.max(math.min((v.X - 24) / 250, (v.Y - 24) / 476, 1), 0.35)
 	end
 	rescale()
 	bind(Workspace:GetPropertyChangedSignal("CurrentCamera"), rescale)
@@ -6120,9 +6176,10 @@ local function onUpdateInfo()
 		scareLbl.TextColor3 = d <= 3 and Color3.fromRGB(255, 80, 80) or COL.scare
 		local unknown = 0
 		for _, e in ipairs(getEggs()) do if eggLuck(st, e) == 0 then unknown += 1 end end
-		speedLbl.Text = ("⚙ You: %.2f cells/s\n🎃 Scarecrow (worst case): %.2f cells/s\n   seen walk %s · hunt %s\n🔍 Unknown-luck eggs: %d"):format(
+		speedLbl.Text = ("⚙ You: %.2f cells/s\n🎃 Scarecrow (worst case): %.2f cells/s\n   seen walk %s · hunt %s\n🔍 Unknown-luck eggs: %d\n🍀 %s"):format(
 			O.speed / st.cs, scareCps(st, m.hunting), scareSeen.walk and ("%.2f"):format(scareSeen.walk) or "?",
-			scareSeen.hunt and ("%.2f"):format(scareSeen.hunt) or "?", unknown)
+			scareSeen.hunt and ("%.2f"):format(scareSeen.hunt) or "?", unknown,
+			#parts > 0 and table.concat(parts, " | ") or "no eggs")
 	else
 		scareText = ""; scareLbl.Text = "🎃 Scarecrow: not found"; scareLbl.TextColor3 = COL.scare
 		speedLbl.Text = "⚙ Speeds: scarecrow not found"
