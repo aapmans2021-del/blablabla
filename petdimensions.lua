@@ -4613,7 +4613,7 @@ task.spawn(function()
 	end)
 
 	-- ═════════════════════════════════════════════════════════════════════════════
--- 🎃 HALLOWEEN MAZE v5  (self-contained; docks into the Pet Dimensions Hub as a "Maze" tab)
+-- 🎃 HALLOWEEN MAZE v4  (self-contained; docks into the Pet Dimensions Hub as a "Maze" tab)
 --   * time-aware scarecrow planner: it treats the scarecrow as a 1-cell hitbox and only enters a cell
 --     if it can be in AND out of it before the scarecrow could get within one cell of it
 --   * hatching is part of the same walk loop, so fleeing / waiting / re-entering the egg is one state machine
@@ -4841,44 +4841,23 @@ local function posCell(st, p)
 end
 -- cells that belong to dead-end branches (leaf pruning). Fleeing INTO one of these traps us.
 local function dangling(g)
-	-- IMPORTANT: do not use iterative leaf-pruning here. In a perfect maze the
-	-- graph is often a tree, which causes that algorithm to eventually mark
-	-- practically every cell as a "dead end". Instead, only mark the actual
-	-- leaf-to-junction corridors as dead-end branches.
 	if g.dang then return g.dang end
-
-	local dang = {}
-	local processed = {}
-
+	local deg, dang, q = {}, {}, {}
 	for c = 1, g.n * g.n do
-		if not processed[c] and #nbrs(g, c) == 1 then
-			local prev = nil
-			local cur = c
-
-			while cur and not processed[cur] do
-				processed[cur] = true
-				dang[cur] = true
-
-				local ns = nbrs(g, cur)
-				if #ns ~= 2 then
-					break -- leaf or the first junction
-				end
-
-				local nextCell
-			if ns[1] == prev then
-				nextCell = ns[2]
-			else
-				nextCell = ns[1]
-			end
-
-			prev, cur = cur, nextCell
-			if cur and #nbrs(g, cur) >= 3 then
-				break
-			end
+		deg[c] = #nbrs(g, c)
+		if deg[c] <= 1 then q[#q + 1] = c end
+	end
+	local h = 1
+	while q[h] do
+		local c = q[h]; h += 1
+		dang[c] = true
+		for _, nb in ipairs(nbrs(g, c)) do
+			if not dang[nb] then
+				deg[nb] -= 1
+				if deg[nb] == 1 then q[#q + 1] = nb end
 			end
 		end
 	end
-
 	g.dang = dang
 	return dang
 end
@@ -4948,7 +4927,6 @@ end
 -- ── v5 scarecrow avoidance ────────────────────────────────────────────────────────────────────
 local MARGIN_BASE, MARGIN_FACING = 1.0, 1.2 -- cells we keep from the scarecrow; larger if it faces / heads for us
 local FACE_SIGN = 1                          -- verified: the client pivots the model with lookAt(pos, pos+heading), so LookVector = facing
-local BLOCK_HIDE = 25                     -- seconds we hide out of sight before creeping back to slip past
 local SLIP_LANE, SLIP_AFTER = 5.9, 3          -- game: CatchRadius 5, corridor half-width 7 (cell 16, wall 2) -> only a lane ~5.9 studs off-centre clears it
 local function scareMargin(st, m, me)
 	if m.hunting then return MARGIN_FACING end
@@ -4968,52 +4946,41 @@ local function scareMargin(st, m, me)
 	return MARGIN_BASE
 end
 local function dangerCtx(st, g)
+	if not O.avoid then return nil end
 	local m, root = monsterModel(st), getRoot()
 	if not m then return nil end
 	local b = m.b or posCell(st, m.pos)
 	local me = root and posCell(st, root.Position)
 	if not (b and me) then return nil end
-
 	local mt = 1 / scareCps(st, m.hunting)
 	local ct = st.cs / math.max(O.speed, 1) * TURN_PENALTY
-	local cfgM = getCfg().Monster or {}
-	local mins = math.max(0, (Workspace:GetServerTimeNow() - (tonumber(st.runStartedAt) or Workspace:GetServerTimeNow())) / 60)
-
-	-- Avoid is now a routing preference, not a hard dependency. Turning it on
-	-- must never make the route planner refuse to move or break egg/candy work.
-	return {
-		m = m,
-		st = st,
-		g = g,
-		dist = bfsCached(g, b),
-		a = m.a,
-		b = b,
-		tb = m.tb,
-		mt = mt,
-		ct = ct,
-		clearA = 0,
-		vd = {},
-		los = false,
-		margin = (m.hunting and MARGIN_FACING or MARGIN_BASE),
-		S = (tonumber(cfgM.SenseStart) or 2) + (tonumber(cfgM.SensePerMinute) or 0.6) * math.min(mins, 20) + 2,
-		pad = 0,
-		hunting = m.hunting == true,
-		face = false,
-		avoid = O.avoid == true,
-	}
+	local clearA = 0
+	if m.a ~= m.b and m.f < 0.8 then clearA = (0.8 - m.f) * math.max(m.seg, mt) end
+	return {m = m, dist = bfsCached(g, b), a = m.a, b = b, tb = m.tb, mt = mt, ct = ct, clearA = clearA,
+		pad = 0.5 * ct + scareMargin(st, m, me) * mt + SAFETY_BUF, hunting = m.hunting, face = scareMargin(st, m, me) > MARGIN_BASE}
 end
-
 local function eta(ctx, c)
-	local d = ctx and ctx.dist and ctx.dist[c]
+	local d = ctx.dist[c]
 	if d == nil then return 1e9 end
-	return (ctx.tb or 0) + d * (ctx.mt or 1)
+	return ctx.tb + d * ctx.mt
 end
-
 local function slack(ctx, c, t)
-	if not ctx then return 1e9 end
-	return eta(ctx, c) - t
+	if c == ctx.a and ctx.a ~= ctx.b and t < ctx.clearA + ctx.pad * 0.6 then return -1 end
+	return eta(ctx, c) - t - ctx.pad
 end
-
+local function safeSearch(g, me, ctx, maxSteps)
+	local steps, prev, order, h = {[me] = 0}, {}, {me}, 1
+	while order[h] do
+		local c = order[h]; h += 1
+		local s = steps[c] + 1
+		if s <= maxSteps then
+			for _, nb in ipairs(nbrs(g, c)) do
+				if steps[nb] == nil and slack(ctx, nb, s * ctx.ct) >= 0 then steps[nb] = s; prev[nb] = c; order[#order + 1] = nb end
+			end
+		end
+	end
+	return steps, prev
+end
 -- dead-end branch info: returns mouth cell (first junction outside the branch) and depth, or nil if `cell` is not in a dead end
 local function branchInfo(g, cell)
 	g.trap = g.trap or {}
@@ -5062,247 +5029,94 @@ local function pickRefuge(g, me, ctx, steps, prevTarget, gd)
 	return best
 end
 
--- decisive escape when no cell is "safe": best cell within 10 steps, only ever moving away from the scarecrow
-local function escapePath(g, me, ctx)
-	local dang = dangling(g)
-	local depth, prev, order, h = {[me] = 0}, {}, {me}, 1
-	local best, bs
-	while order[h] do
-		local c = order[h]; h += 1
-		local d = depth[c]
-		if c ~= me then
-			local sc = math.min(ctx.dist[c] or 20, 16) - d * 0.4 + dodgeShape(g, c) - (dang[c] and 10 or 0)
-			if not bs or sc > bs then best, bs = c, sc end
-		end
-		if d < 10 then
-			for _, nb in ipairs(nbrs(g, c)) do
-				if depth[nb] == nil and (ctx.dist[nb] or 99) >= (ctx.dist[c] or 99) and (ctx.dist[nb] or 99) > 0 then
-					depth[nb] = d + 1; prev[nb] = c; order[#order + 1] = nb
-				end
-			end
-		end
-	end
-	if best then return pathTo(prev, me, best) end
-end
-
--- hallway zone: the corridor (chain of cells with <=2 exits) around a cell, up to and including the junctions at its ends
-local function zoneOf(g, c)
-	g.zone = g.zone or {}
-	local z = g.zone[c]
-	if z then return z end
-	z = {[c] = true}
-	if #nbrs(g, c) <= 2 then
-		local q, h = {c}, 1
-		while q[h] do
-			local x = q[h]; h += 1
-			for _, nb in ipairs(nbrs(g, x)) do
-				if not z[nb] then
-					z[nb] = true
-					if #nbrs(g, nb) <= 2 then q[#q + 1] = nb end
-				end
-			end
-		end
-	end
-	g.zone[c] = z
-	return z
-end
--- is the scarecrow anywhere in a hallway our route needs? (unless it hunts us from behind while we run away from it)
-local function routeBlocked(g, route, ctx, me)
-	if ctx.hunting and route[2] and (ctx.dist[route[2]] or 0) > (ctx.dist[me] or 0) then return false end
-	local z, z2 = zoneOf(g, ctx.b), zoneOf(g, ctx.a)
-	for i = 2, #route do
-		local c = route[i]
-		if z[c] or z2[c] then return true end
-	end
-	return false
-end
-
 -- returns route (starting at `me`), mode, spare seconds on our own cell, ctx
-local function bfsAvoid(g, me, bad)
-	local prev, depth, q, h = {}, {[me] = 0}, {me}, 1
-	while q[h] do
-		local c = q[h]; h += 1
-		for _, nb in ipairs(nbrs(g, c)) do
-			if depth[nb] == nil and not bad(nb) then depth[nb] = depth[c] + 1; prev[nb] = c; q[#q + 1] = nb end
-		end
-	end
-	return prev, depth
-end
--- simple + fast: walk the shortest route that avoids a small bubble around the scarecrow; break away if inside it
 local function decide(st, g, me, goal, ps, opts)
 	local ctx = dangerCtx(st, g)
-
-	-- Normal shortest path when the user turned Avoid off or the Scarecrow is
-	-- not available yet. This branch is intentionally very cheap.
-	if not ctx or not ctx.avoid then
-		ps.blocked = nil
+	if not ctx then
+		ps.refuge, ps.advance, ps.slip, ps.blocked = nil, nil, false, nil
 		local _, prev = bfsPrev(g, me)
-		local route = pathTo(prev, me, goal)
-		return route, "SHORTEST", nil, ctx
+		return pathTo(prev, me, goal), "clear", nil, nil
 	end
-
+	local stay, enter = opts.stay or STAY_SLACK, opts.enter or 0
+	local s0 = slack(ctx, me, 0)
+	local steps, prev = safeSearch(g, me, ctx, 60)
+	-- dead-end goal (corner egg): only commit if, once hunted, we can get in AND back out to the mouth in time
+	local mouth, depth = branchInfo(g, goal)
+	local trapOk = true
+	if mouth and ctx.hunting then
+		local inT = goal == me and 0 or ((bfsCached(g, me)[mouth] or 0) + depth) * ctx.ct
+		trapOk = eta(ctx, mouth) - inT - depth * ctx.ct - ctx.pad >= (goal == me and 1 or 3)
+	end
+	if steps[goal] ~= nil and trapOk then
+		local ok
+		if goal == me then ok = s0 >= stay else ok = slack(ctx, goal, steps[goal] * ctx.ct) >= enter end
+		if ok then
+			ps.refuge, ps.advance, ps.slip, ps.blocked = nil, nil, false, nil
+			return pathTo(prev, me, goal), (s0 < 4 and "racing" or "normal"), s0, ctx
+		end
+	end
+	local gd = bfsCached(g, goal)
+	-- too close to stand still (or trapped in a dead end while hunted): run to the best refuge / dodge cell
+	if s0 < math.max(stay, 1.2) or not trapOk then
+		local r = pickRefuge(g, me, ctx, steps, ps.refuge, gd)
+		if r then ps.refuge, ps.advance, ps.slip = r, nil, false; return pathTo(prev, me, r), "FLEEING", s0, ctx end
+		local bestN, bestV
+		for _, nb in ipairs(nbrs(g, me)) do
+			local v = eta(ctx, nb)
+			if not bestV or v > bestV then bestN, bestV = nb, v end
+		end
+		if bestN then return {me, bestN}, "desperate", s0, ctx end
+		return {me}, "trapped", s0, ctx
+	end
+	-- safe now but the goal is blocked: creep to the best safe cell near it (prefer dodge-shaped cells)
 	local now = os.clock()
-	local scareCell = ctx.b
-	local scareDistFrom = ctx.dist
-	local hardRadius = ctx.hunting and 1.25 or 0.85
-
-	-- If we are already too close, immediately move to a safer reachable cell.
-	local myScareDist = scareDistFrom[me] or 999
-	if O.escape and myScareDist <= hardRadius then
-		local escape = escapePath(g, me, ctx)
-		if escape and #escape > 1 then
-			ps.blocked = nil
-			return escape, "ESCAPING", nil, ctx
-		end
-	end
-
-	-- Small binary heap implemented locally so A* stays fast even on larger floors.
-	local heap = {}
-	local bestG = {[me] = 0}
-	local bestSteps = {[me] = 0}
-	local prev = {}
-	local closed = {}
-	local blockedEdges = ps.blockedEdges or {}
-	ps.blockedEdges = blockedEdges
-
-	local function heapPush(node, f)
-		local item = {node = node, f = f}
-		heap[#heap + 1] = item
-		local i = #heap
-		while i > 1 do
-			local p = math.floor(i / 2)
-			if heap[p].f <= heap[i].f then break end
-			heap[p], heap[i] = heap[i], heap[p]
-			i = p
-		end
-	end
-
-	local function heapPop()
-		if #heap == 0 then return nil end
-		local top = heap[1]
-		local last = table.remove(heap)
-		if #heap > 0 then
-			heap[1] = last
-			local i = 1
-			while true do
-				local l, r = i * 2, i * 2 + 1
-				local best = i
-				if l <= #heap and heap[l].f < heap[best].f then best = l end
-				if r <= #heap and heap[r].f < heap[best].f then best = r end
-				if best == i then break end
-				heap[i], heap[best] = heap[best], heap[i]
-				i = best
-			end
-		end
-		return top.node
-	end
-
-	local gx, gz = Common.CellXZ(g.n, goal)
-	local function heuristic(c)
-		local x, z = Common.CellXZ(g.n, c)
-		return math.abs(x - gx) + math.abs(z - gz)
-	end
-
-	local dead = dangling(g)
-	local function movementRisk(c, stepCount)
-		local d = scareDistFrom[c]
-		if d == nil then return 0 end
-
-		local etaTime = eta(ctx, c)
-		local arrival = stepCount * ctx.ct
-		local spare = etaTime - arrival
-
-		-- Huge penalty for imminent danger, but keep it finite so Avoid never
-		-- turns a valid maze into a permanent "no route" state.
-		if spare < 0.15 then return 10000 end
-		if spare < 0.50 then return 600 end
-		if spare < 1.0 then return 120 end
-		if spare < 2.0 then return 25 end
-		if spare < 4.0 then return 6 end
-
-		-- Prefer extra distance from the Scarecrow when two routes are otherwise similar.
-		local proximity = 1 / math.max(1, d)
-		local risk = proximity * (ctx.hunting and 8 or 3)
-		if dead[c] then risk += (ctx.hunting and 2.5 or 0.75) end
-		if #nbrs(g, c) >= 3 then risk -= 0.3 -- junctions are valuable escape points
-		end
-		return risk
-	end
-
-	heapPush(me, 0)
-
-	while #heap > 0 do
-		local c = heapPop()
-		if closed[c] then continue end
-		closed[c] = true
-
-		if c == goal then
-			ps.blocked = nil
-			return pathTo(prev, me, goal), "AVOID", nil, ctx
-		end
-
-		local base = bestG[c] or math.huge
-		for _, nb in ipairs(nbrs(g, c)) do
-			local edgeA, edgeB = c, nb
-			if edgeA > edgeB then edgeA, edgeB = edgeB, edgeA end
-			local edgeKey = tostring(edgeA) .. ":" .. tostring(edgeB)
-			if not closed[nb] and not blockedEdges[edgeKey] then
-				local stepCount = (bestSteps[c] or 0) + 1
-				local extra = 1
-				extra += movementRisk(nb, stepCount)
-
-				-- Do not deliberately enter a dead-end when hunting unless that cell
-				-- is the actual destination and there is no alternative.
-				if ctx.hunting and dangling(g)[nb] and nb ~= goal then
-					extra += 3
-				end
-
-				local nd = base + extra
-				if nd < (bestG[nb] or math.huge) then
-					bestG[nb] = nd
-					bestSteps[nb] = stepCount
-					prev[nb] = c
-					heapPush(nb, nd + heuristic(nb) * 0.9)
-				end
+	ps.blocked = ps.blocked or now
+	local best, bScore
+	for c, s in pairs(steps) do
+		local d = gd[c]
+		if d then
+			local sl = slack(ctx, c, s * ctx.ct)
+			if sl >= 2 then
+				local sc = -d * 10 + math.min(sl, 6) - s * 0.1 + dodgeShape(g, c) * 2
+				if c == ps.advance then sc += 4 end
+				if not bScore or sc > bScore then best, bScore = c, sc end
 			end
 		end
 	end
-
-	-- Critical fallback: Avoid may prefer safety, but it may never leave the
-	-- player with no path. Use a shortest-path BFS that still respects edges
-	-- the physical wall guard previously proved unusable.
-	local fallbackPrev, fallbackSeen = {}, {[me] = true}
-	local fallbackQ, fallbackHead = {me}, 1
-	while fallbackQ[fallbackHead] do
-		local c = fallbackQ[fallbackHead]
-		fallbackHead += 1
-		for _, nb in ipairs(nbrs(g, c)) do
-			local ea, eb = c, nb
-			if ea > eb then ea, eb = eb, ea end
-			local ek = tostring(ea) .. ":" .. tostring(eb)
-			if not fallbackSeen[nb] and not blockedEdges[ek] then
-				fallbackSeen[nb] = true
-				fallbackPrev[nb] = c
-				fallbackQ[#fallbackQ + 1] = nb
-			end
-		end
+	if best and best ~= me and (gd[best] or 99) < (gd[me] or 99) then
+		ps.advance, ps.refuge = best, nil
+		return pathTo(prev, me, best), "advancing", s0, ctx
 	end
-	local fallback = pathTo(fallbackPrev, me, goal)
-	ps.blocked = fallback and now or ps.blocked
-	return fallback, fallback and "FALLBACK" or "waiting", nil, ctx
-end
--- cells we can walk to (plain BFS; the scarecrow bubble only matters for the main route)
-local function reachSteps(st, g, me)
-	return bfsCached(g, me), dangerCtx(st, g)
+	ps.advance = nil
+	-- still blocked after a while: sprint past it along the far lane (only if it isn't hunting / facing us)
+	if O.slip ~= false and (ps.slip or now - ps.blocked > SLIP_AFTER) and not ctx.hunting and not ctx.face and trapOk and (ctx.dist[me] or 99) <= 3 then
+		local _, p2 = bfsPrev(g, me)
+		local r = pathTo(p2, me, goal)
+		if r then ps.slip = true; return r, "SLIP", s0, ctx end
+	end
+	ps.slip = false
+	return {me}, "waiting", s0, ctx
 end
 -- sprint lane: while passing the scarecrow, run the far-wall lane (>5 studs from its path = outside CatchRadius), at full speed
 local function slipAim(st, aim, root)
-	-- The maze is only one cell wide in many places. The old "slip lane"
-	-- intentionally offset MoveTo targets by ~5.9 studs and could put the
-	-- Humanoid directly into a wall. Keep this hook for compatibility, but
-	-- never offset the route outside its calculated cell.
-	return Vector3.new(aim.X, root.Position.Y, aim.Z)
+	local m = monsterModel(st)
+	if not m or hdist(root.Position, m.pos) > 2.2 * st.cs then return aim end
+	local d = Vector3.new(aim.X - root.Position.X, 0, aim.Z - root.Position.Z)
+	if d.Magnitude < 1e-3 then return aim end
+	d = d.Unit
+	local perp = Vector3.new(-d.Z, 0, d.X)
+	local side = perp:Dot(Vector3.new(m.pos.X - root.Position.X, 0, m.pos.Z - root.Position.Z)) >= 0 and -1 or 1
+	local c = cellPos(st, posCell(st, root.Position))
+	local lat = perp:Dot(Vector3.new(root.Position.X - c.X, 0, root.Position.Z - c.Z))
+	return aim + perp * (side * SLIP_LANE - lat)
 end
+-- steps from `me` over cells we can safely enter (plain BFS when AVOID is off)
+local function reachSteps(st, g, me)
+	local ctx = dangerCtx(st, g)
+	if ctx then return (safeSearch(g, me, ctx, 80)), ctx end
+	return bfsCached(g, me), nil
+end
+
 -- blue path (pooled) ---------------------------------------------------------------------------
 local pathFolder = new("Folder", {Name = "HMV2_Path"}, Workspace)
 local segs, activeSegmentCount = {}, 0
@@ -5403,17 +5217,30 @@ end
 -- movement -------------------------------------------------------------------------------------
 -- aim at the end of the straight run that starts at route[1]; re-centre first if we hug a wall
 local function aimPoint(st, route, root, tp, routeIndex)
-	local first = routeIndex or 1
-	if not route or first >= #route then
-		return Vector3.new(tp.X, root.Position.Y, tp.Z)
+    local first = routeIndex or 1
+    if #route - first < 1 then return Vector3.new(tp.X, root.Position.Y, tp.Z) end
+    local nextIndex = first + 1
+    local x0, z0 = Common.CellXZ(st.n, route[first])
+    local x1, z1 = Common.CellXZ(st.n, route[nextIndex])
+	local dx, dz = x1 - x0, z1 - z0
+    local last = nextIndex
+    for i = nextIndex + 1, #route do
+		local px, pz = Common.CellXZ(st.n, route[i - 1])
+		local cx, cz = Common.CellXZ(st.n, route[i])
+		if math.abs(cx - px - dx) > 1e-3 or math.abs(cz - pz - dz) > 1e-3 then break end
+		last = i
 	end
-
-	local nextCell = route[first + 1]
-	if not nextCell then
-		return Vector3.new(tp.X, root.Position.Y, tp.Z)
+	local p = cellPos(st, route[last])
+	if last == #route and posCell(st, tp) == route[last] then p = tp end
+    if last > nextIndex then
+		local horizontal = math.abs(dx) > 1e-3
+		local lateral = horizontal and math.abs(root.Position.Z - p.Z) or math.abs(root.Position.X - p.X)
+		if lateral <= math.max(st.cs * 0.5 - 2.5, 0.5) then
+			if horizontal then p = Vector3.new(p.X, p.Y, root.Position.Z) else p = Vector3.new(root.Position.X, p.Y, p.Z) end
+		else
+			p = cellPos(st, route[nextIndex])
+		end
 	end
-
-	local p = cellPos(st, nextCell)
 	return Vector3.new(p.X, root.Position.Y, p.Z)
 end
 
@@ -5426,268 +5253,96 @@ end
 
 -- returns "arrived" | "lost" | "cancelled" | "floor" | "reconsider" | "timeout" | whatever opts.onHold returns
 -- opts: stay/enter (spare seconds), onHold(st, root) -> terminal result or nil, onMove(), interrupt(st, root), timeout
-local function cellCenterTarget(st, cell, root)
-	local p = cellPos(st, cell)
-	return Vector3.new(p.X, root.Position.Y, p.Z)
-end
-
-local function mazeEdgeKey(a, b)
-	if a > b then a, b = b, a end
-	return tostring(a) .. ":" .. tostring(b)
-end
-
--- Verify that the physical map does not contain an unexpected solid obstacle
--- between two adjacent official maze cells. This is only a safety guard; the
--- official maze graph remains the primary source of truth and keeps planning fast.
-local function physicalEdgeBlocked(st, fromCell, toCell)
-	local a = cellPos(st, fromCell)
-	local b = cellPos(st, toCell)
-	local flat = Vector3.new(b.X - a.X, 0, b.Z - a.Z)
-	if flat.Magnitude < 0.1 then return false end
-
-	local params = RaycastParams.new()
-	params.FilterType = Enum.RaycastFilterType.Exclude
-	local exclude = {}
-	if Player.Character then exclude[#exclude + 1] = Player.Character end
-	params.FilterDescendantsInstances = exclude
-	params.IgnoreWater = true
-
-	local perpendicular = Vector3.new(-flat.Z, 0, flat.X).Unit
-	local offsets = {0, 0.85, -0.85}
-	local height = math.max(2.0, math.min(3.2, st.cs * 0.2))
-
-	for _, off in ipairs(offsets) do
-		local origin = a + Vector3.new(0, height, 0) + perpendicular * off
-		local hit = Workspace:Raycast(origin, flat, params)
-		if hit and hit.Instance and hit.Instance.CanCollide then
-			-- Ignore transparent/non-solid helper geometry. A real maze wall is
-			-- normally opaque enough and spans the edge between the two cells.
-			if hit.Instance.Transparency < 0.95 then
-				return true
-			end
-		end
-	end
-
-	return false
-end
-
 local function walk(token, getTarget, stop, label, opts)
 	opts = opts or {}
-
 	local s0 = getState()
 	local floor0 = s0 and s0.floor
-	local ps = {blockedEdges = {}}
-	local route, routeMode, routeSpare
-	local plannedGoal, plannedAt = nil, 0
-	local routeCursor = 1
-	local lastCell = nil
-	local lastMoveAt = os.clock()
-	local lastProgressPos = nil
-	local lastProgressAt = os.clock()
-	local lastInterrupt = 0
-	local lastDraw = 0
-	local waitStart = os.clock()
-
+	local ps, lastPos, lastT, lastInt, lastDraw, waitStart = {}, nil, os.clock(), 0, 0, os.clock()
+    local route, routeMode, routeSpare, plannedGoal, plannedAt, routeCursor, activeAim
+    routeCursor = 1
 	while running and token == moveToken do
 		local st, root, hum = getState(), getRoot(), getHum()
-		if not (st and root and hum) then
-			task.wait(0.05)
-			continue
-		end
-
-		if st.floor ~= floor0 then
-			hum:MoveTo(root.Position)
-			return "floor"
-		end
-
+		if not (st and root and hum) then task.wait(0.15); continue end
+		if st.floor ~= floor0 then return "floor" end
 		local tp = getTarget(st)
-		if not tp then
-			hum:MoveTo(root.Position)
-			return "lost"
-		end
-
+		if not tp then return "lost" end
 		local g = grid(st)
 		local me, goal = posCell(st, root.Position), posCell(st, tp)
-		if not (me and goal) then
-			task.wait(0.05)
-			continue
-		end
-
+		if not (me and goal) then task.wait(0.1); continue end
 		local now = os.clock()
-
-		if opts.interrupt and now - lastInterrupt >= 0.20 then
-			lastInterrupt = now
-			if opts.interrupt(st, root) then
-				hum:MoveTo(root.Position)
-				return "reconsider"
-			end
+		if opts.interrupt and now - lastInt >= 0.3 then
+			lastInt = now
+			if opts.interrupt(st, root) then hum:MoveTo(root.Position); return "reconsider" end
 		end
-
 		local atGoal
-		if type(stop) == "function" then
-			atGoal = stop(st, root, tp)
-		else
-			atGoal = hdist(root.Position, tp) <= stop
+		if type(stop) == "function" then atGoal = stop(st, root, tp) else atGoal = hdist(root.Position, tp) <= stop end
+		if atGoal and not opts.onHold then hum:MoveTo(root.Position); return "arrived" end
+        local routeIndex = route and routeIndexFor(route, me, routeCursor)
+        if not routeIndex and route then
+            routeIndex = routeIndexFor(route, me, 1)
+        end
+        if routeIndex then routeCursor = routeIndex end
+        local replanInterval = 0.35
+        local needsPlan = not plannedAt or now - plannedAt >= replanInterval or goal ~= plannedGoal
+            or (route and not routeIndex)
+        if needsPlan then
+            route, routeMode, routeSpare = decide(st, g, me, goal, ps, opts)
+            plannedGoal, plannedAt, routeCursor = goal, now, 1
+            routeIndex = route and routeIndexFor(route, me, 1)
+        end
+		if not route then
+            if activeAim then hum:MoveTo(root.Position); activeAim = nil end
+            setStatus("⏳ no route"); task.wait(0.15); continue
+        end
+        if not routeIndex then
+            if activeAim then hum:MoveTo(root.Position); activeAim = nil end
+            setStatus("⏳ replanning route"); task.wait(0.1); continue
 		end
-
-		if atGoal and not opts.onHold then
-			hum:MoveTo(root.Position)
-			return "arrived"
-		end
-
-		if opts.timeout and now - waitStart > opts.timeout then
-			hum:MoveTo(root.Position)
-			return "timeout"
-		end
-
-		local currentIndex = route and routeIndexFor(route, me, math.max(1, routeCursor - 1))
-		if currentIndex then
-			routeCursor = currentIndex
-		elseif route then
-			-- We physically left the planned route. Stop immediately instead of
-			-- following a stale MoveTo target through a wall.
-			hum:MoveTo(root.Position)
-			route = nil
-			routeCursor = 1
-		end
-
-		local needsPlan =
-			not route
-			or goal ~= plannedGoal
-			or now - plannedAt >= 0.18
-			or not currentIndex
-
-		if needsPlan then
-			route, routeMode, routeSpare = decide(st, g, me, goal, ps, opts)
-			plannedGoal, plannedAt = goal, now
-			routeCursor = route and routeIndexFor(route, me, 1) or 1
-			lastCell = me
-			lastMoveAt = now
-			ps.lastMoveIssued = false
-		end
-
-		if not route or not routeCursor then
-			hum:MoveTo(root.Position)
-			setStatus("⏳ calculating route...")
-			task.wait(0.04)
-			continue
-		end
-
-		local mode = routeMode
-		local holding = atGoal and opts.onHold and (goal == me or routeCursor >= #route)
+		if hum.WalkSpeed ~= O.speed then hum.WalkSpeed = O.speed end
+        local mode, s0v = routeMode, routeSpare
+        local holding = atGoal and opts.onHold and (goal == me or (#route - (routeCursor or 1) <= 0))
 		if holding then
+			waitStart = now
 			hum:MoveTo(root.Position)
 			if lastRoute then clearPath() end
 			local res = opts.onHold(st, root)
 			if res then return res end
-			task.wait(0.05)
-			continue
+			task.wait(0.1); continue
 		end
-
-		-- If we still have route cells ahead, ONLY move to the immediate next
-		-- cell centre. Never skip cells and never offset laterally.
-		if routeCursor < #route then
-			local nextCell = route[routeCursor + 1]
-			local cx, cz = Common.CellXZ(st.n, route[routeCursor])
-			local nx, nz = Common.CellXZ(st.n, nextCell)
-			local manhattan = math.abs(nx - cx) + math.abs(nz - cz)
-
-			-- Safety assertion: a route edge must be one cardinal maze step.
-			-- If anything unexpected gets into the route, discard it instead of
-			-- trying to cross the wall diagonally.
-			if manhattan ~= 1 then
-				hum:MoveTo(root.Position)
-				route = nil
-				plannedAt = 0
-				task.wait(0.02)
-				continue
-			end
-
-			local edgeKey = mazeEdgeKey(route[routeCursor], nextCell)
-			if not ps.blockedEdges or not ps.blockedEdges[edgeKey] then
-				if physicalEdgeBlocked(st, route[routeCursor], nextCell) then
-					ps.blockedEdges = ps.blockedEdges or {}
-					ps.blockedEdges[edgeKey] = true
-					hum:MoveTo(root.Position)
-					route = nil
-					plannedAt = 0
-					setStatus("↻ wall detected, rerouting...")
-					task.wait(0.02)
-					continue
-				end
-			end
-
-			local target = cellCenterTarget(st, nextCell, root)
-			if not target then
-				local p = cellPos(st, nextCell)
-				target = Vector3.new(p.X, root.Position.Y, p.Z)
-			end
-
-			-- Re-centre before taking a turn. This prevents Humanoid acceleration
-			-- from cutting across the corner and clipping through the outer wall.
-			local currentCenter = cellCenterTarget(st, route[routeCursor], root)
-			if currentCenter and hdist(root.Position, currentCenter) > math.min(1.5, st.cs * 0.10) then
-				if opts.onMove and not ps.lastMoveIssued then opts.onMove(); ps.lastMoveIssued = true end
-				hum:MoveTo(currentCenter)
-			else
-				if opts.onMove and not ps.lastMoveIssued then opts.onMove(); ps.lastMoveIssued = true end
-				hum:MoveTo(target)
-			end
-
-			local progressTarget = target
-			local currentError = hdist(root.Position, progressTarget)
-			if lastProgressPos == nil then
-				lastProgressPos = root.Position
-				lastProgressAt = now
-			elseif hdist(root.Position, lastProgressPos) >= 0.40 then
-				lastProgressPos = root.Position
-				lastProgressAt = now
-			elseif currentError <= 1.15 then
-				lastProgressPos = root.Position
-				lastProgressAt = now
-			end
-
-			-- Much faster stuck detection than the old 1.2 second watchdog.
-			-- A blocked MoveTo should trigger a fresh path in under a second.
-			if now - lastProgressAt >= 0.65 then
-				hum:MoveTo(root.Position)
-				route = nil
-				plannedAt = 0
-				lastProgressAt = now
-				lastProgressPos = root.Position
-				setStatus("↻ blocked, recalculating...")
-				 task.wait(0.03)
-				continue
-			end
-
-			-- Advance the route as soon as the player is actually inside the next
-			-- cell; this avoids waiting for exact centre overlap.
-			if me == nextCell then
-				routeCursor += 1
-				ps.lastMoveIssued = false
-				lastCell = nextCell
-				lastMoveAt = now
-				lastProgressPos = root.Position
-				lastProgressAt = now
-			end
-		else
-			local final = Vector3.new(tp.X, root.Position.Y, tp.Z)
-			hum:MoveTo(final)
-		end
-
-		if needsPlan and now - lastDraw >= 0.10 then
+		if opts.onMove then opts.onMove() end
+		if opts.timeout and now - waitStart > opts.timeout then hum:MoveTo(root.Position); return "timeout" end
+		local aim
+        local movementTarget = tp
+        if #route - routeCursor >= 1 then aim = aimPoint(st, route, root, movementTarget, routeCursor)
+		elseif mode == "waiting" or mode == "trapped" then aim = nil
+        else aim = Vector3.new(movementTarget.X, root.Position.Y, movementTarget.Z) end
+        if aim and ps.slip then aim = slipAim(st, aim, root) end
+        local activeCell = activeAim and posCell(st, activeAim)
+        local activeIndex = activeCell and routeIndexFor(route, activeCell, routeCursor)
+        local activeStillValid = activeAim and activeIndex and activeIndex > routeCursor
+            and hdist(root.Position, activeAim) > st.cs * 0.35
+        if activeStillValid then aim = activeAim end
+        if aim then
+            if not activeAim or (aim - activeAim).Magnitude >= 0.75 then
+                hum:MoveTo(aim); activeAim = aim
+            end
+        elseif activeAim then
+            hum:MoveTo(root.Position); activeAim = nil
+        end
+        if needsPlan and now - lastDraw >= 0.2 then
 			lastDraw = now
-			drawRoute(st, route, tp, root.Position.Y, routeCursor)
-			setStatus(("→ %s [%s]"):format(label, mode or "route"))
+            drawRoute(st, route, movementTarget, root.Position.Y, routeCursor)
+			setStatus(("→ %s  [%s%s]"):format(label, mode, s0v and (" · spare %.1fs"):format(s0v) or ""))
 		end
-
-		task.wait(0.035)
+		if aim and now - lastT > 1.2 then
+            if lastPos and hdist(root.Position, lastPos) < 1 and activeAim then hum:MoveTo(activeAim) end
+			lastPos, lastT = root.Position, now
+		end
+		task.wait(0.08)
 	end
-
 	return "cancelled"
 end
 
-local eggWork
 local candyIgnore = setmetatable({}, {__mode = "k"})
 local function nearestCandy(st, g, me)
 	local steps, ctx = reachSteps(st, g, me)
@@ -5696,10 +5351,7 @@ local function nearestCandy(st, g, me)
 		if not candyIgnore[c] then
 			local p = posOf(c); local cell = p and posCell(st, p)
 			local s = cell and steps[cell]
-			-- Avoid is handled by the movement planner. Do not discard candies
-			-- merely because the Scarecrow is currently near their cell; that
-			-- caused Candy First/Auto to stall whenever Avoid was enabled.
-			if s and (not bd or s < bd) then best, bd = c, s end
+			if s and (not ctx or slack(ctx, cell, s * ctx.ct) >= 2) and (not bd or s < bd) then best, bd = c, s end
 		end
 	end
 	return best
@@ -5718,8 +5370,7 @@ local function collectCandy(token)
 			setStatus("⏳ candy near scarecrow..."); task.wait(0.3); continue
 		end
 		idleSince = nil
-		local r = walk(token, function() if c.Parent then return posOf(c) end end, CANDY_STOP, "Candy", {timeout = 25, interrupt = function(s) return autoOn and eggWork(s) end})
-		if r == "reconsider" then return r end
+		local r = walk(token, function() if c.Parent then return posOf(c) end end, CANDY_STOP, "Candy", {timeout = 25})
 		if r == "cancelled" or r == "floor" then return r end
 		if r == "arrived" or r == "timeout" then
 			tries[c] = (tries[c] or 0) + 1
@@ -5867,159 +5518,71 @@ local function scoutEggs(token)
 	return "cancelled"
 end
 
--- true while there is egg work to do (a hatchable egg, or one we can still scout) - checked constantly while walking
-eggWork = function(st)
-	if not O.hatch then return false end
-	local rt = getRoot(); local me = rt and posCell(st, rt.Position)
-	if not me then return false end
-	local g = grid(st)
-	if pickEgg(st, g, me, not O.scout) then return true end
-	if O.scout then
-		local dist = bfsCached(g, me)
-		for _, egg in ipairs(getEggs()) do
-			local name = egg:GetAttribute("ID")
-			if name and settingsForEgg(name).enabled and not rejected[egg] and eggLuck(st, egg) == 0 then
-				local p = posOf(egg); local ec = p and posCell(st, p)
-				local t = scoutTried[egg]
-				if ec and dist[ec] and (not t or t.n < 2) then return true end
-			end
-		end
-	end
-	return false
-end
 local function exitTarget(st) local p = cellPos(st, st.exit); return p + Vector3.new(0, 6, 0) end
 local function autoLoop(token)
 	while running and token == moveToken and autoOn do
 		local st = getState()
-		if not st then
-			setStatus("⏳ waiting for maze...")
-			task.wait(0.15)
-			continue
-		end
-
+		if not st then task.wait(0.3); continue end
 		local floor = st.floor
-		local newFloor = false
-		local startEggs = {}
-		for _, e in ipairs(getEggs()) do startEggs[e] = true end
-
-		-- Candy First: failure to collect candy is not fatal to Auto.
 		if O.candyFirst then
 			local root = getRoot()
 			local me = root and posCell(st, root.Position)
 			local pendingEgg = O.hatch and me and pickEgg(st, grid(st), me, true)
-			if not pendingEgg then
-				local candyResult = collectCandy(token)
-				if candyResult == "cancelled" and token ~= moveToken then return end
-			end
+			if not pendingEgg and collectCandy(token) == "cancelled" then return end
 		end
-
-		-- Hatch/scout stage. Never disable Auto because one egg was temporarily
-		-- unreachable; reject that target and continue to the next one.
 		if O.hatch then
 			while running and token == moveToken and autoOn do
 				local s2, root = getState(), getRoot()
 				local me = s2 and root and posCell(s2, root.Position)
-				if not me then
-					task.wait(0.08)
-					continue
-				end
-				if s2.floor ~= floor then
-					newFloor = true
-					break
-				end
-
+				if not me or s2.floor ~= floor then break end
 				local egg = pickEgg(s2, grid(s2), me, not O.scout)
 				if egg then
 					local r = hatchAt(token, egg, false)
-					if r == "cancelled" then
-						if token ~= moveToken or not autoOn then return end
-						break
-					end
-					if r == "floor" then
-						newFloor = true
-						break
-					end
-					if r == "lost" or r == "gone" or r == "failed" or r == "timeout" then
-						rejected[egg] = rejected[egg] or r
-						task.wait(0.05)
-					end
+					if r == "cancelled" then return end
+					if r == "floor" then break end
+					if r == "lost" or r == "gone" or r == "failed" then rejected[egg] = rejected[egg] or r end
 				elseif O.scout then
 					local result = scoutEggs(token)
-					if result == "cancelled" then
-						if token ~= moveToken or not autoOn then return end
-						break
-					end
-					if result == "floor" then newFloor = true; break end
+					if result == "cancelled" then return end
 					if result ~= "scouted" then break end
 				else
 					break
 				end
 			end
 		end
-
-		if newFloor then
-			local t0 = os.clock()
-			while running and token == moveToken and autoOn and os.clock() - t0 < 8 do
-				local fresh = false
-				for _, e in ipairs(getEggs()) do
-					if not startEggs[e] then fresh = true; break end
-				end
-				if fresh then break end
-				setStatus("new floor - waiting for eggs")
-				task.wait(0.15)
-			end
-			task.wait(0.25)
-			continue
-		end
-
 		if token ~= moveToken or not autoOn then return end
-
 		local eggsBefore = {}
 		for _, e in ipairs(getEggs()) do eggsBefore[e] = true end
-
-		local r = walk(token, exitTarget, EXIT_STOP, "EXIT", {interrupt = eggWork})
-		if r == "cancelled" then
-			if token ~= moveToken or not autoOn then return end
-			task.wait(0.05)
-			continue
-		end
-		if r == "floor" then
-			task.wait(0.1)
-			continue
-		end
-		if r == "reconsider" then
-			task.wait(0.10)
-			continue
-		end
-
+		local r = walk(token, exitTarget, EXIT_STOP, "EXIT", {interrupt = function(state) return O.hatch and hasEligibleEgg(state) end})
+		if r == "cancelled" then return end
+		if r == "reconsider" then continue end
 		local t = os.clock()
-		while running and token == moveToken and autoOn do
+		local eggsAppeared = false
+		while running and token == moveToken do
 			local s3 = getState()
-			if not s3 then
-				task.wait(0.1)
-				continue
-			end
+			if not s3 then break end
 			if s3.floor ~= floor then
 				local t2 = os.clock()
-				while running and token == moveToken and autoOn and os.clock() - t2 < 8 do
+				while running and token == moveToken and os.clock() - t2 < 8 do
+					local list = getEggs()
 					local fresh = false
-					for _, e in ipairs(getEggs()) do
+					for _, e in ipairs(list) do
 						if not eggsBefore[e] then fresh = true; break end
 					end
-					if not fresh and next(eggsBefore) == nil and #getEggs() > 0 then fresh = true end
+					if not fresh and next(eggsBefore) == nil and #list > 0 then fresh = true end
 					if fresh then break end
-					setStatus("waiting for eggs to refresh")
-					task.wait(0.15)
+					setStatus("waiting for eggs to refresh"); task.wait(0.2)
 				end
-				task.wait(0.25)
+				task.wait(0.3)
+				eggsAppeared = true
 				break
 			end
 			if os.clock() - t > 8 then break end
-			setStatus("✅ at exit, waiting for next floor...")
-			task.wait(0.15)
+			
+			setStatus("✅ at exit, waiting for next floor..."); task.wait(0.2)
 		end
-
-		task.wait(0.1)
+		if eggsAppeared then continue end
+		task.wait(0.5)
 	end
 end
 
@@ -6043,27 +5606,12 @@ end
 local function startJob(fn)
 	moveToken += 1
 	local t = moveToken
-	jobRunning = true
-	preview = nil
-	stopMotion()
-	clearPath()
+	jobRunning = true; preview = nil
 	task.spawn(function()
 		local ok, err = pcall(fn, t)
-		if not ok then
-			warn("[HMV2] " .. tostring(err))
-			if t == moveToken then
-				setStatus("⚠ " .. tostring(err):sub(1, 90))
-			end
-		end
+		if not ok then warn("[HMV2] " .. tostring(err)) end
 		if t == moveToken then
-			jobRunning = false
-			if not autoOn then
-				setAutoHatch(false)
-				refreshAutoBtn()
-				stopMotion()
-				clearPath()
-				setStatus("Idle")
-			end
+			jobRunning = false; autoOn = false; setAutoHatch(false); refreshAutoBtn(); stopMotion(); clearPath(); setStatus("Idle")
 		end
 	end)
 end
@@ -6194,7 +5742,7 @@ end
 local tabBtn, hubBtns, origTab = nil, {}, {}
 local selColor, unselColor = Color3.fromRGB(60, 140, 220), Color3.fromRGB(32, 32, 42)
 if ownGui then
-	label(titleBar, "🎃 HALLOWEEN MAZE v5", UDim2.new(1, -80, 1, 0), COL.white, 17).Position = UDim2.fromOffset(10, 0)
+	label(titleBar, "🎃 HALLOWEEN MAZE v4", UDim2.new(1, -80, 1, 0), COL.white, 17).Position = UDim2.fromOffset(10, 0)
 	local minimized = false
 	button(titleBar, "–", UDim2.fromOffset(26, 24), Color3.fromRGB(60, 60, 70), function()
 		closeDD(); minimized = not minimized
@@ -6318,7 +5866,7 @@ do
 	toggle(tg2, "SCOUT", "scout", nil, third)
 	local tg3 = row(28, true)
 	toggle(tg3, "PATH", "path", refreshPathVisibility, half)
-	toggle(tg3, "MAP WHEN HIDDEN", "pin", nil, half)
+	toggle(tg3, "PIN MAP", "pin", nil, half)
 
 	local ac = row(32, true)
 	button(ac, "🍬 CANDY", third, Color3.fromRGB(110, 90, 30), function() startJob(collectCandy) end)
@@ -6326,40 +5874,8 @@ do
 	button(ac, "PATH EXIT", third, Color3.fromRGB(30, 80, 130), pathExit)
 	local ac2 = row(32, true)
 	autoBtn = button(ac2, "AUTO: OFF", third, Color3.fromRGB(70, 60, 90), function()
-		if autoOn then
-			stopAll("Auto stopped")
-			return
-		end
-		moveToken += 1
-		local t = moveToken
-		autoOn = true
-		jobRunning = true
-		preview = nil
-		refreshAutoBtn()
-		setStatus("▶ starting Auto...")
-		task.spawn(function()
-			local ok, err = pcall(autoLoop, t)
-			if not ok then
-				warn("[HMV2 Auto] " .. tostring(err))
-				if t == moveToken and autoOn then
-					setStatus("⚠ Auto recovered: " .. tostring(err):sub(1, 70))
-					jobRunning = false
-					task.wait(0.15)
-					if t == moveToken and autoOn then
-						jobRunning = true
-						task.spawn(function()
-							pcall(autoLoop, t)
-						end)
-					end
-				end
-			end
-			if t == moveToken and not autoOn then
-				jobRunning = false
-				refreshAutoBtn()
-				stopMotion()
-				clearPath()
-			end
-		end)
+		if autoOn then stopAll("Auto stopped"); return end
+		startJob(function(t) autoOn = true; refreshAutoBtn(); autoLoop(t) end)
 	end)
 	button(ac2, "🔍 SCOUT", third, Color3.fromRGB(60, 80, 110), function() startJob(scoutEggs) end)
 	button(ac2, "🛑 STOP (X)", third, Color3.fromRGB(120, 45, 45), function() stopAll() end)
@@ -6459,7 +5975,7 @@ do
 		BorderSizePixel = 0, ClipsDescendants = true}, MM)
 	wallLayer = new("Frame", {Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1}, canvas)
 	dotLayer = new("Frame", {Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1, ZIndex = 5}, canvas)
-	speedCard = new("Frame", {Position = UDim2.fromOffset(346, 300), Size = UDim2.fromOffset(250, 122), BackgroundColor3 = COL.card, BorderSizePixel = 0}, Root)
+	speedCard = new("Frame", {Position = UDim2.fromOffset(346, 300), Size = UDim2.fromOffset(250, 96), BackgroundColor3 = COL.card, BorderSizePixel = 0}, Root)
 	corner(speedCard, 10)
 	speedLbl = label(speedCard, "⚙ Speeds: -", UDim2.new(1, -16, 1, -12), Color3.fromRGB(190, 200, 215), 12)
 	speedLbl.Position = UDim2.fromOffset(8, 6); speedLbl.TextYAlignment = Enum.TextYAlignment.Top
@@ -6467,9 +5983,9 @@ do
 	mapOverlayGui = new("ScreenGui", {Name = "HMV2_Pin", ResetOnSpawn = false, IgnoreGuiInset = true, DisplayOrder = 1000,
 		ZIndexBehavior = Enum.ZIndexBehavior.Sibling, Enabled = false}, PlayerGui)
 	local overlayScale = new("UIScale", {Scale = 1}, mapOverlayGui)
-	mapOverlayRoot = new("Frame", {Name = "Overlay", Size = UDim2.fromOffset(250, 476), AnchorPoint = Vector2.new(1, 0),
+	mapOverlayRoot = new("Frame", {Name = "Overlay", Size = UDim2.fromOffset(250, 450), AnchorPoint = Vector2.new(1, 0),
 		Position = UDim2.new(1, -12, 0, 12), BackgroundTransparency = 1, Active = true}, mapOverlayGui)
-	local statusCard = new("Frame", {Name = "NavigationStatus", Position = UDim2.fromOffset(0, 428), Size = UDim2.fromOffset(250, 48),
+	local statusCard = new("Frame", {Name = "NavigationStatus", Position = UDim2.fromOffset(0, 402), Size = UDim2.fromOffset(250, 48),
 		BackgroundColor3 = COL.card, BorderSizePixel = 0}, mapOverlayRoot)
 	corner(statusCard, 8)
 	minimapStatusLbl = label(statusCard, "Idle", UDim2.new(1, -16, 1, -8), Color3.fromRGB(150, 210, 255), 13)
@@ -6480,7 +5996,7 @@ do
 		local cam = Workspace.CurrentCamera
 		if not cam then return end
 		local v = cam.ViewportSize
-		overlayScale.Scale = math.max(math.min((v.X - 24) / 250, (v.Y - 24) / 476, 1), 0.35)
+		overlayScale.Scale = math.max(math.min((v.X - 24) / 250, (v.Y - 24) / 450, 1), 0.35)
 	end
 	rescale()
 	bind(Workspace:GetPropertyChangedSignal("CurrentCamera"), rescale)
@@ -6604,10 +6120,9 @@ local function onUpdateInfo()
 		scareLbl.TextColor3 = d <= 3 and Color3.fromRGB(255, 80, 80) or COL.scare
 		local unknown = 0
 		for _, e in ipairs(getEggs()) do if eggLuck(st, e) == 0 then unknown += 1 end end
-		speedLbl.Text = ("⚙ You: %.2f cells/s\n🎃 Scarecrow (worst case): %.2f cells/s\n   seen walk %s · hunt %s\n🔍 Unknown-luck eggs: %d\n🍀 %s"):format(
+		speedLbl.Text = ("⚙ You: %.2f cells/s\n🎃 Scarecrow (worst case): %.2f cells/s\n   seen walk %s · hunt %s\n🔍 Unknown-luck eggs: %d"):format(
 			O.speed / st.cs, scareCps(st, m.hunting), scareSeen.walk and ("%.2f"):format(scareSeen.walk) or "?",
-			scareSeen.hunt and ("%.2f"):format(scareSeen.hunt) or "?", unknown,
-			#parts > 0 and table.concat(parts, " | ") or "no eggs")
+			scareSeen.hunt and ("%.2f"):format(scareSeen.hunt) or "?", unknown)
 	else
 		scareText = ""; scareLbl.Text = "🎃 Scarecrow: not found"; scareLbl.TextColor3 = COL.scare
 		speedLbl.Text = "⚙ Speeds: scarecrow not found"
@@ -6644,16 +6159,7 @@ bind(UIS.InputBegan, function(i, gp)
 end)
 bind(RunService.Heartbeat, function()
 	local hum = getHum()
-	if hum and (jobRunning or autoOn) then
-		local speed = tonumber(O.speed)
-		if not speed or speed <= 0 then
-			speed = tonumber(getCfg().PlayerSpeed) or 20
-			O.speed = speed
-		end
-		if math.abs(hum.WalkSpeed - speed) > 0.05 then
-			hum.WalkSpeed = speed
-		end
-	end
+	if hum and hum.WalkSpeed ~= O.speed and (jobRunning or autoOn) then hum.WalkSpeed = O.speed end
 end)
 bind(Player.CharacterAdded, function() stopAll("Respawned") end)
 
@@ -6704,5 +6210,5 @@ env.HMV2 = {Destroy = destroy, GetState = getState, Opt = O,
 		moveEgg(best)
 		return "started " .. tostring(best:GetAttribute("ID"))
 	end}
-print("🎃 Halloween Maze v5 loaded" .. (hubMain and " (docked into the hub)" or ""))	
+print("🎃 Halloween Maze v4 loaded" .. (hubMain and " (docked into the hub)" or ""))	
 end)
