@@ -5283,12 +5283,13 @@ end
 end
 
 -- returns "arrived" | "lost" | "cancelled" | "floor"
-local function walk(token, getTarget, stop, label)
+local function walk(token, getTarget, stop, label, shouldInterrupt)
     local s0 = getState()
     local floor0 = s0 and s0.floor
     local ps, lastPos, lastT = {}, nil, os.clock()
     local route, plannedAt, plannedGoal, plannedTarget, activeAim
     local routeCursor = 1
+    local lastInterruptCheck = 0
     while running and token == moveToken do
         local st, root, hum = getState(), getRoot(), getHum()
         if not (st and root and hum) then task.wait(0.15); continue end
@@ -5303,6 +5304,13 @@ local function walk(token, getTarget, stop, label)
         local me, goal = posCell(st, root.Position), posCell(st, tp)
         if not (me and goal) then task.wait(0.15); continue end
         local now = os.clock()
+        if shouldInterrupt and now - lastInterruptCheck >= 0.3 then
+            lastInterruptCheck = now
+            if shouldInterrupt(st, root) then
+                hum:MoveTo(root.Position)
+                return "reconsider"
+            end
+        end
         local routeIndex = route and routeIndexFor(route, me, routeCursor)
         local activeCell = activeAim and posCell(st, activeAim)
         local activeBlocked = false
@@ -5340,7 +5348,9 @@ local function walk(token, getTarget, stop, label)
             hum:MoveTo(aim); activeAim = aim
         end
         if os.clock() - lastT > 1.2 then
-            if lastPos and (root.Position - lastPos).Magnitude < 1 then hum.Jump = true end
+            if lastPos and hdist(root.Position, lastPos) < 1 and activeAim and not activeBlocked then
+                hum:MoveTo(activeAim)
+            end
             lastPos, lastT = root.Position, os.clock()
         end
         task.wait(0.08)
@@ -5558,6 +5568,11 @@ local function pickEgg(st, g, me, allowUnknown)
 	return best
 end
 
+local function hasReachableEgg(st, root)
+    local me = root and posCell(st, root.Position)
+    return me ~= nil and pickEgg(st, grid(st), me, true) ~= nil
+end
+
 -- ───────── egg scouting ─────────
 local scoutTried = setmetatable({}, {__mode = "k"})
 local function scoutEggs(token)
@@ -5649,14 +5664,20 @@ local function autoLoop(token)
 			end
 		end
 		if token ~= moveToken or not autoOn then return end
-		local r = walk(token, exitTarget, EXIT_STOP, "EXIT")
+        local r = walk(token, exitTarget, EXIT_STOP, "EXIT", function(state)
+            return hatchOn and hasReachableEgg(state, getRoot())
+        end)
 		if r == "cancelled" then return end
+        if r == "reconsider" then continue end
 		local t = os.clock()
+        local eggsAppeared = false
 		while running and token == moveToken do
 			local s3 = getState()
 			if not s3 or s3.floor ~= floor or os.clock() - t > 8 then break end
+            if hatchOn and hasReachableEgg(s3, getRoot()) then eggsAppeared = true; break end
 			setStatus("✅ at exit, waiting for next floor..."); task.wait(0.2)
 		end
+        if eggsAppeared then continue end
 		task.wait(0.5)
 	end
 end
