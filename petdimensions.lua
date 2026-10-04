@@ -4981,7 +4981,7 @@ end
 
 -- returns route (starting at `me`), mode, spare seconds on our own cell, ctx
 local function decide(st, g, me, goal, ps, opts)
-    if opts.directGoal and goal ~= me then
+    if opts.directGoal and (goal ~= me or not opts.safetyActive) then
         ps.refuge, ps.advance = nil, nil
         local _, prev = bfsPrev(g, me)
         return pathTo(prev, me, goal), "egg route", nil, nil
@@ -5189,7 +5189,8 @@ local function walk(token, getTarget, stop, label, opts)
 		if atGoal and not opts.onHold then hum:MoveTo(root.Position); return "arrived" end
         local routeIndex = route and routeIndexFor(route, me, routeCursor)
         if routeIndex then routeCursor = routeIndex end
-        local atDirectGoal = opts.directGoal and opts.onHold and goal == me
+        if opts.directGoal then opts.safetyActive = atGoal end
+        local atDirectGoal = opts.directGoal and opts.onHold and atGoal
         local replanInterval = opts.directGoal and (atDirectGoal and 0.35 or math.huge) or 0.35
         local needsPlan = not plannedAt or now - plannedAt >= replanInterval or goal ~= plannedGoal
             or (route and not routeIndex) or (atDirectGoal and routeMode == "egg route")
