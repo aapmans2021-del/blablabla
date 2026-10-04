@@ -4634,7 +4634,7 @@ local COL = {
         bg = Color3.fromRGB(18, 27, 26), card = Color3.fromRGB(31, 44, 40), white = Color3.new(1, 1, 1),
 }
 local AVOID_R, HUNT_R = 5, 7
-local EGG_STOP, EXIT_STOP, CANDY_STOP = 6, 3, 3.5
+local EGG_STOP, EXIT_STOP, CANDY_STOP = 2.25, 3, 3.5
 
 -- ───────── state ─────────
 local running, moveToken, jobRunning = true, 0, false
@@ -4881,10 +4881,12 @@ local function monsterInfo(st)
 			local k = mon.hunting == true and "hunt" or "walk"
 			if v < 30 then scareSeen[k] = math.max(scareSeen[k] or 0, v) end
 		end
-		return a:Lerp(b, f), mon.from, mon.to, mon.hunting == true
+        local direction = b - a
+        if direction.Magnitude > 0.01 then direction = direction.Unit else direction = nil end
+        return a:Lerp(b, f), mon.from, mon.to, mon.hunting == true, direction
 	end
 	local mz = getMaze(); local sc = mz and mz:FindFirstChild("Scarecrow")
-	if sc then return sc:GetPivot().Position, nil, nil, false end
+    if sc then return sc:GetPivot().Position, nil, nil, false, nil end
 end
 
 -- ───────── planning ─────────
@@ -4942,7 +4944,7 @@ local function pathTo(prev, src, dst)
 end
 -- graph distance from the scarecrow (both ends of its current segment) to every cell (cached per cell triple)
 local function danger(st, g)
-	local p, a, b, hunting = monsterInfo(st)
+    local p, a, b, hunting, direction = monsterInfo(st)
 	if not p then return nil end
 	local mc = posCell(st, p) or a
 	if not mc then return nil end
@@ -4962,6 +4964,14 @@ local function danger(st, g)
 				for c, d in pairs(d2) do if d < (dm[c] or 99) then dm[c] = d end end
 			end
 		end
+        if direction then
+            local directional = table.clone(dm)
+            for cell, distance in pairs(dm) do
+                local behind = -(cellPos(st, cell) - p):Dot(direction) / st.cs
+                if behind > 0.25 then directional[cell] = distance + math.min(2, behind * 0.6) end
+            end
+            dm = directional
+        end
 		if g.dmcN > 48 then g.dmc, g.dmcN = {}, 0 end
 		g.dmc[key] = dm; g.dmcN += 1
 	end
@@ -5091,7 +5101,7 @@ local function plan(st, g, me, goal, ps)
 	local dme = dm[me] or 99
 	local sP, sS = speeds(st, hunting, dme)
 	-- 1) can we get to the goal (by any route) staying ahead of the scarecrow? re-checked every tick
-    local route, rsteps, rprev = racePath(g, me, routeGoal, dm, sP, sS, (hunting and 2.0 or 1.2) / sP)
+    local route, rsteps, rprev = racePath(g, me, routeGoal, dm, sP, sS, (hunting and 0.8 or 0.4) / sP)
 	if route then
         ps.waitSince = nil; ps.fleeTo = nil; ps.advanceTo = nil
 		return route, dme <= 10 and "racing" or "normal", dme
@@ -5102,7 +5112,7 @@ local function plan(st, g, me, goal, ps)
         if r then ps.fleeTo = t; ps.advanceTo = nil end
 		return r
 	end
-	if dme / sS <= (hunting and 3.0 or 2.0) then
+    if dme / sS <= (hunting and 1.6 or 1.1) then
 		local r = flee(); if r then return r, "FLEEING", dme end
 	end
 	-- 2b) NEW: scarecrow near the route but not on top of us -> don't stand still, walk to the safe cell
@@ -5290,10 +5300,10 @@ local function walk(token, getTarget, stop, label)
             routeIndex = route and routeIndexFor(route, me, routeCursor)
         end
         if not route or not routeIndex then
-                    routeCursor = routeIndex
             if activeAim then hum:MoveTo(root.Position); activeAim = nil end
             setStatus("⏳ " .. tostring(mode or "no route")); task.wait(0.12); continue
         end
+        routeCursor = routeIndex
         if needsPlan then
             drawRoute(st, route, tp, root.Position.Y, routeIndex)
             setStatus(("→ %s  [%s%s]"):format(label, mode, dme and (" · scarecrow " .. dme) or ""))
@@ -5453,7 +5463,7 @@ local function hatchAt(token, egg, force)
 		if st.floor ~= floor0 then result = "floor"; break end
 		local ep = posOf(egg)
 		if not ep then result = "gone"; break end
-		if hdist(root.Position, ep) > EGG_STOP + 3 then
+        if hdist(root.Position, ep) > EGG_STOP + 0.5 then
 			setAutoHatch(false)
 			local r = walk(token, function() if egg.Parent then return posOf(egg) end end, EGG_STOP, "Egg")
 			if r ~= "arrived" then result = r; break end
@@ -5501,17 +5511,19 @@ local function hatchAt(token, egg, force)
 	return result
 end
 
-local function pickEgg(st, g, me)
+local function pickEgg(st, g, me, allowUnknown)
 	local dm, hunting
 	if avoidOn then dm, hunting = danger(st, g) end
-	local dist = dijkstra(g, me, dm, dm ~= nil, hunting and HUNT_R or AVOID_R)
+    local dist = dijkstra(g, me, dm, false, hunting and HUNT_R or AVOID_R)
 	local best, bs
 	for _, egg in ipairs(getEggs()) do
 		local name = egg:GetAttribute("ID")
         local eggConfig = name and settingsForEgg(name)
         if name and eggConfig.enabled and not rejected[egg] then
 			local mult, left = eggLuck(st, egg)
-            if not ((mult > 0 and mult < eggConfig.minLuck) or (left and left <= 0)) then
+            local oddsKnown = mult > 0
+            if (allowUnknown or oddsKnown or eggConfig.minLuck <= 1)
+                and not ((oddsKnown and mult < eggConfig.minLuck) or (left and left <= 0)) then
 				local p = posOf(egg); local cell = p and posCell(st, p)
 				local d = cell and dist[cell]
 				if d then
@@ -5562,6 +5574,10 @@ local function scoutEggs(token)
 			return cellPos(s, bCell)
 		end, st.cs * 0.3, "Scout")
 		if r == "cancelled" or r == "floor" then return r end
+        if r == "lost" and bEgg.Parent then
+            local latestState = getState()
+            if latestState and eggLuck(latestState, bEgg) > 0 then return "scouted" end
+        end
 		if r == "arrived" then
 			local t = os.clock()
 			while os.clock() - t < 0.7 and bEgg.Parent do
@@ -5571,6 +5587,7 @@ local function scoutEggs(token)
 			end
 			local tried = scoutTried[bEgg]
 			tried[bCell] = true; tried.n += 1
+            return "scouted"
 		end
 	end
 	return "cancelled"
@@ -5583,20 +5600,30 @@ local function autoLoop(token)
 		if not st then task.wait(0.3); continue end
 		local floor = st.floor
 		if candyFirst then
-			if collectCandy(token) == "cancelled" then return end
+            local root = getRoot()
+            local me = root and posCell(st, root.Position)
+            local pendingEgg = hatchOn and me and pickEgg(st, grid(st), me, true)
+            if not pendingEgg and collectCandy(token) == "cancelled" then return end
 		end
 		if hatchOn then
-			if scoutOn and scoutEggs(token) == "cancelled" then return end
 			while running and token == moveToken and autoOn do
 				local s2, root = getState(), getRoot()
 				local me = s2 and root and posCell(s2, root.Position)
 				if not me or s2.floor ~= floor then break end
-				local egg = pickEgg(s2, grid(s2), me)
-				if not egg then break end
-				local r = hatchAt(token, egg, false)
-				if r == "cancelled" then return end
-				if r == "floor" then break end
-				if r == "lost" or r == "gone" or r == "failed" then rejected[egg] = rejected[egg] or r end
+                local egg = pickEgg(s2, grid(s2), me, not scoutOn)
+                if egg then
+                    local r = hatchAt(token, egg, false)
+                    if r == "cancelled" then return end
+                    if r == "floor" then break end
+                    if r == "lost" or r == "gone" or r == "failed" then rejected[egg] = rejected[egg] or r end
+                elseif scoutOn then
+                    local result = scoutEggs(token)
+                    if result == "cancelled" then return end
+                    if result == "scouted" then continue end
+                    break
+                else
+                    break
+                end
 			end
 		end
 		if token ~= moveToken or not autoOn then return end
