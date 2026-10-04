@@ -5327,7 +5327,7 @@ local function walk(token, getTarget, stop, label, shouldInterrupt, pursueGoal)
         local routeInvalid = route ~= nil and routeIndex == nil
         local replanInterval = pursueGoal and 0.75 or 0.35
         local needsPlan = not plannedAt or now - plannedAt >= replanInterval or goal ~= plannedGoal
-            or routeInvalid or activeBlocked or not plannedTarget or hdist(tp, plannedTarget) >= 0.75
+            or routeInvalid or not plannedTarget or hdist(tp, plannedTarget) >= 0.75
         local mode, dme
         if needsPlan then
             route, mode, dme = plan(st, g, me, goal, ps, pursueGoal)
