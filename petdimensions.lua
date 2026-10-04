@@ -5029,6 +5029,9 @@ local function safeFlee(g, me, dm, sP, sS, goal, prevTarget)
 				end
 			end
 		end
+        if prevTarget and prevTarget ~= me and steps[prevTarget] then
+            return pathTo(prev, me, prevTarget), prevTarget
+        end
 		local cand = {}
 		for c, s in pairs(steps) do
 			if c ~= me then
@@ -5054,6 +5057,7 @@ local function plan(st, g, me, goal, ps)
 	local dm, hunting
 	if avoidOn then dm, hunting = danger(st, g) end
 	if not dm then
+        ps.fleeTo, ps.advanceTo, ps.approachTo = nil, nil, nil
 		local _, prev = dijkstra(g, me, nil, false, 0)
 		return pathTo(prev, me, goal), "normal", nil
 	end
@@ -5068,20 +5072,34 @@ local function plan(st, g, me, goal, ps)
                 if not bestScore or score < bestScore then best, bestScore = cell, score end
             end
         end
+        local previous = ps.approachTo
+        local previousAdjacent = false
+        if previous then
+            for _, cell in ipairs(nbrs(g, goal)) do
+                if cell == previous then previousAdjacent = true; break end
+            end
+        end
+        if previousAdjacent and (dm[previous] or 0) > 0 and approachDist[previous] then
+            local previousScore = approachDist[previous] - math.min(dm[previous] or 99, 12) * 0.05
+            if not bestScore or previousScore <= bestScore + 3 then best = previous end
+        end
+        ps.approachTo = best
         if best then routeGoal = best end
+    else
+        ps.approachTo = nil
     end
 	local dme = dm[me] or 99
 	local sP, sS = speeds(st, hunting, dme)
 	-- 1) can we get to the goal (by any route) staying ahead of the scarecrow? re-checked every tick
     local route, rsteps, rprev = racePath(g, me, routeGoal, dm, sP, sS, (hunting and 2.0 or 1.2) / sP)
 	if route then
-		ps.waitSince = nil; ps.fleeTo = nil
+        ps.waitSince = nil; ps.fleeTo = nil; ps.advanceTo = nil
 		return route, dme <= 10 and "racing" or "normal", dme
 	end
 	-- 2) can't win the race: scarecrow close -> retreat to a safe cell that lures it off the goal path
 	local function flee()
         local r, t = safeFlee(g, me, dm, sP, sS, routeGoal, ps.fleeTo)
-		if r then ps.fleeTo = t end
+        if r then ps.fleeTo = t; ps.advanceTo = nil end
 		return r
 	end
 	if dme / sS <= (hunting and 3.0 or 2.0) then
@@ -5093,19 +5111,23 @@ local function plan(st, g, me, goal, ps)
 	if type(rsteps) == "table" then
         local gd = bfsCached(g, routeGoal)
 		local bestC, bestD, bestS = nil, gd[me] or 1e9, nil
-		for c, s in pairs(rsteps) do
-			local d = gd[c]
-			if d and c ~= me and (d < bestD or (d == bestD and bestC and s < bestS)) then bestC, bestD, bestS = c, d, s end
+        if ps.advanceTo and ps.advanceTo ~= me and rsteps[ps.advanceTo] then
+            bestC = ps.advanceTo
+        else
+            for c, s in pairs(rsteps) do
+                local d = gd[c]
+                if d and c ~= me and (d < bestD or (d == bestD and bestC and s < bestS)) then bestC, bestD, bestS = c, d, s end
+            end
 		end
 		if bestC then
 			local r = pathTo(rprev, me, bestC)
-			if r then ps.waitSince = nil; ps.fleeTo = nil; return r, "advancing", dme end
+            if r then ps.advanceTo = bestC; ps.waitSince = nil; ps.fleeTo = nil; return r, "advancing", dme end
 		end
 	end
 	-- 3) NEW: never stand still. No fully safe route and nothing better to advance to -> take the
 	-- soft-cost route (penalises cells near the scarecrow) immediately; re-planned every tick, and the
 	-- flee check above takes over the moment the scarecrow gets close.
-	ps.fleeTo = nil
+    ps.fleeTo, ps.advanceTo = nil, nil
 	local R = hunting and HUNT_R or AVOID_R
 	local _, p2 = dijkstra(g, me, dm, true, R) -- cells right next to the scarecrow blocked
     local r2 = pathTo(p2, me, routeGoal)
@@ -5124,11 +5146,13 @@ local function clearPath()
 	for _, s in ipairs(segs) do s.Transparency = 1 end
 	lastRoute = nil
 end
-local function drawRoute(st, route, tp, y)
+local function drawRoute(st, route, tp, y, firstIndex)
 	local pts = {}
 	local root = getRoot()
 	if root then pts[1] = Vector3.new(root.Position.X, y, root.Position.Z) end
-	for _, c in ipairs(route) do local p = cellPos(st, c); pts[#pts + 1] = Vector3.new(p.X, y, p.Z) end
+    for i = firstIndex or 1, #route do
+        local p = cellPos(st, route[i]); pts[#pts + 1] = Vector3.new(p.X, y, p.Z)
+    end
 	if tp then pts[#pts + 1] = Vector3.new(tp.X, y, tp.Z) end
 	local k = 0
 	for i = 1, #pts - 1 do
@@ -5192,67 +5216,104 @@ local function refreshESP()
 end
 
 -- ───────── movement ─────────
-local function aimPoint(st, route, root, tp)
-    if #route == 1 then
+local function aimPoint(st, route, root, tp, routeIndex)
+    local first = routeIndex or 1
+    if #route - first < 1 then
         local targetCell = posCell(st, tp)
-        local p = targetCell == route[1] and tp or cellPos(st, route[1])
+        local p = targetCell == route[first] and tp or cellPos(st, route[first])
         return Vector3.new(p.X, root.Position.Y, p.Z)
     end
-	local p2 = cellPos(st, route[2])
-	if #route >= 3 then
-		local a, b, c = route[1], route[2], route[3]
-		if b - a == c - b then
-			local lateral = (math.abs(b - a) == 1) and math.abs(root.Position.Z - p2.Z) or math.abs(root.Position.X - p2.X)
-			if lateral < 3 then p2 = cellPos(st, route[3]) end
-		end
-	end
-	return Vector3.new(p2.X, root.Position.Y, p2.Z)
+    local nextIndex = first + 1
+    local direction = route[nextIndex] - route[first]
+    local targetIndex = nextIndex
+    for i = nextIndex + 1, math.min(#route, nextIndex + 7) do
+        if route[i] - route[i - 1] ~= direction then break end
+        targetIndex = i
+    end
+    if targetIndex == #route and posCell(st, tp) == route[targetIndex] then
+        return Vector3.new(tp.X, root.Position.Y, tp.Z)
+    end
+    local p = cellPos(st, route[targetIndex])
+    if targetIndex > nextIndex then
+        local lateral = (math.abs(direction) == 1) and math.abs(root.Position.Z - p.Z) or math.abs(root.Position.X - p.X)
+        local laneMargin = math.max(st.cs * 0.5 - 2.25, 0.5)
+        if lateral <= laneMargin then
+            if math.abs(direction) == 1 then p = Vector3.new(p.X, p.Y, root.Position.Z)
+            else p = Vector3.new(root.Position.X, p.Y, p.Z) end
+        end
+    end
+    return Vector3.new(p.X, root.Position.Y, p.Z)
+end
+
+    local function routeIndexFor(route, cell, firstIndex)
+        for i = firstIndex or 1, #route do
+            local routeCell = route[i]
+        if routeCell == cell then return i end
+    end
+    return nil
 end
 
 -- returns "arrived" | "lost" | "cancelled" | "floor"
 local function walk(token, getTarget, stop, label)
-	local s0 = getState()
-	local floor0 = s0 and s0.floor
+    local s0 = getState()
+    local floor0 = s0 and s0.floor
     local ps, lastPos, lastT = {}, nil, os.clock()
-    local route, plannedAt, plannedMe, plannedGoal, plannedTarget, activeAim
-	while running and token == moveToken do
-		local st, root, hum = getState(), getRoot(), getHum()
-		if not (st and root and hum) then task.wait(0.15); continue end
-		if st.floor ~= floor0 then return "floor" end
-		local tp = getTarget(st)
-		if not tp then return "lost" end
-		if hdist(root.Position, tp) <= stop then hum:MoveTo(root.Position); return "arrived" end
-		local g = grid(st)
-		local me, goal = posCell(st, root.Position), posCell(st, tp)
-		if not (me and goal) then task.wait(0.15); continue end
+    local route, plannedAt, plannedGoal, plannedTarget, activeAim
+    local routeCursor = 1
+    while running and token == moveToken do
+        local st, root, hum = getState(), getRoot(), getHum()
+        if not (st and root and hum) then task.wait(0.15); continue end
+        if st.floor ~= floor0 then return "floor" end
+        local tp = getTarget(st)
+        if not tp then return "lost" end
+        if hdist(root.Position, tp) <= stop then hum:MoveTo(root.Position); return "arrived" end
+        local g = grid(st)
+        local me, goal = posCell(st, root.Position), posCell(st, tp)
+        if not (me and goal) then task.wait(0.15); continue end
         local now = os.clock()
-        local needsPlan = not plannedAt or now - plannedAt >= 0.25 or me ~= plannedMe or goal ~= plannedGoal
-            or not plannedTarget or hdist(tp, plannedTarget) >= 0.75
+        local routeIndex = route and routeIndexFor(route, me, routeCursor)
+        local activeCell = activeAim and posCell(st, activeAim)
+        local activeBlocked = false
+        if avoidOn and activeCell then
+            local monsterPosition = monsterInfo(st)
+            local monsterCell = monsterPosition and posCell(st, monsterPosition)
+            activeBlocked = monsterCell == activeCell
+        end
+        local routeInvalid = route ~= nil and routeIndex == nil
+        local needsPlan = not plannedAt or now - plannedAt >= 0.35 or goal ~= plannedGoal
+            or routeInvalid or activeBlocked or not plannedTarget or hdist(tp, plannedTarget) >= 0.75
         local mode, dme
         if needsPlan then
             route, mode, dme = plan(st, g, me, goal, ps)
-            plannedAt, plannedMe, plannedGoal, plannedTarget = now, me, goal, tp
+            plannedAt, plannedGoal, plannedTarget = now, goal, tp
+            routeCursor = 1
+            routeIndex = route and routeIndexFor(route, me, routeCursor)
         end
-		if not route then
+        if not route or not routeIndex then
+                    routeCursor = routeIndex
             if activeAim then hum:MoveTo(root.Position); activeAim = nil end
             setStatus("⏳ " .. tostring(mode or "no route")); task.wait(0.12); continue
-		end
+        end
         if needsPlan then
-            drawRoute(st, route, tp, root.Position.Y)
+            drawRoute(st, route, tp, root.Position.Y, routeIndex)
             setStatus(("→ %s  [%s%s]"):format(label, mode, dme and (" · scarecrow " .. dme) or ""))
         end
         if hum.WalkSpeed ~= desiredSpeed then hum.WalkSpeed = desiredSpeed end
-        local aim = aimPoint(st, route, root, tp)
+        local aim = aimPoint(st, route, root, tp, routeIndex)
+        local activeIndex = activeCell and routeIndexFor(route, activeCell, routeIndex)
+        local activeStillValid = activeAim and activeIndex and activeIndex > routeIndex
+            and hdist(root.Position, activeAim) > st.cs * 0.35 and not activeBlocked
+        if activeStillValid then aim = activeAim end
         if not activeAim or (aim - activeAim).Magnitude >= 0.75 then
             hum:MoveTo(aim); activeAim = aim
         end
-		if os.clock() - lastT > 1.2 then
-			if lastPos and (root.Position - lastPos).Magnitude < 1 then hum.Jump = true end
-			lastPos, lastT = root.Position, os.clock()
-		end
-		task.wait(0.08)
-	end
-	return "cancelled"
+        if os.clock() - lastT > 1.2 then
+            if lastPos and (root.Position - lastPos).Magnitude < 1 then hum.Jump = true end
+            lastPos, lastT = root.Position, os.clock()
+        end
+        task.wait(0.08)
+    end
+    return "cancelled"
 end
 
 local candyIgnore = setmetatable({}, {__mode = "k"})
@@ -5315,36 +5376,64 @@ end
 local function escape(token)
 	local t0 = os.clock()
 	local ps = {}
+    local route, fleeGoal, plannedAt, routeCursor, activeAim
+    routeCursor = 1
 	while running and token == moveToken and os.clock() - t0 < 40 do
 		local st, root, hum = getState(), getRoot(), getHum()
 		local me = st and root and posCell(st, root.Position)
 		if not (me and hum) then task.wait(0.2); continue end
 		local g = grid(st)
-		local dm, hunting = danger(st, g)
+        local dm, hunting = danger(st, g)
 		if not dm then return true end
 		if (dm[me] or 99) >= (hunting and 10 or 8) then return true end
-		local sP, sS = speeds(st, hunting, dm[me])
-		local route, best = safeFlee(g, me, dm, sP, sS, nil, ps.fleeTo)
-		if route then ps.fleeTo = best
-		else
-			local dist, prev = dijkstra(g, me, dm, false, hunting and HUNT_R or AVOID_R)
-			local bs
-			for c, d in pairs(dist) do
-				if d <= 18 then
-					local s = (dm[c] or 99) - d * 0.3
-					if not bs or s > bs then best, bs = c, s end
-				end
-			end
-			route = (best and best ~= me) and pathTo(prev, me, best) or nil
-		end
-		if route and best then
-			local tp = cellPos(st, best)
-			drawRoute(st, route, tp, root.Position.Y)
-			setStatus("🏃 escaping scarecrow · " .. (dm[me] or 99) .. " cells")
-			hum.WalkSpeed = desiredSpeed
-			hum:MoveTo(aimPoint(st, route, root, tp))
-		end
-		task.wait(0.1)
+        local now = os.clock()
+        local routeIndex = route and routeIndexFor(route, me, routeCursor)
+        local activeCell = activeAim and posCell(st, activeAim)
+        local activeBlocked = activeCell and (dm[activeCell] or 99) == 0
+        local needsPlan = not plannedAt or now - plannedAt >= 0.3 or not routeIndex or activeBlocked
+        if needsPlan then
+            local sP, sS = speeds(st, hunting, dm[me])
+            local nextRoute, best = safeFlee(g, me, dm, sP, sS, nil, ps.fleeTo)
+            if not nextRoute then
+                local dist, prev = dijkstra(g, me, dm, false, hunting and HUNT_R or AVOID_R)
+                local bestScore
+                if ps.fleeTo and ps.fleeTo ~= me and dist[ps.fleeTo] and dist[ps.fleeTo] <= 18 then
+                    best = ps.fleeTo
+                    bestScore = (dm[best] or 99) - dist[best] * 0.3
+                end
+                for cell, distance in pairs(dist) do
+                    if distance <= 18 then
+                        local score = (dm[cell] or 99) - distance * 0.3
+                        if not bestScore or score > bestScore then best, bestScore = cell, score end
+                    end
+                end
+                nextRoute = (best and best ~= me) and pathTo(prev, me, best) or nil
+            end
+            route, fleeGoal, plannedAt = nextRoute, best, now
+            routeCursor = 1
+            routeIndex = route and routeIndexFor(route, me, routeCursor)
+            if route and fleeGoal then ps.fleeTo = fleeGoal end
+        end
+        if not route or not routeIndex or not fleeGoal then
+            if activeAim then hum:MoveTo(root.Position); activeAim = nil end
+            task.wait(0.1); continue
+        end
+        routeCursor = routeIndex
+        local tp = cellPos(st, fleeGoal)
+        local aim = aimPoint(st, route, root, tp, routeIndex)
+        local activeIndex = activeCell and routeIndexFor(route, activeCell, routeIndex)
+        local activeStillValid = activeAim and activeIndex and activeIndex > routeIndex
+            and hdist(root.Position, activeAim) > st.cs * 0.35 and not activeBlocked
+        if activeStillValid then aim = activeAim end
+        if hum.WalkSpeed ~= desiredSpeed then hum.WalkSpeed = desiredSpeed end
+        if needsPlan then
+            drawRoute(st, route, tp, root.Position.Y, routeIndex)
+            setStatus("🏃 escaping scarecrow · " .. (dm[me] or 99) .. " cells")
+        end
+        if not activeAim or (aim - activeAim).Magnitude >= 0.75 then
+            hum:MoveTo(aim); activeAim = aim
+        end
+        task.wait(0.08)
 	end
 	return false
 end
