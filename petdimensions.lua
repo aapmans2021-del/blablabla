@@ -621,83 +621,6 @@ pcall(function()
             return
         end
 
-        local kind = tostring(attack.kind)
-        if kind ~= "slam" and kind ~= "barrage" and kind ~= "sweep" and kind ~= "leap" and kind ~= "land" then
-            return
-        end
-
-        local now = os.clock()
-        local windup = tonumber(attack.windup) or 0
-        local duration
-
-        if kind == "sweep" then
-            duration = windup + math.max(0.05, tonumber(attack.seconds) or 2) + 0.35
-        elseif kind == "leap" then
-            duration = windup + math.max(0, tonumber(attack.air) or 1) + 0.7
-        elseif kind == "land" then
-            duration = 0.9
-        else
-            duration = windup + 0.8
-        end
-
-        ExpeditionAttackSequence += 1
-        table.insert(ExpeditionActiveAttacks, {
-            kind = kind,
-            at = attack.at,
-            radius = attack.radius,
-            length = attack.length,
-            width = attack.width,
-            clear = attack.clear,
-            start = attack.start,
-            arc = attack.arc,
-            windup = windup,
-            seconds = attack.seconds,
-            started = now,
-            expires = now + duration,
-            sequence = ExpeditionAttackSequence,
-        })
-        ExpeditionDodgeUntil = math.max(ExpeditionDodgeUntil, now + duration)
-    end)
-end)
-
--- Continuously maintain the safe position while an attack is active. This
--- is intentionally independent from the visible FX folder.
-task.spawn(function()
-    while true do
-        task.wait(0.025)
-
-        local now = os.clock()
-        for i = #ExpeditionActiveAttacks, 1, -1 do
-            local attack = ExpeditionActiveAttacks[i]
-            if not attack or attack.expires <= now then
-                table.remove(ExpeditionActiveAttacks, i)
-            end
-        end
-
-        if not AutoFarmExpedition or not ExpeditionDodgeEnabled or #ExpeditionActiveAttacks == 0 then
-            if ExpeditionDodgeActive then
-                EndExpeditionDodge()
-            end
-            continue
-        end
-
-        local character = localPlayer.Character
-        local hrp = character and character:FindFirstChild("HumanoidRootPart")
-        if not hrp then
-            EndExpeditionDodge()
-            continue
-        end
-
-        -- Before the telegraph resolves, we can wait. Once the player's
-        -- current position becomes dangerous, move immediately to a safe
-        -- point inside the combat radius.
-        if not IsPointDangerous(hrp.Position, now) then
-            if ExpeditionDodgeActive and now >= ExpeditionDodgeUntil then
-                EndExpeditionDodge()
-            end
-            continue
-        end
-
         if not ExpeditionDodgeActive then
             BeginExpeditionDodge()
         else
@@ -985,417 +908,6 @@ task.spawn(function()
             end)
 
             local pets = GetAllEquippedPetUIDs()
-            for _, petUid in ipairs(pets) do
-                pcall(function()
-                    Library.Network.Fire("Farm Coin", CurrentCometId, petUid)
-                end)
-            end
-        end
-        task.wait(0.05)
-    end
-end)
-
--- Fast attack loop
-task.spawn(function()
-    while true do
-        if FastAttackSpeed then
-            local targetId = nil
-            if AutoFarmComet then
-                targetId = CurrentCometId
-            elseif AutoFarmHackerBoss then
-                targetId = CurrentHackerBossId
-            elseif AutoFarmExpedition then
-                targetId = CurrentExpeditionTargetId
-            elseif AutoFarmRobot or AutoFarmTurkey then
-                targetId = CurrentTargetId
-            end
-
-            if targetId then
-                if DamageRemote then
-                    pcall(function()
-                        DamageRemote:FireServer(targetId)
-                    end)
-                end
-
-                local pets = GetAllEquippedPetUIDs()
-                for _, petUid in ipairs(pets) do
-                    pcall(function()
-                        Library.Network.Fire("Farm Coin", targetId, petUid)
-                    end)
-                end
-            end
-        end
-        task.wait(FastAttackInterval)
-    end
-end)
-
--- Expedition Auto Farm Loop
--- Picks a random living expedition mob, selects/taps it, and sends the
--- equipped pets once. Damage/Fast Attack can then keep hitting the target.
-task.spawn(function()
-    while true do
-        task.wait(0.15)
-
-        if AutoFarmExpedition and localPlayer:GetAttribute("ExpeditionRun") then
-            if not CurrentExpeditionTarget or not IsExpeditionMob(CurrentExpeditionTarget) then
-                CurrentExpeditionTarget = FindRandomExpeditionMob(CurrentExpeditionTarget)
-                CurrentExpeditionTargetId = CurrentExpeditionTarget
-                    and tostring(CurrentExpeditionTarget:GetAttribute("ID"))
-                    or nil
-                LastExpeditionPetSendTarget = nil
-            end
-
-            if CurrentExpeditionTarget and IsExpeditionMob(CurrentExpeditionTarget) then
-                local targetId = tostring(CurrentExpeditionTarget:GetAttribute("ID"))
-                CurrentExpeditionTargetId = targetId
-
-                pcall(function()
-                    Library.Signal.Fire("Select Coin", CurrentExpeditionTarget)
-                end)
-
-                -- Same original pet-send sequence as robots/turkey, once per
-                -- individual expedition mob.
-                if LastExpeditionPetSendTarget ~= CurrentExpeditionTarget then
-                    local myPets = GetAllEquippedPetUIDs()
-                    if #myPets > 0 then
-                        pcall(function()
-                            Library.Network.Invoke("Join Coin", targetId, myPets)
-                        end)
-
-                        for _, petUid in ipairs(myPets) do
-                            pcall(function()
-                                Library.Network.Fire("Change Pet Target", petUid, "Coin", targetId)
-                            end)
-                        end
-
-                        LastExpeditionPetSendTarget = CurrentExpeditionTarget
-                    end
-                end
-            else
-                CurrentExpeditionTarget = nil
-                CurrentExpeditionTargetId = nil
-                LastExpeditionPetSendTarget = nil
-            end
-        else
-            CurrentExpeditionTarget = nil
-            CurrentExpeditionTargetId = nil
-            LastExpeditionPetSendTarget = nil
-        end
-    end
-end)
-
--- Expedition damage uses the same target as the normal mob farm.
-task.spawn(function()
-    while true do
-        task.wait(0.05)
-        if AutoFarmExpedition and CurrentExpeditionTargetId
-            and localPlayer:GetAttribute("ExpeditionRun") then
-            pcall(function()
-                if DamageRemote then
-                    DamageRemote:FireServer(CurrentExpeditionTargetId)
-                end
-            end)
-        end
-    end
-end)
-
--- EXPEDITION ATTACK DODGE
--- Keep the player close enough that expedition mobs can still target them.
--- The expedition source does not expose a numeric arena radius, so the dodge
--- uses a conservative target-relative radius instead of making large jumps.
-local function GetSafeExpeditionDodgeCFrame(hrp, targetPosition)
-    local offset = hrp.Position - targetPosition
-    local flatOffset = Vector3.new(offset.X, 0, offset.Z)
-
-    if flatOffset.Magnitude < 0.5 then
-        flatOffset = Vector3.new(hrp.CFrame.RightVector.X, 0, hrp.CFrame.RightVector.Z)
-    end
-
-    if flatOffset.Magnitude < 0.05 then
-        flatOffset = Vector3.new(1, 0, 0)
-    end
-
-    local radial = flatOffset.Unit
-    local perpendicular = Vector3.new(-radial.Z, 0, radial.X)
-
-    -- Alternate sides so repeated attacks do not send the player farther away.
-    if math.random(0, 1) == 0 then
-        perpendicular = -perpendicular
-    end
-
-    local candidate = targetPosition + perpendicular * ExpeditionDodgeRadius
-
-    -- Put the player on actual ground. This prevents the dodge from placing
-    -- the HumanoidRootPart in mid-air and falling through the expedition map.
-    local rayParams = RaycastParams.new()
-    rayParams.FilterType = Enum.RaycastFilterType.Exclude
-    rayParams.FilterDescendantsInstances = {localPlayer.Character, CurrentExpeditionTarget}
-    rayParams.IgnoreWater = true
-
-    local rayOrigin = candidate + Vector3.new(0, 60, 0)
-    local rayResult = Workspace:Raycast(rayOrigin, Vector3.new(0, -140, 0), rayParams)
-    if rayResult then
-        candidate = rayResult.Position + Vector3.new(0, 3, 0)
-    else
-        -- If no floor was found, do not perform the teleport at all.
-        return nil
-    end
-
-    -- Final safety check: never place the player farther than the combat radius.
-    local finalOffset = Vector3.new(candidate.X - targetPosition.X, 0, candidate.Z - targetPosition.Z)
-    if finalOffset.Magnitude > ExpeditionMaxCombatRadius then
-        candidate = targetPosition + finalOffset.Unit * ExpeditionMaxCombatRadius
-        local floorCheck = Workspace:Raycast(candidate + Vector3.new(0, 60, 0), Vector3.new(0, -140, 0), rayParams)
-        if not floorCheck then
-            return nil
-        end
-        candidate = floorCheck.Position + Vector3.new(0, 3, 0)
-    end
-
-    return CFrame.new(candidate, Vector3.new(targetPosition.X, candidate.Y, targetPosition.Z))
-end
-
-task.spawn(function()
-    while true do
-        task.wait(0.05)
-
-        if AutoFarmExpedition then
-            local character = localPlayer.Character
-            local hrp = character and character:FindFirstChild("HumanoidRootPart")
-            local fxFolder = Workspace:FindFirstChild("__AUTUMNBOSS_FX")
-
-            if hrp and CurrentExpeditionTarget and CurrentExpeditionTarget.Parent and fxFolder and #fxFolder:GetChildren() > 0 then
-                if not ExpeditionIsEvading then
-                    local targetPart = CurrentExpeditionTarget:FindFirstChild("Coin")
-                    local targetPosition = targetPart and targetPart.Position or CurrentExpeditionTarget:GetPivot().Position
-                    local safeDodge = GetSafeExpeditionDodgeCFrame(hrp, targetPosition)
-
-                    if safeDodge then
-                        ExpeditionIsEvading = true
-                        ExpeditionSavedCFrame = hrp.CFrame
-                        hrp.CFrame = safeDodge
-                    end
-                end
-            elseif ExpeditionIsEvading and hrp then
-                ExpeditionIsEvading = false
-                if ExpeditionSavedCFrame then
-                    hrp.CFrame = ExpeditionSavedCFrame
-                end
-                ExpeditionSavedCFrame = nil
-            end
-        elseif ExpeditionIsEvading then
-            local character = localPlayer.Character
-            local hrp = character and character:FindFirstChild("HumanoidRootPart")
-            if hrp and ExpeditionSavedCFrame then
-                hrp.CFrame = ExpeditionSavedCFrame
-            end
-            ExpeditionIsEvading = false
-            ExpeditionSavedCFrame = nil
-        end
-    end
-end)
-
-
--- Hacker Boss Auto Farm Loop
--- Uses the same coin selection / Join Coin / Change Pet Target sequence
--- as the other auto farms, targeting the live Hacker Prime boss coin.
-task.spawn(function()
-    while true do
-        task.wait(0.15)
-
-        if AutoFarmHackerBoss then
-            if not CurrentHackerBoss or not CurrentHackerBoss.Parent then
-                CurrentHackerBoss = FindHackerBoss()
-                CurrentHackerBossId = CurrentHackerBoss and tostring(CurrentHackerBoss:GetAttribute("ID")) or nil
-            end
-
-            if CurrentHackerBoss and CurrentHackerBoss.Parent then
-                CurrentHackerBossId = tostring(CurrentHackerBoss:GetAttribute("ID"))
-                FocusPetsContinuous(CurrentHackerBoss)
-            else
-                CurrentHackerBoss = nil
-                CurrentHackerBossId = nil
-            end
-        else
-            CurrentHackerBoss = nil
-            CurrentHackerBossId = nil
-        end
-    end
-end)
-
--- Main Auto Farm Loop
-task.spawn(function()
-    while true do
-        task.wait(0.15)
-        if AutoFarmRobot then
-            if not CurrentTarget or not CurrentTarget.Parent then
-                CurrentTarget = GetNextRobot()
-            end
-            if CurrentTarget and CurrentTarget.Parent then
-                CurrentTargetId = tostring(CurrentTarget:GetAttribute("ID"))
-                FocusPetsContinuous(CurrentTarget)
-            else
-                CurrentTargetId = nil
-            end
-        else
-            if not AutoFarmTurkey then
-                CurrentTarget = nil
-                CurrentTargetId = nil
-            end
-        end
-        
-        if AutoFarmTurkey then
-            if not CurrentTarget or not CurrentTarget.Parent then
-                CurrentTarget = FindTurkey()
-            end
-            if CurrentTarget and CurrentTarget.Parent then
-                CurrentTargetId = tostring(CurrentTarget:GetAttribute("ID"))
-                FocusPetsContinuous(CurrentTarget)
-            else
-                CurrentTargetId = nil
-            end
-        else
-            if not AutoFarmRobot then
-                CurrentTarget = nil
-                CurrentTargetId = nil
-            end
-        end
-    end
-end)
-
--- Damage Spam Loop
-task.spawn(function()
-    while true do
-        task.wait(0.05)
-        if CurrentTargetId and DamageRemote and (AutoFarmRobot or AutoFarmTurkey) then
-            pcall(function()
-                DamageRemote:FireServer(CurrentTargetId)
-            end)
-        end
-    end
-end)
-
--- Hacker Boss damage loop
-task.spawn(function()
-    while true do
-        task.wait(0.05)
-        if AutoFarmHackerBoss and CurrentHackerBossId and DamageRemote then
-            pcall(function()
-                DamageRemote:FireServer(CurrentHackerBossId)
-            end)
-        end
-    end
-end)
-
--- GENERIC CLOSEST-COIN FARM
--- Target scanning is deliberately separated from attacking. This keeps the
--- expensive Workspace scan from running at the same rate as the hit remotes.
-local ClosestCoinScanInterval = 0.10
-local ClosestCoinHitInterval = 0.05
-local CachedEquippedPets = {}
-local CachedPetsRefreshAt = 0
-local LastCoinInteractionTarget = nil
-local LastCoinTeleportTarget = nil
-
-local function RefreshCachedEquippedPets(force)
-    local now = os.clock()
-    if not force and now < CachedPetsRefreshAt then
-        return CachedEquippedPets
-    end
-
-    local pets = {}
-    pcall(function()
-        pets = GetAllEquippedPetUIDs()
-    end)
-
-    CachedEquippedPets = pets or {}
-    CachedPetsRefreshAt = now + 0.50
-    return CachedEquippedPets
-end
-
--- Find and select the target at a lower rate than the actual attack loop.
-task.spawn(function()
-    while true do
-        if AutoTap or AutoTeleportClosestCoin then
-            local previous = CurrentCoinTarget
-            local target = FindClosestCoin(previous)
-
-            if target and target.Parent then
-                local targetId = target:GetAttribute("ID")
-                if targetId ~= nil then
-                    targetId = tostring(targetId)
-                    local changed = target ~= CurrentCoinTarget
-
-                    CurrentCoinTarget = target
-                    CurrentCoinTargetId = targetId
-
-                    -- Selection is only sent when the target changes. Sending
-                    -- it every frame is unnecessary and causes extra client work.
-                    if changed or LastCoinInteractionTarget ~= target then
-                        pcall(function()
-                            Library.Signal.Fire("Select Coin", target)
-                        end)
-                        LastCoinInteractionTarget = target
-
-                        if AutoTap then
-                            local pets = RefreshCachedEquippedPets(true)
-                            if #pets > 0 then
-                                pcall(function()
-                                    Library.Network.Invoke("Join Coin", targetId, pets)
-                                end)
-
-                                for _, petUid in ipairs(pets) do
-                                    pcall(function()
-                                        Library.Network.Fire("Change Pet Target", petUid, "Coin", targetId)
-                                    end)
-                                end
-                            end
-                        end
-                    end
-
-                    -- Teleport only when the target changes instead of
-                    -- repeatedly setting CFrame every frame.
-                    if AutoTeleportClosestCoin and (changed or LastCoinTeleportTarget ~= target) then
-                        TeleportToClosestCoin(target)
-                        LastCoinTeleportTarget = target
-                    elseif not AutoTeleportClosestCoin then
-                        LastCoinTeleportTarget = nil
-                    end
-                else
-                    ResetCoinTarget()
-                    LastCoinInteractionTarget = nil
-                    LastCoinTeleportTarget = nil
-                end
-            else
-                ResetCoinTarget()
-                LastCoinInteractionTarget = nil
-                LastCoinTeleportTarget = nil
-            end
-        else
-            ResetCoinTarget()
-            LastCoinInteractionTarget = nil
-            LastCoinTeleportTarget = nil
-        end
-
-        task.wait(ClosestCoinScanInterval)
-    end
-end)
-
--- Dedicated hit loop. It uses the same direct damage/Farm Coin calls as the
--- existing Expedition/Turkey/Comet attack paths, but avoids rebuilding the
--- pet list on every hit.
-task.spawn(function()
-    while true do
-        if AutoTap and CurrentCoinTargetId then
-            local targetId = CurrentCoinTargetId
-            local pets = RefreshCachedEquippedPets(false)
-
-            if DamageRemote then
-                pcall(function()
-                    DamageRemote:FireServer(targetId)
-                end)
-            end
-
             for _, petUid in ipairs(pets) do
                 pcall(function()
                     Library.Network.Fire("Farm Coin", targetId, petUid)
@@ -5147,16 +4659,21 @@ local function decide(st, g, me, goal, ps, opts)
 		ps.refuge, ps.advance, ps.slip, ps.blocked, ps.fleeing = nil, nil, false, nil, false
 		return bfsAvoiding(g, me, goal, ps.blockedEdges), "clear", nil, nil
 	end
-	do
-		local liveRoute, reachesGoal, spare = timeAwareRoute(g, me, goal, ctx, ps.blockedEdges)
+	-- Prefer a route that is safe for its whole duration. Do not return a
+	-- one-cell "wait" result here: doing that made all recovery logic below
+	-- unreachable, so one moving scarecrow could permanently strand the bot.
+	local liveRoute, reachesGoal, spare = timeAwareRoute(g, me, goal, ctx, ps.blockedEdges)
+	if reachesGoal then
 		ps.refuge, ps.advance, ps.retreat, ps.slip, ps.blocked, ps.fleeing = nil, nil, nil, false, nil, false
-		if reachesGoal then return liveRoute, "TIMED ROUTE", spare, ctx end
-		if #liveRoute > 1 then return liveRoute, "REPOSITIONING", spare, ctx end
-		-- A physical nudge can have marked the only exit edge as blocked.  Do
-		-- not let that stale local memory turn into a manual Auto restart.
-		ps.blockedEdges = {}
-		return liveRoute, "WAITING FOR OPENING", spare, ctx
+		return liveRoute, "TIMED ROUTE", spare, ctx
 	end
+	if #liveRoute > 1 then
+		ps.refuge, ps.advance, ps.retreat, ps.slip, ps.blocked, ps.fleeing = nil, nil, nil, false, nil, false
+		return liveRoute, "REPOSITIONING", spare, ctx
+	end
+	-- No fully-safe forward step right now. Fall through to the conservative
+	-- refuge / escape / slip planner instead of treating the scarecrow as a
+	-- permanent obstacle. Expired blocked edges are cleaned by walk().
 
 	local stay, enter = opts.stay or STAY_SLACK, opts.enter or 0
 	local s0 = slack(ctx, me, 0)
@@ -6432,3 +5949,490 @@ env.HMV2 = {Destroy = destroy, GetState = getState, Opt = O,
 	end}
 print("🎃 Halloween Maze v4 loaded" .. (hubMain and " (docked into the hub)" or ""))	
 end)
+                    Library.Network.Fire("Farm Coin", CurrentCometId, petUid)
+                end)
+            end
+        end
+        task.wait(0.05)
+    end
+end)
+
+-- Fast attack loop
+task.spawn(function()
+    while true do
+        if FastAttackSpeed then
+            local targetId = nil
+            if AutoFarmComet then
+                targetId = CurrentCometId
+            elseif AutoFarmHackerBoss then
+                targetId = CurrentHackerBossId
+            elseif AutoFarmExpedition then
+                targetId = CurrentExpeditionTargetId
+            elseif AutoFarmRobot or AutoFarmTurkey then
+                targetId = CurrentTargetId
+            end
+
+            if targetId then
+                if DamageRemote then
+                    pcall(function()
+                        DamageRemote:FireServer(targetId)
+                    end)
+                end
+
+                local pets = GetAllEquippedPetUIDs()
+                for _, petUid in ipairs(pets) do
+                    pcall(function()
+                        Library.Network.Fire("Farm Coin", targetId, petUid)
+                    end)
+                end
+            end
+        end
+        task.wait(FastAttackInterval)
+    end
+end)
+
+-- Expedition Auto Farm Loop
+-- Picks a random living expedition mob, selects/taps it, and sends the
+-- equipped pets once. Damage/Fast Attack can then keep hitting the target.
+task.spawn(function()
+    while true do
+        task.wait(0.15)
+
+        if AutoFarmExpedition and localPlayer:GetAttribute("ExpeditionRun") then
+            if not CurrentExpeditionTarget or not IsExpeditionMob(CurrentExpeditionTarget) then
+                CurrentExpeditionTarget = FindRandomExpeditionMob(CurrentExpeditionTarget)
+                CurrentExpeditionTargetId = CurrentExpeditionTarget
+                    and tostring(CurrentExpeditionTarget:GetAttribute("ID"))
+                    or nil
+                LastExpeditionPetSendTarget = nil
+            end
+
+            if CurrentExpeditionTarget and IsExpeditionMob(CurrentExpeditionTarget) then
+                local targetId = tostring(CurrentExpeditionTarget:GetAttribute("ID"))
+                CurrentExpeditionTargetId = targetId
+
+                pcall(function()
+                    Library.Signal.Fire("Select Coin", CurrentExpeditionTarget)
+                end)
+
+                -- Same original pet-send sequence as robots/turkey, once per
+                -- individual expedition mob.
+                if LastExpeditionPetSendTarget ~= CurrentExpeditionTarget then
+                    local myPets = GetAllEquippedPetUIDs()
+                    if #myPets > 0 then
+                        pcall(function()
+                            Library.Network.Invoke("Join Coin", targetId, myPets)
+                        end)
+
+                        for _, petUid in ipairs(myPets) do
+                            pcall(function()
+                                Library.Network.Fire("Change Pet Target", petUid, "Coin", targetId)
+                            end)
+                        end
+
+                        LastExpeditionPetSendTarget = CurrentExpeditionTarget
+                    end
+                end
+            else
+                CurrentExpeditionTarget = nil
+                CurrentExpeditionTargetId = nil
+                LastExpeditionPetSendTarget = nil
+            end
+        else
+            CurrentExpeditionTarget = nil
+            CurrentExpeditionTargetId = nil
+            LastExpeditionPetSendTarget = nil
+        end
+    end
+end)
+
+-- Expedition damage uses the same target as the normal mob farm.
+task.spawn(function()
+    while true do
+        task.wait(0.05)
+        if AutoFarmExpedition and CurrentExpeditionTargetId
+            and localPlayer:GetAttribute("ExpeditionRun") then
+            pcall(function()
+                if DamageRemote then
+                    DamageRemote:FireServer(CurrentExpeditionTargetId)
+                end
+            end)
+        end
+    end
+end)
+
+-- EXPEDITION ATTACK DODGE
+-- Keep the player close enough that expedition mobs can still target them.
+-- The expedition source does not expose a numeric arena radius, so the dodge
+-- uses a conservative target-relative radius instead of making large jumps.
+local function GetSafeExpeditionDodgeCFrame(hrp, targetPosition)
+    local offset = hrp.Position - targetPosition
+    local flatOffset = Vector3.new(offset.X, 0, offset.Z)
+
+    if flatOffset.Magnitude < 0.5 then
+        flatOffset = Vector3.new(hrp.CFrame.RightVector.X, 0, hrp.CFrame.RightVector.Z)
+    end
+
+    if flatOffset.Magnitude < 0.05 then
+        flatOffset = Vector3.new(1, 0, 0)
+    end
+
+    local radial = flatOffset.Unit
+    local perpendicular = Vector3.new(-radial.Z, 0, radial.X)
+
+    -- Alternate sides so repeated attacks do not send the player farther away.
+    if math.random(0, 1) == 0 then
+        perpendicular = -perpendicular
+    end
+
+    local candidate = targetPosition + perpendicular * ExpeditionDodgeRadius
+
+    -- Put the player on actual ground. This prevents the dodge from placing
+    -- the HumanoidRootPart in mid-air and falling through the expedition map.
+    local rayParams = RaycastParams.new()
+    rayParams.FilterType = Enum.RaycastFilterType.Exclude
+    rayParams.FilterDescendantsInstances = {localPlayer.Character, CurrentExpeditionTarget}
+    rayParams.IgnoreWater = true
+
+    local rayOrigin = candidate + Vector3.new(0, 60, 0)
+    local rayResult = Workspace:Raycast(rayOrigin, Vector3.new(0, -140, 0), rayParams)
+    if rayResult then
+        candidate = rayResult.Position + Vector3.new(0, 3, 0)
+    else
+        -- If no floor was found, do not perform the teleport at all.
+        return nil
+    end
+
+    -- Final safety check: never place the player farther than the combat radius.
+    local finalOffset = Vector3.new(candidate.X - targetPosition.X, 0, candidate.Z - targetPosition.Z)
+    if finalOffset.Magnitude > ExpeditionMaxCombatRadius then
+        candidate = targetPosition + finalOffset.Unit * ExpeditionMaxCombatRadius
+        local floorCheck = Workspace:Raycast(candidate + Vector3.new(0, 60, 0), Vector3.new(0, -140, 0), rayParams)
+        if not floorCheck then
+            return nil
+        end
+        candidate = floorCheck.Position + Vector3.new(0, 3, 0)
+    end
+
+    return CFrame.new(candidate, Vector3.new(targetPosition.X, candidate.Y, targetPosition.Z))
+end
+
+task.spawn(function()
+    while true do
+        task.wait(0.05)
+
+        if AutoFarmExpedition then
+            local character = localPlayer.Character
+            local hrp = character and character:FindFirstChild("HumanoidRootPart")
+            local fxFolder = Workspace:FindFirstChild("__AUTUMNBOSS_FX")
+
+            if hrp and CurrentExpeditionTarget and CurrentExpeditionTarget.Parent and fxFolder and #fxFolder:GetChildren() > 0 then
+                if not ExpeditionIsEvading then
+                    local targetPart = CurrentExpeditionTarget:FindFirstChild("Coin")
+                    local targetPosition = targetPart and targetPart.Position or CurrentExpeditionTarget:GetPivot().Position
+                    local safeDodge = GetSafeExpeditionDodgeCFrame(hrp, targetPosition)
+
+                    if safeDodge then
+                        ExpeditionIsEvading = true
+                        ExpeditionSavedCFrame = hrp.CFrame
+                        hrp.CFrame = safeDodge
+                    end
+                end
+            elseif ExpeditionIsEvading and hrp then
+                ExpeditionIsEvading = false
+                if ExpeditionSavedCFrame then
+                    hrp.CFrame = ExpeditionSavedCFrame
+                end
+                ExpeditionSavedCFrame = nil
+            end
+        elseif ExpeditionIsEvading then
+            local character = localPlayer.Character
+            local hrp = character and character:FindFirstChild("HumanoidRootPart")
+            if hrp and ExpeditionSavedCFrame then
+                hrp.CFrame = ExpeditionSavedCFrame
+            end
+            ExpeditionIsEvading = false
+            ExpeditionSavedCFrame = nil
+        end
+    end
+end)
+
+
+-- Hacker Boss Auto Farm Loop
+-- Uses the same coin selection / Join Coin / Change Pet Target sequence
+-- as the other auto farms, targeting the live Hacker Prime boss coin.
+task.spawn(function()
+    while true do
+        task.wait(0.15)
+
+        if AutoFarmHackerBoss then
+            if not CurrentHackerBoss or not CurrentHackerBoss.Parent then
+                CurrentHackerBoss = FindHackerBoss()
+                CurrentHackerBossId = CurrentHackerBoss and tostring(CurrentHackerBoss:GetAttribute("ID")) or nil
+            end
+
+            if CurrentHackerBoss and CurrentHackerBoss.Parent then
+                CurrentHackerBossId = tostring(CurrentHackerBoss:GetAttribute("ID"))
+                FocusPetsContinuous(CurrentHackerBoss)
+            else
+                CurrentHackerBoss = nil
+                CurrentHackerBossId = nil
+            end
+        else
+            CurrentHackerBoss = nil
+            CurrentHackerBossId = nil
+        end
+    end
+end)
+
+-- Main Auto Farm Loop
+task.spawn(function()
+    while true do
+        task.wait(0.15)
+        if AutoFarmRobot then
+            if not CurrentTarget or not CurrentTarget.Parent then
+                CurrentTarget = GetNextRobot()
+            end
+            if CurrentTarget and CurrentTarget.Parent then
+                CurrentTargetId = tostring(CurrentTarget:GetAttribute("ID"))
+                FocusPetsContinuous(CurrentTarget)
+            else
+                CurrentTargetId = nil
+            end
+        else
+            if not AutoFarmTurkey then
+                CurrentTarget = nil
+                CurrentTargetId = nil
+            end
+        end
+        
+        if AutoFarmTurkey then
+            if not CurrentTarget or not CurrentTarget.Parent then
+                CurrentTarget = FindTurkey()
+            end
+            if CurrentTarget and CurrentTarget.Parent then
+                CurrentTargetId = tostring(CurrentTarget:GetAttribute("ID"))
+                FocusPetsContinuous(CurrentTarget)
+            else
+                CurrentTargetId = nil
+            end
+        else
+            if not AutoFarmRobot then
+                CurrentTarget = nil
+                CurrentTargetId = nil
+            end
+        end
+    end
+end)
+
+-- Damage Spam Loop
+task.spawn(function()
+    while true do
+        task.wait(0.05)
+        if CurrentTargetId and DamageRemote and (AutoFarmRobot or AutoFarmTurkey) then
+            pcall(function()
+                DamageRemote:FireServer(CurrentTargetId)
+            end)
+        end
+    end
+end)
+
+-- Hacker Boss damage loop
+task.spawn(function()
+    while true do
+        task.wait(0.05)
+        if AutoFarmHackerBoss and CurrentHackerBossId and DamageRemote then
+            pcall(function()
+                DamageRemote:FireServer(CurrentHackerBossId)
+            end)
+        end
+    end
+end)
+
+-- GENERIC CLOSEST-COIN FARM
+-- Target scanning is deliberately separated from attacking. This keeps the
+-- expensive Workspace scan from running at the same rate as the hit remotes.
+local ClosestCoinScanInterval = 0.10
+local ClosestCoinHitInterval = 0.05
+local CachedEquippedPets = {}
+local CachedPetsRefreshAt = 0
+local LastCoinInteractionTarget = nil
+local LastCoinTeleportTarget = nil
+
+local function RefreshCachedEquippedPets(force)
+    local now = os.clock()
+    if not force and now < CachedPetsRefreshAt then
+        return CachedEquippedPets
+    end
+
+    local pets = {}
+    pcall(function()
+        pets = GetAllEquippedPetUIDs()
+    end)
+
+    CachedEquippedPets = pets or {}
+    CachedPetsRefreshAt = now + 0.50
+    return CachedEquippedPets
+end
+
+-- Find and select the target at a lower rate than the actual attack loop.
+task.spawn(function()
+    while true do
+        if AutoTap or AutoTeleportClosestCoin then
+            local previous = CurrentCoinTarget
+            local target = FindClosestCoin(previous)
+
+            if target and target.Parent then
+                local targetId = target:GetAttribute("ID")
+                if targetId ~= nil then
+                    targetId = tostring(targetId)
+                    local changed = target ~= CurrentCoinTarget
+
+                    CurrentCoinTarget = target
+                    CurrentCoinTargetId = targetId
+
+                    -- Selection is only sent when the target changes. Sending
+                    -- it every frame is unnecessary and causes extra client work.
+                    if changed or LastCoinInteractionTarget ~= target then
+                        pcall(function()
+                            Library.Signal.Fire("Select Coin", target)
+                        end)
+                        LastCoinInteractionTarget = target
+
+                        if AutoTap then
+                            local pets = RefreshCachedEquippedPets(true)
+                            if #pets > 0 then
+                                pcall(function()
+                                    Library.Network.Invoke("Join Coin", targetId, pets)
+                                end)
+
+                                for _, petUid in ipairs(pets) do
+                                    pcall(function()
+                                        Library.Network.Fire("Change Pet Target", petUid, "Coin", targetId)
+                                    end)
+                                end
+                            end
+                        end
+                    end
+
+                    -- Teleport only when the target changes instead of
+                    -- repeatedly setting CFrame every frame.
+                    if AutoTeleportClosestCoin and (changed or LastCoinTeleportTarget ~= target) then
+                        TeleportToClosestCoin(target)
+                        LastCoinTeleportTarget = target
+                    elseif not AutoTeleportClosestCoin then
+                        LastCoinTeleportTarget = nil
+                    end
+                else
+                    ResetCoinTarget()
+                    LastCoinInteractionTarget = nil
+                    LastCoinTeleportTarget = nil
+                end
+            else
+                ResetCoinTarget()
+                LastCoinInteractionTarget = nil
+                LastCoinTeleportTarget = nil
+            end
+        else
+            ResetCoinTarget()
+            LastCoinInteractionTarget = nil
+            LastCoinTeleportTarget = nil
+        end
+
+        task.wait(ClosestCoinScanInterval)
+    end
+end)
+
+-- Dedicated hit loop. It uses the same direct damage/Farm Coin calls as the
+-- existing Expedition/Turkey/Comet attack paths, but avoids rebuilding the
+-- pet list on every hit.
+task.spawn(function()
+    while true do
+        if AutoTap and CurrentCoinTargetId then
+            local targetId = CurrentCoinTargetId
+            local pets = RefreshCachedEquippedPets(false)
+
+            if DamageRemote then
+                pcall(function()
+                    DamageRemote:FireServer(targetId)
+                end)
+            end
+
+            for _, petUid in ipairs(pets) do
+                pcall(function()
+        local kind = tostring(attack.kind)
+        if kind ~= "slam" and kind ~= "barrage" and kind ~= "sweep" and kind ~= "leap" and kind ~= "land" then
+            return
+        end
+
+        local now = os.clock()
+        local windup = tonumber(attack.windup) or 0
+        local duration
+
+        if kind == "sweep" then
+            duration = windup + math.max(0.05, tonumber(attack.seconds) or 2) + 0.35
+        elseif kind == "leap" then
+            duration = windup + math.max(0, tonumber(attack.air) or 1) + 0.7
+        elseif kind == "land" then
+            duration = 0.9
+        else
+            duration = windup + 0.8
+        end
+
+        ExpeditionAttackSequence += 1
+        table.insert(ExpeditionActiveAttacks, {
+            kind = kind,
+            at = attack.at,
+            radius = attack.radius,
+            length = attack.length,
+            width = attack.width,
+            clear = attack.clear,
+            start = attack.start,
+            arc = attack.arc,
+            windup = windup,
+            seconds = attack.seconds,
+            started = now,
+            expires = now + duration,
+            sequence = ExpeditionAttackSequence,
+        })
+        ExpeditionDodgeUntil = math.max(ExpeditionDodgeUntil, now + duration)
+    end)
+end)
+
+-- Continuously maintain the safe position while an attack is active. This
+-- is intentionally independent from the visible FX folder.
+task.spawn(function()
+    while true do
+        task.wait(0.025)
+
+        local now = os.clock()
+        for i = #ExpeditionActiveAttacks, 1, -1 do
+            local attack = ExpeditionActiveAttacks[i]
+            if not attack or attack.expires <= now then
+                table.remove(ExpeditionActiveAttacks, i)
+            end
+        end
+
+        if not AutoFarmExpedition or not ExpeditionDodgeEnabled or #ExpeditionActiveAttacks == 0 then
+            if ExpeditionDodgeActive then
+                EndExpeditionDodge()
+            end
+            continue
+        end
+
+        local character = localPlayer.Character
+        local hrp = character and character:FindFirstChild("HumanoidRootPart")
+        if not hrp then
+            EndExpeditionDodge()
+            continue
+        end
+
+        -- Before the telegraph resolves, we can wait. Once the player's
+        -- current position becomes dangerous, move immediately to a safe
+        -- point inside the combat radius.
+        if not IsPointDangerous(hrp.Position, now) then
+            if ExpeditionDodgeActive and now >= ExpeditionDodgeUntil then
+                EndExpeditionDodge()
+            end
+            continue
+        end
