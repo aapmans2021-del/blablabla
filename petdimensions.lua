@@ -5163,10 +5163,16 @@ local function aimPoint(st, route, root, tp, routeIndex)
     if last > nextIndex then
 		local horizontal = math.abs(dx) > 1e-3
 		local lateral = horizontal and math.abs(root.Position.Z - p.Z) or math.abs(root.Position.X - p.X)
-		if lateral <= math.max(st.cs * 0.5 - 2.5, 0.5) then
-			if horizontal then p = Vector3.new(p.X, p.Y, root.Position.Z) else p = Vector3.new(root.Position.X, p.Y, p.Z) end
+		-- Do NOT fall back to the next cell when we are slightly off-center.
+		-- That fallback was the cause of Auto visibly stopping at every cell on
+		-- long straight runs: MoveTo() was being given only one cell at a time
+		-- until the character re-centered. Keep the long straight target and
+		-- preserve the current lateral position so Humanoid movement can correct
+		-- itself continuously without stopping.
+		if horizontal then
+			p = Vector3.new(p.X, p.Y, root.Position.Z)
 		else
-			p = cellPos(st, route[nextIndex])
+			p = Vector3.new(root.Position.X, p.Y, p.Z)
 		end
 	end
 	return Vector3.new(p.X, root.Position.Y, p.Z)
@@ -5186,7 +5192,7 @@ local function walk(token, getTarget, stop, label, opts)
 	local s0 = getState()
 	local floor0 = s0 and s0.floor
 	local ps, lastPos, lastT, lastInt, lastDraw, waitStart = {}, nil, os.clock(), 0, 0, os.clock()
-    local route, routeMode, routeSpare, plannedGoal, plannedAt, routeCursor, activeAim
+    local route, routeMode, routeSpare, plannedGoal, plannedAt, routeCursor, activeAim, lastMoveTo
     routeCursor = 1
 	while running and token == moveToken do
 		local st, root, hum = getState(), getRoot(), getHum()
@@ -5239,22 +5245,79 @@ local function walk(token, getTarget, stop, label, opts)
 		end
 		if opts.onMove then opts.onMove() end
 		if opts.timeout and now - waitStart > opts.timeout then hum:MoveTo(root.Position); return "timeout" end
-		local aim
+		-- Keep a continuous look-ahead MoveTo target. The previous Auto movement
+        -- only refreshed Humanoid:MoveTo when the target changed. Roblox can time
+        -- out a MoveTo internally, which made Auto stop on a cell and then move
+        -- again when the next route update happened.
+        local aim
         local movementTarget = tp
-        if #route - routeCursor >= 1 then aim = aimPoint(st, route, root, movementTarget, routeCursor)
-		elseif mode == "waiting" or mode == "trapped" then aim = nil
-        else aim = Vector3.new(movementTarget.X, root.Position.Y, movementTarget.Z) end
+
+        -- Egg/manual MOVE behaviour: when the remaining route from the
+        -- player's current cell to the egg is one uninterrupted straight
+        -- corridor, send Humanoid:MoveTo directly to the egg itself.
+        -- The old Auto code converted this into a cell-centre target through
+        -- aimPoint(), which is why Auto could pause on every cell even though
+        -- clicking MOVE on the same egg drove straight to it.
+        local directCorridor = false
+        if opts.directGoal and route and #route - routeCursor >= 1 then
+            local first = routeCursor
+            local second = first + 1
+            local x0, z0 = Common.CellXZ(st.n, route[first])
+            local x1, z1 = Common.CellXZ(st.n, route[second])
+            local dx, dz = x1 - x0, z1 - z0
+            directCorridor = true
+            for i = second + 1, #route do
+                local px, pz = Common.CellXZ(st.n, route[i - 1])
+                local cx, cz = Common.CellXZ(st.n, route[i])
+                if math.abs(cx - px - dx) > 1e-3 or math.abs(cz - pz - dz) > 1e-3 then
+                    directCorridor = false
+                    break
+                end
+            end
+        end
+
+        if directCorridor then
+            -- Keep the real egg position as the MoveTo destination instead
+            -- of the next cell. This is the same movement style as the
+            -- Overview-tab MOVE button and is refreshed continuously below.
+            aim = Vector3.new(movementTarget.X, root.Position.Y, movementTarget.Z)
+        elseif #route - routeCursor >= 1 then
+            aim = aimPoint(st, route, root, movementTarget, routeCursor)
+        elseif mode == "waiting" or mode == "trapped" then
+            aim = nil
+        else
+            aim = Vector3.new(movementTarget.X, root.Position.Y, movementTarget.Z)
+        end
+
         local activeCell = activeAim and posCell(st, activeAim)
         local activeIndex = activeCell and routeIndexFor(route, activeCell, routeCursor)
         local activeStillValid = activeAim and activeIndex and activeIndex > routeCursor
-            and hdist(root.Position, activeAim) > st.cs * 0.35
-        if activeStillValid then aim = activeAim end
+            and hdist(root.Position, activeAim) > st.cs * 0.20
+
+        if activeStillValid and aim then
+            -- If the old target is still farther ahead on the same valid route,
+            -- keep it instead of collapsing to the newly entered cell.
+            local activeDist = hdist(root.Position, activeAim)
+            local newDist = hdist(root.Position, aim)
+            if activeDist > newDist + 0.5 then
+                aim = activeAim
+            end
+        end
+
         if aim then
-            if not activeAim or (aim - activeAim).Magnitude >= 0.75 then
-                hum:MoveTo(aim); activeAim = aim
+            -- Refresh every 0.30s even when the target has not changed. This
+            -- prevents Humanoid:MoveTo timeout/stalling on long straight runs.
+            if not activeAim
+                or (aim - activeAim).Magnitude >= 0.5
+                or now - lastMoveTo >= 0.30 then
+                hum:MoveTo(aim)
+                activeAim = aim
+                lastMoveTo = now
             end
         elseif activeAim then
-            hum:MoveTo(root.Position); activeAim = nil
+            hum:MoveTo(root.Position)
+            activeAim = nil
+            lastMoveTo = now
         end
         if needsPlan and now - lastDraw >= 0.2 then
 			lastDraw = now
