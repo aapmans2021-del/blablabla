@@ -4958,7 +4958,8 @@ local function dangerCtx(st, g)
 	local clearA = 0
 	if m.a ~= m.b and m.f < 0.8 then clearA = (0.8 - m.f) * math.max(m.seg, mt) end
 	return {m = m, dist = bfsCached(g, b), a = m.a, b = b, tb = m.tb, mt = mt, ct = ct, clearA = clearA,
-		pad = 0.5 * ct + scareMargin(st, m, me) * mt + SAFETY_BUF, hunting = m.hunting, face = scareMargin(st, m, me) > MARGIN_BASE}
+		pad = 0.5 * ct + scareMargin(st, m, me) * mt + SAFETY_BUF, hunting = m.hunting, face = scareMargin(st, m, me) > MARGIN_BASE,
+		cs = st.cs}
 end
 local function eta(ctx, c)
 	local d = ctx.dist[c]
@@ -5125,8 +5126,11 @@ local function timeAwareRoute(g, me, goal, ctx, blocked)
 		if step < 80 then
 			for _, nextCell in ipairs(nbrs(g, cell)) do
 				local nextStep = step + 1
+				-- Keep a real timing cushion outside the one-cell kill hitbox.  A
+				-- zero/near-zero margin can look safe on paper but loses to update
+				-- latency, cornering, and the character's physical width.
 				if steps[nextCell] == nil and not edgeBlocked(blocked, cell, nextCell)
-					and hitboxEta(ctx, nextCell) > nextStep * ctx.ct + 0.08 then
+					and hitboxEta(ctx, nextCell) > nextStep * ctx.ct + math.max(0.35, ctx.ct * 0.75) then
 					steps[nextCell], prev[nextCell] = nextStep, cell
 					q[#q + 1] = nextCell
 				end
@@ -5148,6 +5152,9 @@ local function decide(st, g, me, goal, ps, opts)
 		ps.refuge, ps.advance, ps.retreat, ps.slip, ps.blocked, ps.fleeing = nil, nil, nil, false, nil, false
 		if reachesGoal then return liveRoute, "TIMED ROUTE", spare, ctx end
 		if #liveRoute > 1 then return liveRoute, "REPOSITIONING", spare, ctx end
+		-- A physical nudge can have marked the only exit edge as blocked.  Do
+		-- not let that stale local memory turn into a manual Auto restart.
+		ps.blockedEdges = {}
 		return liveRoute, "WAITING FOR OPENING", spare, ctx
 	end
 
@@ -5407,7 +5414,7 @@ local function walk(token, getTarget, stop, label, opts)
 	local s0 = getState()
 	local floor0 = s0 and s0.floor
 	local ps, lastPos, lastT, lastInt, lastDraw, waitStart = {blockedEdges = {}, edgeAttempts = {}}, nil, os.clock(), 0, 0, os.clock()
-    local route, routeMode, routeSpare, plannedGoal, plannedAt, routeCursor, activeAim
+    local route, routeMode, routeSpare, plannedGoal, plannedAt, plannedMonster, routeCursor, activeAim
     routeCursor = 1
 	while running and token == moveToken do
 		local st, root, hum = getState(), getRoot(), getHum()
@@ -5418,6 +5425,14 @@ local function walk(token, getTarget, stop, label, opts)
 		local g = grid(st)
 		local me, goal = posCell(st, root.Position), posCell(st, tp)
 		if not (me and goal) then task.wait(0.1); continue end
+		-- Crossing an exit while pursuing candy/an egg is still a floor change.
+		-- Report it immediately so Auto restarts its scan instead of continuing
+		-- with stale targets and walking straight through the following floor.
+		if label ~= "EXIT" and me == st.exit then
+			hum:MoveTo(root.Position)
+			setStatus("🚪 exit crossed; refreshing next floor")
+			return "exit"
+		end
 		local now = os.clock()
 		if opts.interrupt and now - lastInt >= 0.3 then
 			lastInt = now
@@ -5434,14 +5449,18 @@ local function walk(token, getTarget, stop, label, opts)
             routeIndex = routeIndexFor(route, me, 1)
         end
         if routeIndex then routeCursor = routeIndex end
-        local replanInterval = 0.35
+        -- Replan as the scarecrow advances through a segment, not just on a
+        -- coarse timer.  Its route/direction changes are included in the key.
+        local monster = monsterModel(st)
+        local monsterKey = monster and (tostring(monster.a) .. ":" .. tostring(monster.b) .. ":" .. tostring(math.floor((monster.f or 0) * 20))) or "none"
+        local replanInterval = 0.10
         local needsPlan = not plannedAt or now - plannedAt >= replanInterval or goal ~= plannedGoal
-            or (route and not routeIndex)
-		if needsPlan then
-			-- An old MoveTo may point through the route we just rejected.
-			if activeAim then hum:MoveTo(root.Position); activeAim = nil end
-			route, routeMode, routeSpare = decide(st, g, me, goal, ps, opts)
-            plannedGoal, plannedAt, routeCursor = goal, now, 1
+            or monsterKey ~= plannedMonster or (route and not routeIndex)
+        if needsPlan then
+			-- Do not stop an unchanged cell crossing: the new command below will
+			-- immediately replace it only when the live route actually changes.
+            route, routeMode, routeSpare = decide(st, g, me, goal, ps, opts)
+            plannedGoal, plannedAt, plannedMonster, routeCursor = goal, now, monsterKey, 1
             routeIndex = route and routeIndexFor(route, me, 1)
         end
 		if not route then
@@ -5540,7 +5559,7 @@ local function collectCandy(token)
 		end
 		idleSince = nil
 		local r = walk(token, function() if c.Parent then return posOf(c) end end, CANDY_STOP, "Candy", {timeout = 25})
-		if r == "cancelled" or r == "floor" then return r end
+		if r == "cancelled" or r == "floor" or r == "exit" then return r end
 		if r == "arrived" or r == "timeout" then
 			tries[c] = (tries[c] or 0) + 1
 			if tries[c] >= 3 or r == "timeout" then candyIgnore[c] = true end
@@ -5666,7 +5685,7 @@ local function scoutEggs(token)
 			if not bEgg.Parent or eggLuck(s, bEgg) > 0 then return nil end
 			return cellPos(s, bCell)
 		end, st.cs * 0.3, "Scout", {timeout = 40})
-		if r == "cancelled" or r == "floor" then return r end
+		if r == "cancelled" or r == "floor" or r == "exit" then return r end
 		local tried = scoutTried[bEgg]
 		if r == "lost" and bEgg.Parent then
 			local latest = getState()
@@ -5689,6 +5708,20 @@ end
 
 local function exitTarget(st) local p = cellPos(st, st.exit); return p + Vector3.new(0, 6, 0) end
 local function autoLoop(token)
+	local function refreshAfterExit(oldFloor)
+		local deadline = os.clock() + 8
+		while running and token == moveToken and autoOn and os.clock() < deadline do
+			local state = getState()
+			if state and state.floor ~= oldFloor then
+				setStatus("🔄 next floor detected; refreshing targets")
+				-- Let the server replace the egg/candy instances before scanning.
+				task.wait(0.45)
+				return true
+			end
+			task.wait(0.1)
+		end
+		return false
+	end
 	while running and token == moveToken and autoOn do
 		local st = getState()
 		if not st then task.wait(0.3); continue end
@@ -5697,9 +5730,17 @@ local function autoLoop(token)
 			local root = getRoot()
 			local me = root and posCell(st, root.Position)
 			local pendingEgg = O.hatch and me and pickEgg(st, grid(st), me, true)
-			if not pendingEgg and collectCandy(token) == "cancelled" then return end
+			if not pendingEgg then
+				local candyResult = collectCandy(token)
+				if candyResult == "cancelled" then return end
+				if candyResult == "floor" or candyResult == "exit" then
+					refreshAfterExit(floor)
+					continue
+				end
+			end
 		end
 		if O.hatch then
+			local changedFloor = false
 			while running and token == moveToken and autoOn do
 				local s2, root = getState(), getRoot()
 				local me = s2 and root and posCell(s2, root.Position)
@@ -5708,15 +5749,20 @@ local function autoLoop(token)
 				if egg then
 					local r = hatchAt(token, egg, false)
 					if r == "cancelled" then return end
-					if r == "floor" then break end
+					if r == "floor" or r == "exit" then changedFloor = true; break end
 					if r == "lost" or r == "gone" or r == "failed" then rejected[egg] = rejected[egg] or r end
 				elseif O.scout then
 					local result = scoutEggs(token)
 					if result == "cancelled" then return end
+					if result == "floor" or result == "exit" then changedFloor = true; break end
 					if result ~= "scouted" then break end
 				else
 					break
 				end
+			end
+			if changedFloor then
+				refreshAfterExit(floor)
+				continue
 			end
 		end
 		if token ~= moveToken or not autoOn then return end
