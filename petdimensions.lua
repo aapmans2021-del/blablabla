@@ -5096,6 +5096,46 @@ local function winningRaceRoute(g, me, goal, ctx, blocked)
 	return route, eta(ctx, goal) - (#route - 1) * ctx.ct
 end
 
+-- Plan in player-time, not in a persistent "hide" state.  The scarecrow's
+-- graph distance is converted into the first moment its one-cell kill hitbox
+-- can reach a cell.  Every cell in the selected route must be crossed before
+-- that moment.  When the goal is temporarily impossible, return the safe
+-- route that makes the most progress toward it, then recompute on the next
+-- tick from the live scarecrow state.
+local function hitboxEta(ctx, cell)
+	local distance = ctx.dist[cell]
+	if distance == nil then return math.huge end
+	return ctx.tb + math.max(0, distance - 1) * ctx.mt
+end
+local function timeAwareRoute(g, me, goal, ctx, blocked)
+	local steps, prev, q, head = {[me] = 0}, {}, {me}, 1
+	local toGoal = bfsCached(g, goal)
+	local best, bestScore = me, math.huge
+	while q[head] do
+		local cell = q[head]; head += 1
+		local step = steps[cell]
+		local remaining = toGoal[cell]
+		if remaining then
+			local score = remaining * 100 - math.min(hitboxEta(ctx, cell) - step * ctx.ct, 10)
+			if score < bestScore then best, bestScore = cell, score end
+		end
+		if cell == goal then
+			return pathTo(prev, me, goal), true, hitboxEta(ctx, goal) - step * ctx.ct
+		end
+		if step < 80 then
+			for _, nextCell in ipairs(nbrs(g, cell)) do
+				local nextStep = step + 1
+				if steps[nextCell] == nil and not edgeBlocked(blocked, cell, nextCell)
+					and hitboxEta(ctx, nextCell) > nextStep * ctx.ct + 0.08 then
+					steps[nextCell], prev[nextCell] = nextStep, cell
+					q[#q + 1] = nextCell
+				end
+			end
+		end
+	end
+	return pathTo(prev, me, best) or {me}, false, hitboxEta(ctx, best) - (steps[best] or 0) * ctx.ct
+end
+
 -- returns route (starting at `me`), mode, spare seconds on our own cell, ctx
 local function decide(st, g, me, goal, ps, opts)
 	local ctx = dangerCtx(st, g)
@@ -5103,6 +5143,14 @@ local function decide(st, g, me, goal, ps, opts)
 		ps.refuge, ps.advance, ps.slip, ps.blocked, ps.fleeing = nil, nil, false, nil, false
 		return bfsAvoiding(g, me, goal, ps.blockedEdges), "clear", nil, nil
 	end
+	do
+		local liveRoute, reachesGoal, spare = timeAwareRoute(g, me, goal, ctx, ps.blockedEdges)
+		ps.refuge, ps.advance, ps.retreat, ps.slip, ps.blocked, ps.fleeing = nil, nil, nil, false, nil, false
+		if reachesGoal then return liveRoute, "TIMED ROUTE", spare, ctx end
+		if #liveRoute > 1 then return liveRoute, "REPOSITIONING", spare, ctx end
+		return liveRoute, "WAITING FOR OPENING", spare, ctx
+	end
+
 	local stay, enter = opts.stay or STAY_SLACK, opts.enter or 0
 	local s0 = slack(ctx, me, 0)
 	local steps, prev = safeSearch(g, me, ctx, 60, ps.blockedEdges)
