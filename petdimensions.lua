@@ -4981,6 +4981,11 @@ end
 
 -- returns route (starting at `me`), mode, spare seconds on our own cell, ctx
 local function decide(st, g, me, goal, ps, opts)
+    if opts.directGoal and goal ~= me then
+        ps.refuge, ps.advance = nil, nil
+        local _, prev = bfsPrev(g, me)
+        return pathTo(prev, me, goal), "egg route", nil, nil
+    end
 	local ctx = dangerCtx(st, g)
 	if not ctx then
 		ps.refuge, ps.advance = nil, nil
@@ -5050,11 +5055,11 @@ local function clearPath()
 	activeSegmentCount = 0
 	lastRoute = nil
 end
-local function drawRoute(st, route, tp, y)
+local function drawRoute(st, route, tp, y, firstIndex)
 	local pts = {}
 	local root = getRoot()
 	if root then pts[1] = Vector3.new(root.Position.X, y, root.Position.Z) end
-	for i = 2, #route do local p = cellPos(st, route[i]); pts[#pts + 1] = Vector3.new(p.X, y, p.Z) end
+    for i = firstIndex or 2, #route do local p = cellPos(st, route[i]); pts[#pts + 1] = Vector3.new(p.X, y, p.Z) end
 	if tp and #route <= 1 then pts[#pts + 1] = Vector3.new(tp.X, y, tp.Z) end
 	local k = 0
 	for i = 1, #pts - 1 do
@@ -5121,13 +5126,15 @@ end
 
 -- movement -------------------------------------------------------------------------------------
 -- aim at the end of the straight run that starts at route[1]; re-centre first if we hug a wall
-local function aimPoint(st, route, root, tp)
-	if #route < 2 then return Vector3.new(tp.X, root.Position.Y, tp.Z) end
-	local x0, z0 = Common.CellXZ(st.n, route[1])
-	local x1, z1 = Common.CellXZ(st.n, route[2])
+local function aimPoint(st, route, root, tp, routeIndex)
+    local first = routeIndex or 1
+    if #route - first < 1 then return Vector3.new(tp.X, root.Position.Y, tp.Z) end
+    local nextIndex = first + 1
+    local x0, z0 = Common.CellXZ(st.n, route[first])
+    local x1, z1 = Common.CellXZ(st.n, route[nextIndex])
 	local dx, dz = x1 - x0, z1 - z0
-	local last = 2
-	for i = 3, #route do
+    local last = nextIndex
+    for i = nextIndex + 1, #route do
 		local px, pz = Common.CellXZ(st.n, route[i - 1])
 		local cx, cz = Common.CellXZ(st.n, route[i])
 		if math.abs(cx - px - dx) > 1e-3 or math.abs(cz - pz - dz) > 1e-3 then break end
@@ -5135,7 +5142,7 @@ local function aimPoint(st, route, root, tp)
 	end
 	local p = cellPos(st, route[last])
 	if last == #route and posCell(st, tp) == route[last] then p = tp end
-	if last > 2 then
+    if last > nextIndex then
 		local horizontal = math.abs(dx) > 1e-3
 		local lateral = horizontal and math.abs(root.Position.Z - p.Z) or math.abs(root.Position.X - p.X)
 		if lateral <= math.max(st.cs * 0.5 - 2.5, 0.5) then
@@ -5147,6 +5154,13 @@ local function aimPoint(st, route, root, tp)
 	return Vector3.new(p.X, root.Position.Y, p.Z)
 end
 
+local function routeIndexFor(route, cell, firstIndex)
+    for i = firstIndex or 1, #route do
+        if route[i] == cell then return i end
+    end
+    return nil
+end
+
 -- returns "arrived" | "lost" | "cancelled" | "floor" | "reconsider" | "timeout" | whatever opts.onHold returns
 -- opts: stay/enter (spare seconds), onHold(st, root) -> terminal result or nil, onMove(), interrupt(st, root), timeout
 local function walk(token, getTarget, stop, label, opts)
@@ -5154,6 +5168,8 @@ local function walk(token, getTarget, stop, label, opts)
 	local s0 = getState()
 	local floor0 = s0 and s0.floor
 	local ps, lastPos, lastT, lastInt, lastDraw, waitStart = {}, nil, os.clock(), 0, 0, os.clock()
+    local route, routeMode, routeSpare, plannedGoal, plannedAt, routeCursor, activeAim
+    routeCursor = 1
 	while running and token == moveToken do
 		local st, root, hum = getState(), getRoot(), getHum()
 		if not (st and root and hum) then task.wait(0.15); continue end
@@ -5171,12 +5187,26 @@ local function walk(token, getTarget, stop, label, opts)
 		local atGoal
 		if type(stop) == "function" then atGoal = stop(st, root, tp) else atGoal = hdist(root.Position, tp) <= stop end
 		if atGoal and not opts.onHold then hum:MoveTo(root.Position); return "arrived" end
-		local route, mode, s0v = decide(st, g, me, goal, ps, opts)
+        local routeIndex = route and routeIndexFor(route, me, routeCursor)
+        if routeIndex then routeCursor = routeIndex end
+        local replanInterval = opts.directGoal and 1 or 0.35
+        local needsPlan = not plannedAt or now - plannedAt >= replanInterval or goal ~= plannedGoal or (route and not routeIndex)
+        if needsPlan then
+            route, routeMode, routeSpare = decide(st, g, me, goal, ps, opts)
+            plannedGoal, plannedAt, routeCursor = goal, now, 1
+            routeIndex = route and routeIndexFor(route, me, routeCursor)
+        end
 		if not route then
-			hum:MoveTo(root.Position); setStatus("⏳ no route"); task.wait(0.15); continue
+            if activeAim then hum:MoveTo(root.Position); activeAim = nil end
+            setStatus("⏳ no route"); task.wait(0.15); continue
+        end
+        if not routeIndex then
+            if activeAim then hum:MoveTo(root.Position); activeAim = nil end
+            setStatus("⏳ replanning route"); task.wait(0.1); continue
 		end
 		if hum.WalkSpeed ~= O.speed then hum.WalkSpeed = O.speed end
-		local holding = atGoal and #route <= 1 and (mode == "clear" or mode == "normal" or mode == "racing")
+        local mode, s0v = routeMode, routeSpare
+        local holding = atGoal and #route <= 1 and (mode == "clear" or mode == "normal" or mode == "racing")
 		if holding then
 			waitStart = now
 			hum:MoveTo(root.Position)
@@ -5188,17 +5218,29 @@ local function walk(token, getTarget, stop, label, opts)
 		if opts.onMove then opts.onMove() end
 		if opts.timeout and now - waitStart > opts.timeout then hum:MoveTo(root.Position); return "timeout" end
 		local aim
-		if #route >= 2 then aim = aimPoint(st, route, root, tp)
+        local movementTarget = opts.directGoal and cellPos(st, goal) or tp
+        if #route - routeCursor >= 1 then aim = aimPoint(st, route, root, movementTarget, routeCursor)
 		elseif mode == "waiting" or mode == "trapped" then aim = nil
-		else aim = Vector3.new(tp.X, root.Position.Y, tp.Z) end
-		if aim then hum:MoveTo(aim) else hum:MoveTo(root.Position) end
-		if now - lastDraw >= 0.2 then
+        else aim = Vector3.new(movementTarget.X, root.Position.Y, movementTarget.Z) end
+        local activeCell = activeAim and posCell(st, activeAim)
+        local activeIndex = activeCell and routeIndexFor(route, activeCell, routeCursor)
+        local activeStillValid = activeAim and activeIndex and activeIndex > routeCursor
+            and hdist(root.Position, activeAim) > st.cs * 0.35
+        if activeStillValid then aim = activeAim end
+        if aim then
+            if not activeAim or (aim - activeAim).Magnitude >= 0.75 then
+                hum:MoveTo(aim); activeAim = aim
+            end
+        elseif activeAim then
+            hum:MoveTo(root.Position); activeAim = nil
+        end
+        if needsPlan and now - lastDraw >= 0.2 then
 			lastDraw = now
-			drawRoute(st, route, tp, root.Position.Y)
+            drawRoute(st, route, movementTarget, root.Position.Y, routeCursor)
 			setStatus(("→ %s  [%s%s]"):format(label, mode, s0v and (" · spare %.1fs"):format(s0v) or ""))
 		end
 		if aim and now - lastT > 1.2 then
-			if lastPos and hdist(root.Position, lastPos) < 1 then hum.Jump = true; hum:MoveTo(cellPos(st, me)) end
+            if lastPos and hdist(root.Position, lastPos) < 1 and activeAim then hum:MoveTo(activeAim) end
 			lastPos, lastT = root.Position, now
 		end
 		task.wait(0.08)
@@ -5269,6 +5311,7 @@ local function hatchAt(token, egg, force)
 	local tHatch, reasserts, last = 0, 0, os.clock()
 	local opts = {
 		stay = O.escape and STAY_SLACK or 0, enter = O.escape and ENTER_SLACK or 0, timeout = 150,
+        directGoal = true,
 		onMove = function() setAutoHatch(false); last = os.clock() end,
 	}
 	opts.onHold = function(st)
