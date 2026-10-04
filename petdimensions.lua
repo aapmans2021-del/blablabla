@@ -4634,12 +4634,13 @@ local COL = {
         bg = Color3.fromRGB(18, 27, 26), card = Color3.fromRGB(31, 44, 40), white = Color3.new(1, 1, 1),
 }
 local AVOID_R, HUNT_R = 5, 7
-local EGG_STOP, EXIT_STOP, CANDY_STOP = 2.25, 3, 3.5
+local EXIT_STOP, CANDY_STOP = 3, 3.5
 
 -- ───────── state ─────────
 local running, moveToken, jobRunning = true, 0, false
 local avoidOn, candyFirst, candyEsp, autoOn = true, true, true, false
 local hatchOn, escapeOn, scoutOn = true, true, true
+local pathVisible, minimapWhenHidden = true, false
 local minLuck, hatchSeconds = 10, 60 -- hatchSeconds 0 = until the lucky eggs run out
 local eggSel, eggNames = {}, {}
 local eggSettings = {}
@@ -4650,6 +4651,7 @@ local conns, esp, pools, ddLists = {}, {}, {}, {}
 local lastRoute, lastRouteFloor, preview = nil, nil, nil
 local Common, Client, modInst
 local setStatus = function() end
+local updateMinimapAttachment
 local Lib; pcall(function() Lib = require(RS.Framework.Library) end)
 
 local function bind(sig, fn) local c = sig:Connect(fn); conns[#conns + 1] = c; return c end
@@ -4690,6 +4692,8 @@ do
 		if s.hatchOn ~= nil then hatchOn = s.hatchOn == true end
 		if s.escapeOn ~= nil then escapeOn = s.escapeOn == true end
 		if s.scoutOn ~= nil then scoutOn = s.scoutOn == true end
+        if s.pathVisible ~= nil then pathVisible = s.pathVisible == true end
+        if s.minimapWhenHidden ~= nil then minimapWhenHidden = s.minimapWhenHidden == true end
 		if s.zoom ~= nil then zoomOn = s.zoom == true end
 		minLuck = tonumber(s.minLuck) or minLuck
 		hatchSeconds = tonumber(s.hatchSeconds) or hatchSeconds
@@ -4715,6 +4719,7 @@ local function saveSettings()
 		if writefile then
 			writefile(SFILE, HttpService:JSONEncode({speed = desiredSpeed, avoid = avoidOn, candyFirst = candyFirst,
 				candyEsp = candyEsp, zoom = zoomOn, hatchOn = hatchOn, escapeOn = escapeOn, scoutOn = scoutOn,
+                pathVisible = pathVisible, minimapWhenHidden = minimapWhenHidden,
                 minLuck = minLuck, hatchSeconds = hatchSeconds, eggSel = eggSel, eggSettings = eggSettings}))
 		end
 	end)
@@ -5152,8 +5157,15 @@ end
 -- ───────── blue path (pooled) ─────────
 local pathFolder = new("Folder", {Name = "HMV2_Path"}, workspace)
 local segs = {}
+local activeSegmentCount = 0
+local function refreshPathVisibility()
+    for i, segment in ipairs(segs) do
+        segment.Transparency = pathVisible and i <= activeSegmentCount and 0 or 1
+    end
+end
 local function clearPath()
 	for _, s in ipairs(segs) do s.Transparency = 1 end
+    activeSegmentCount = 0
 	lastRoute = nil
 end
 local function drawRoute(st, route, tp, y, firstIndex)
@@ -5176,10 +5188,12 @@ local function drawRoute(st, route, tp, y, firstIndex)
 					CastShadow = false, Material = Enum.Material.Neon, Color = COL.path}, pathFolder)
 				segs[k] = p
 			end
-			p.Transparency = 0; p.Size = Vector3.new(0.6, 0.6, d); p.CFrame = CFrame.lookAt((a + b) / 2, b)
+            p.Transparency = pathVisible and 0 or 1
+            p.Size = Vector3.new(0.6, 0.6, d); p.CFrame = CFrame.lookAt((a + b) / 2, b)
 		end
 	end
 	for i = k + 1, #segs do segs[i].Transparency = 1 end
+    activeSegmentCount = k
 	lastRoute, lastRouteFloor = route, st.floor
 end
 
@@ -5255,6 +5269,11 @@ local function aimPoint(st, route, root, tp, routeIndex)
     return Vector3.new(p.X, root.Position.Y, p.Z)
 end
 
+local function sameCellTarget(st, root, target)
+    local targetCell = posCell(st, target)
+    return targetCell ~= nil and posCell(st, root.Position) == targetCell
+end
+
     local function routeIndexFor(route, cell, firstIndex)
         for i = firstIndex or 1, #route do
             local routeCell = route[i]
@@ -5276,7 +5295,10 @@ local function walk(token, getTarget, stop, label)
         if st.floor ~= floor0 then return "floor" end
         local tp = getTarget(st)
         if not tp then return "lost" end
-        if hdist(root.Position, tp) <= stop then hum:MoveTo(root.Position); return "arrived" end
+        local arrived
+        if type(stop) == "function" then arrived = stop(st, root, tp)
+        else arrived = hdist(root.Position, tp) <= stop end
+        if arrived then hum:MoveTo(root.Position); return "arrived" end
         local g = grid(st)
         local me, goal = posCell(st, root.Position), posCell(st, tp)
         if not (me and goal) then task.wait(0.15); continue end
@@ -5463,9 +5485,9 @@ local function hatchAt(token, egg, force)
 		if st.floor ~= floor0 then result = "floor"; break end
 		local ep = posOf(egg)
 		if not ep then result = "gone"; break end
-        if hdist(root.Position, ep) > EGG_STOP + 0.5 then
+        if not sameCellTarget(st, root, ep) then
 			setAutoHatch(false)
-			local r = walk(token, function() if egg.Parent then return posOf(egg) end end, EGG_STOP, "Egg")
+            local r = walk(token, function() if egg.Parent then return posOf(egg) end end, sameCellTarget, "Egg")
 			if r ~= "arrived" then result = r; break end
 			last = os.clock()
 			continue
@@ -5670,7 +5692,7 @@ local function startJob(fn)
 end
 local function moveEgg(egg)
 	startJob(function(t)
-		local r = walk(t, function() if egg.Parent then return posOf(egg) end end, EGG_STOP, "Egg")
+        local r = walk(t, function() if egg.Parent then return posOf(egg) end end, sameCellTarget, "Egg")
 		if r == "arrived" and hatchOn then hatchAt(t, egg, true) end
 	end)
 end
@@ -5884,7 +5906,11 @@ local luckLbl = label(info, "🍀 Luck: -", UDim2.new(1, -8, 0, 28), COL.luck, 1
 local scareLbl = label(info, "🎃 Scarecrow: -", UDim2.new(1, -8, 0, 22), COL.scare, 14)
 local statusLbl = label(row(22), "Idle", UDim2.fromScale(1, 1), Color3.fromRGB(150, 210, 255), 13)
 statusLbl.Name = "Status"
-setStatus = function(t) if statusLbl and statusLbl.Parent then statusLbl.Text = t end end
+local minimapStatusLbl
+setStatus = function(t)
+    if statusLbl and statusLbl.Parent then statusLbl.Text = t end
+    if minimapStatusLbl and minimapStatusLbl.Parent then minimapStatusLbl.Text = t end
+end
 
 -- speed
 local sp = row(30, true)
@@ -5925,6 +5951,18 @@ local third = UDim2.new(1 / 3, -3, 1, 0)
 toggle(tg2, "HATCH", hatchOn, function(v) hatchOn = v; saveSettings() end, third)
 toggle(tg2, "ESCAPE", escapeOn, function(v) escapeOn = v; saveSettings() end, third)
 toggle(tg2, "SCOUT", scoutOn, function(v) scoutOn = v; saveSettings() end, third)
+local tg3 = row(28, true)
+local half = UDim2.new(0.5, -3, 1, 0)
+toggle(tg3, "PATH", pathVisible, function(v)
+    pathVisible = v
+    refreshPathVisibility()
+    saveSettings()
+end, half)
+toggle(tg3, "PIN MAP", minimapWhenHidden, function(v)
+    minimapWhenHidden = v
+    saveSettings()
+    if updateMinimapAttachment then updateMinimapAttachment() end
+end, half)
 
 -- Per-egg configuration options
 local luckOptions = {}
@@ -6050,6 +6088,57 @@ local speedCard = new("Frame", {Position = UDim2.fromOffset(346, 300), Size = UD
 corner(speedCard, 10)
 local speedLbl = label(speedCard, "⚙ Speeds: -", UDim2.new(1, -16, 1, -12), Color3.fromRGB(190, 200, 215), 12)
 speedLbl.Position = UDim2.fromOffset(8, 6); speedLbl.TextYAlignment = Enum.TextYAlignment.Top
+local mapOverlayGui = new("ScreenGui", {Name = "HMV2_MinimapOverlay", ResetOnSpawn = false,
+    IgnoreGuiInset = true, DisplayOrder = 1000, ZIndexBehavior = Enum.ZIndexBehavior.Sibling, Enabled = false}, PlayerGui)
+local mapOverlayScale = new("UIScale", {Scale = 1}, mapOverlayGui)
+local mapOverlayRoot = new("Frame", {Name = "Overlay", Size = UDim2.fromOffset(250, 450), AnchorPoint = Vector2.new(1, 0),
+    Position = UDim2.new(1, -12, 0, 12), BackgroundTransparency = 1}, mapOverlayGui)
+local miniStatusCard = new("Frame", {Name = "NavigationStatus", Position = UDim2.fromOffset(0, 402),
+    Size = UDim2.fromOffset(250, 48), BackgroundColor3 = COL.card, BorderSizePixel = 0}, mapOverlayRoot)
+corner(miniStatusCard, 8)
+minimapStatusLbl = label(miniStatusCard, "Idle", UDim2.new(1, -16, 1, -8), Color3.fromRGB(150, 210, 255), 13)
+minimapStatusLbl.Position = UDim2.fromOffset(8, 4)
+minimapStatusLbl.TextYAlignment = Enum.TextYAlignment.Center
+local mapDetached = false
+local function updateMapOverlayScale()
+    local camera = Workspace.CurrentCamera
+    if not camera then return end
+    local viewport = camera.ViewportSize
+    local scale = math.min((viewport.X - 24) / 250, (viewport.Y - 24) / 450, 1)
+    mapOverlayScale.Scale = math.max(scale, 0.35)
+end
+local overlayCameraConnection
+local function hookMapOverlayCamera()
+    if overlayCameraConnection then overlayCameraConnection:Disconnect() end
+    local camera = Workspace.CurrentCamera
+    if camera then
+        overlayCameraConnection = bind(camera:GetPropertyChangedSignal("ViewportSize"), updateMapOverlayScale)
+    end
+    updateMapOverlayScale()
+end
+updateMinimapAttachment = function()
+    local detached = minimapWhenHidden and not Root.Visible
+    if detached ~= mapDetached then
+        mapDetached = detached
+        if detached then
+            MM.Parent = mapOverlayRoot
+            MM.Position = UDim2.fromOffset(0, 0)
+            speedCard.Parent = mapOverlayRoot
+            speedCard.Position = UDim2.fromOffset(0, 300)
+        else
+            MM.Parent = Root
+            MM.Position = UDim2.fromOffset(346, 0)
+            speedCard.Parent = Root
+            speedCard.Position = UDim2.fromOffset(346, 300)
+        end
+    end
+    mapOverlayGui.Enabled = detached
+    if detached then updateMapOverlayScale() end
+end
+bind(Root:GetPropertyChangedSignal("Visible"), updateMinimapAttachment)
+bind(Workspace:GetPropertyChangedSignal("CurrentCamera"), hookMapOverlayCamera)
+hookMapOverlayCamera()
+updateMinimapAttachment()
 local mmKey
 local function rebuildMinimap(st, g)
 	wallLayer:ClearAllChildren()
@@ -6076,7 +6165,7 @@ local function dots(name, count, color, size, z)
 	return p
 end
 local function updateMinimap()
-	if not Root.Visible then return end
+    if not Root.Visible and not mapOverlayGui.Enabled then return end
 	local st = getState(); if not st then return end
 	local g = grid(st)
 	local key = st.walls .. ":" .. tostring(st.floor)
@@ -6084,7 +6173,7 @@ local function updateMinimap()
 	local cp = 240 / st.n
 	local function xy(p) return UDim2.fromOffset((p.X - st.origin.X) / st.cs * cp, (p.Z - st.origin.Z) / st.cs * cp) end
 	local rt = (lastRoute and lastRouteFloor == st.floor) and lastRoute or {}
-	local rd = dots("route", #rt, COL.path, 4, 1)
+    local rd = dots("route", pathVisible and #rt or 0, COL.path, 4, 1)
 	for i, c in ipairs(rt) do rd[i].Position = xy(cellPos(st, c)) end
 	local cm = candyModels()
 	local cd = dots("candy", #cm, COL.candy, 5, 2)
@@ -6174,6 +6263,7 @@ local function destroy()
 	for _, c in ipairs(conns) do pcall(function() c:Disconnect() end) end
 	for _, e in pairs(esp) do pcall(function() e.gui:Destroy() end) end
 	for _, l in ipairs(ddLists) do pcall(function() l:Destroy() end) end
+    pcall(function() mapOverlayGui:Destroy() end)
 	if ownGui then pcall(function() ownGui:Destroy() end) end
 	if hubMain then
 		local wasOpen = Root.Visible
@@ -6217,7 +6307,7 @@ env.HMV2 = {Destroy = destroy, GetState = getState,
         local eggConfig = settingsForEgg(best:GetAttribute("ID"))
         eggConfig.hatchSeconds = sec or eggConfig.hatchSeconds
 		startJob(function(t)
-			local r = walk(t, function() if best.Parent then return posOf(best) end end, EGG_STOP, "Egg")
+            local r = walk(t, function() if best.Parent then return posOf(best) end end, sameCellTarget, "Egg")
 			if r == "arrived" then hatchAt(t, best, true) end
 		end)
 		return "started " .. tostring(best:GetAttribute("ID"))
