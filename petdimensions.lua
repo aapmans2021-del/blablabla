@@ -6223,7 +6223,9 @@ local function updateMinimap()
 	local function xy(p) return UDim2.fromOffset((p.X - st.origin.X) / st.cs * cp, (p.Z - st.origin.Z) / st.cs * cp) end
 	local rt = (lastRoute and lastRouteFloor == st.floor) and lastRoute or {}
     local rd = dots("route", pathVisible and #rt or 0, COL.path, 4, 1)
-	for i, c in ipairs(rt) do rd[i].Position = xy(cellPos(st, c)) end
+    if pathVisible then
+        for i, c in ipairs(rt) do rd[i].Position = xy(cellPos(st, c)) end
+    end
 	local cm = candyModels()
 	local cd = dots("candy", #cm, COL.candy, 5, 2)
 	for i, c in ipairs(cm) do local p = posOf(c); if p then cd[i].Position = xy(p) end end
