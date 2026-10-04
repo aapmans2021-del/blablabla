@@ -4927,7 +4927,7 @@ end
 -- ── v5 scarecrow avoidance ────────────────────────────────────────────────────────────────────
 local MARGIN_BASE, MARGIN_FACING = 1.0, 1.2 -- cells we keep from the scarecrow; larger if it faces / heads for us
 local FACE_SIGN = 1                          -- verified: the client pivots the model with lookAt(pos, pos+heading), so LookVector = facing
-local BLOCK_HIDE = 14                     -- seconds we hide out of sight before creeping back to slip past
+local BLOCK_HIDE = 2.5                    -- only a short fallback; race planning below is preferred
 local SLIP_LANE, SLIP_AFTER = 5.9, 3          -- game: CatchRadius 5, corridor half-width 7 (cell 16, wall 2) -> only a lane ~5.9 studs off-centre clears it
 local function scareMargin(st, m, me)
 	if m.hunting then return MARGIN_FACING end
@@ -5079,6 +5079,23 @@ local function escapePath(g, me, ctx)
 	if best then return pathTo(prev, me, best) end
 end
 
+-- The conservative safe-search uses the full scarecrow margin.  That is
+-- correct for waiting, but it can make the bot hide even when it can cross a
+-- corridor and arrive at the destination before the scarecrow can enter any
+-- of those cells.  This admits that route with a small hitbox buffer instead.
+local function winningRaceRoute(g, me, goal, ctx, blocked)
+	local route = bfsAvoiding(g, me, goal, blocked)
+	if not route then return nil end
+	local hitboxBuffer = math.max(0.2, ctx.ct * 0.35)
+	for i = 1, #route do
+		local playerTime = (i - 1) * ctx.ct
+		if eta(ctx, route[i]) - playerTime < hitboxBuffer then
+			return nil
+		end
+	end
+	return route, eta(ctx, goal) - (#route - 1) * ctx.ct
+end
+
 -- returns route (starting at `me`), mode, spare seconds on our own cell, ctx
 local function decide(st, g, me, goal, ps, opts)
 	local ctx = dangerCtx(st, g)
@@ -5105,6 +5122,14 @@ local function decide(st, g, me, goal, ps, opts)
 		end
 	end
 	local gd = bfsCached(g, goal)
+	-- Prefer a continuous run whenever we can cross every route cell before the
+	-- scarecrow can reach that cell.  This is intentionally checked before the
+	-- flee/hide branch: being close is not a reason to hide if we are winning.
+	local race, raceSpare = winningRaceRoute(g, me, goal, ctx, ps.blockedEdges)
+	if race then
+		ps.refuge, ps.advance, ps.retreat, ps.slip, ps.blocked, ps.fleeing = nil, nil, nil, false, nil, false
+		return race, "BEATING SCARECROW", raceSpare, ctx
+	end
 	-- too close to stand still (or trapped in a dead end while hunted): run to the best refuge / dodge cell
 	if s0 < math.max(stay, 1.2) or not trapOk or (ps.fleeing and s0 < 2.5) then
 		ps.fleeing = true
