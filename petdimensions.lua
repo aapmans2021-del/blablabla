@@ -4643,7 +4643,6 @@ local COL = {
 	bg = Color3.fromRGB(18, 27, 26), card = Color3.fromRGB(31, 44, 40), white = Color3.new(1, 1, 1),
 }
 -- tuning ---------------------------------------------------------------------------------------
-local HITBOX_CELLS = 1.0   -- scarecrow hitbox, in cells (it blocks a whole cell)
 local TURN_PENALTY = 1.12  -- real walking is slower than cellSize/speed (corners, acceleration)
 local SAFETY_BUF = 0.25    -- extra seconds of margin
 local STAY_SLACK = 1.5     -- seconds of spare time we need to keep standing on a cell
@@ -4653,7 +4652,7 @@ local EXIT_STOP, CANDY_STOP = 3, 3.5
 
 -- state ----------------------------------------------------------------------------------------
 local running, moveToken, jobRunning, autoOn = true, 0, false, false
-local O = {avoid = true, candyFirst = true, candyEsp = true, hatch = true, escape = true, scout = true,
+local O = {slip = true, avoid = true, candyFirst = true, candyEsp = true, hatch = true, escape = true, scout = true,
 	path = true, pin = false, zoom = false, minLuck = 10, hatchSeconds = 60, speed = 20}
 local eggNames, eggSettings, savedEggSettings = {}, {}, {}
 local rejected = setmetatable({}, {__mode = "k"})
@@ -4925,29 +4924,50 @@ local function scareCps(st, hunting)
 	return math.max(v * 1.08, 0.3)
 end
 
+-- ── v5 scarecrow avoidance ────────────────────────────────────────────────────────────────────
+local MARGIN_BASE, MARGIN_FACING = 1.0, 1.2 -- cells we keep from the scarecrow; larger if it faces / heads for us
+local FACE_SIGN = 1                          -- verified: the client pivots the model with lookAt(pos, pos+heading), so LookVector = facing
+local SLIP_LANE, SLIP_AFTER = 5.9, 3          -- game: CatchRadius 5, corridor half-width 7 (cell 16, wall 2) -> only a lane ~5.9 studs off-centre clears it
+local function scareMargin(st, m, me)
+	if m.hunting then return MARGIN_FACING end
+	local mp, pp = m.pos, cellPos(st, me)
+	local to = Vector3.new(pp.X - mp.X, 0, pp.Z - mp.Z)
+	if to.Magnitude < 1e-3 then return MARGIN_FACING end
+	to = to.Unit
+	local a, b = cellPos(st, m.a), cellPos(st, m.b)
+	local hd = Vector3.new(b.X - a.X, 0, b.Z - a.Z)
+	if hd.Magnitude > 1e-3 and hd.Unit:Dot(to) > 0.3 then return MARGIN_FACING end
+	local mz = getMaze(); local sc = mz and mz:FindFirstChild("Scarecrow")
+	if sc then
+		local lv = sc:GetPivot().LookVector * FACE_SIGN
+		lv = Vector3.new(lv.X, 0, lv.Z)
+		if lv.Magnitude > 1e-3 and lv.Unit:Dot(to) > 0.5 then return MARGIN_FACING end
+	end
+	return MARGIN_BASE
+end
 local function dangerCtx(st, g)
 	if not O.avoid then return nil end
-	local m = monsterModel(st)
+	local m, root = monsterModel(st), getRoot()
 	if not m then return nil end
 	local b = m.b or posCell(st, m.pos)
-	if not b then return nil end
-	local mt = 1 / scareCps(st, m.hunting)               -- seconds the scarecrow needs per cell
-	local ct = st.cs / math.max(O.speed, 1) * TURN_PENALTY -- seconds we need per cell
+	local me = root and posCell(st, root.Position)
+	if not (b and me) then return nil end
+	local mt = 1 / scareCps(st, m.hunting)
+	local ct = st.cs / math.max(O.speed, 1) * TURN_PENALTY
 	local clearA = 0
 	if m.a ~= m.b and m.f < 0.8 then clearA = (0.8 - m.f) * math.max(m.seg, mt) end
 	return {m = m, dist = bfsCached(g, b), a = m.a, b = b, tb = m.tb, mt = mt, ct = ct, clearA = clearA,
-		pad = 0.5 * ct + HITBOX_CELLS * mt + SAFETY_BUF, hunting = m.hunting}
+		pad = 0.5 * ct + scareMargin(st, m, me) * mt + SAFETY_BUF, hunting = m.hunting, face = scareMargin(st, m, me) > MARGIN_BASE}
 end
-local function eta(ctx, c) -- earliest the scarecrow could be standing on cell c (seconds from now)
+local function eta(ctx, c)
 	local d = ctx.dist[c]
 	if d == nil then return 1e9 end
 	return ctx.tb + d * ctx.mt
 end
-local function slack(ctx, c, t) -- spare seconds if we are on cell c at time t (< 0 = unsafe)
+local function slack(ctx, c, t)
 	if c == ctx.a and ctx.a ~= ctx.b and t < ctx.clearA + ctx.pad * 0.6 then return -1 end
 	return eta(ctx, c) - t - ctx.pad
 end
--- earliest-arrival BFS over the cells we can enter, and leave, before the scarecrow can threaten them
 local function safeSearch(g, me, ctx, maxSteps)
 	local steps, prev, order, h = {[me] = 0}, {}, {me}, 1
 	while order[h] do
@@ -4955,21 +4975,51 @@ local function safeSearch(g, me, ctx, maxSteps)
 		local s = steps[c] + 1
 		if s <= maxSteps then
 			for _, nb in ipairs(nbrs(g, c)) do
-				if steps[nb] == nil and slack(ctx, nb, s * ctx.ct) >= 0 then
-					steps[nb] = s; prev[nb] = c; order[#order + 1] = nb
-				end
+				if steps[nb] == nil and slack(ctx, nb, s * ctx.ct) >= 0 then steps[nb] = s; prev[nb] = c; order[#order + 1] = nb end
 			end
 		end
 	end
 	return steps, prev
+end
+-- dead-end branch info: returns mouth cell (first junction outside the branch) and depth, or nil if `cell` is not in a dead end
+local function branchInfo(g, cell)
+	g.trap = g.trap or {}
+	local t = g.trap[cell]
+	if t == nil then
+		t = false
+		if dangling(g)[cell] then
+			local dang, seen, q, h = dangling(g), {[cell] = 0}, {cell}, 1
+			while q[h] and not t do
+				local c = q[h]; h += 1
+				for _, nb in ipairs(nbrs(g, c)) do
+					if not dang[nb] then t = {nb, seen[c] + 1}; break end
+					if seen[nb] == nil then seen[nb] = seen[c] + 1; q[#q + 1] = nb end
+				end
+			end
+		end
+		g.trap[cell] = t
+	end
+	if t then return t[1], t[2] end
+end
+-- cells where a chaser can be side-stepped: corners (2) and 2-long hallways (1.5); never dead ends
+local function dodgeShape(g, c)
+	if dangling(g)[c] then return 0 end
+	local n = nbrs(g, c)
+	if #n ~= 2 then return 0 end
+	local x0, z0 = Common.CellXZ(g.n, c)
+	local x1, z1 = Common.CellXZ(g.n, n[1])
+	local x2, z2 = Common.CellXZ(g.n, n[2])
+	if math.abs(x1 + x2 - 2 * x0) > 1e-3 or math.abs(z1 + z2 - 2 * z0) > 1e-3 then return 2 end
+	if #nbrs(g, n[1]) == 2 or #nbrs(g, n[2]) == 2 then return 1.5 end
+	return 0
 end
 local function pickRefuge(g, me, ctx, steps, prevTarget, gd)
 	local dang = dangling(g)
 	local best, bs
 	for c, s in pairs(steps) do
 		if c ~= me then
-			local sc = math.min(slack(ctx, c, s * ctx.ct), 8) + math.min(ctx.dist[c] or 20, 14) * 0.5 - s * 0.2
-			if dang[c] then sc -= 6 end
+			local sc = math.min(slack(ctx, c, s * ctx.ct), 8) + math.min(ctx.dist[c] or 20, 14) * 0.5 - s * 0.2 + dodgeShape(g, c) * 1.5
+			if dang[c] then sc -= 12 end
 			if #nbrs(g, c) >= 3 then sc += 1.5 end
 			if gd and gd[c] then sc -= gd[c] * 0.15 end
 			if c == prevTarget then sc += 2.5 end
@@ -4981,35 +5031,35 @@ end
 
 -- returns route (starting at `me`), mode, spare seconds on our own cell, ctx
 local function decide(st, g, me, goal, ps, opts)
-    -- Eggs use the same full BFS as the exit: never creep cell-by-cell.
-    if opts.directGoal then
-        ps.refuge, ps.advance = nil, nil
-        local _, prev = bfsPrev(g, me)
-        return pathTo(prev, me, goal), "egg route", nil, nil
-    end
 	local ctx = dangerCtx(st, g)
 	if not ctx then
-		ps.refuge, ps.advance = nil, nil
+		ps.refuge, ps.advance, ps.slip, ps.blocked = nil, nil, false, nil
 		local _, prev = bfsPrev(g, me)
 		return pathTo(prev, me, goal), "clear", nil, nil
 	end
 	local stay, enter = opts.stay or STAY_SLACK, opts.enter or 0
 	local s0 = slack(ctx, me, 0)
 	local steps, prev = safeSearch(g, me, ctx, 60)
-	-- 1) the goal can be reached (and, for the final cell, stood on) with time to spare
-	if steps[goal] ~= nil then
+	-- dead-end goal (corner egg): only commit if, once hunted, we can get in AND back out to the mouth in time
+	local mouth, depth = branchInfo(g, goal)
+	local trapOk = true
+	if mouth and ctx.hunting then
+		local inT = goal == me and 0 or ((bfsCached(g, me)[mouth] or 0) + depth) * ctx.ct
+		trapOk = eta(ctx, mouth) - inT - depth * ctx.ct - ctx.pad >= (goal == me and 1 or 3)
+	end
+	if steps[goal] ~= nil and trapOk then
 		local ok
 		if goal == me then ok = s0 >= stay else ok = slack(ctx, goal, steps[goal] * ctx.ct) >= enter end
 		if ok then
-			ps.refuge, ps.advance = nil, nil
+			ps.refuge, ps.advance, ps.slip, ps.blocked = nil, nil, false, nil
 			return pathTo(prev, me, goal), (s0 < 4 and "racing" or "normal"), s0, ctx
 		end
 	end
 	local gd = bfsCached(g, goal)
-	-- 2) the scarecrow is too close for us to stay put: run to the best refuge
-	if s0 < math.max(stay, 1.2) then
+	-- too close to stand still (or trapped in a dead end while hunted): run to the best refuge / dodge cell
+	if s0 < math.max(stay, 1.2) or not trapOk then
 		local r = pickRefuge(g, me, ctx, steps, ps.refuge, gd)
-		if r then ps.refuge, ps.advance = r, nil; return pathTo(prev, me, r), "FLEEING", s0, ctx end
+		if r then ps.refuge, ps.advance, ps.slip = r, nil, false; return pathTo(prev, me, r), "FLEEING", s0, ctx end
 		local bestN, bestV
 		for _, nb in ipairs(nbrs(g, me)) do
 			local v = eta(ctx, nb)
@@ -5018,14 +5068,16 @@ local function decide(st, g, me, goal, ps, opts)
 		if bestN then return {me, bestN}, "desperate", s0, ctx end
 		return {me}, "trapped", s0, ctx
 	end
-	-- 3) safe right now but the goal is blocked: creep as close to it as stays safe, otherwise wait here
+	-- safe now but the goal is blocked: creep to the best safe cell near it (prefer dodge-shaped cells)
+	local now = os.clock()
+	ps.blocked = ps.blocked or now
 	local best, bScore
 	for c, s in pairs(steps) do
 		local d = gd[c]
 		if d then
 			local sl = slack(ctx, c, s * ctx.ct)
 			if sl >= 2 then
-				local sc = -d * 10 + math.min(sl, 6) - s * 0.1
+				local sc = -d * 10 + math.min(sl, 6) - s * 0.1 + dodgeShape(g, c) * 2
 				if c == ps.advance then sc += 4 end
 				if not bScore or sc > bScore then best, bScore = c, sc end
 			end
@@ -5036,7 +5088,27 @@ local function decide(st, g, me, goal, ps, opts)
 		return pathTo(prev, me, best), "advancing", s0, ctx
 	end
 	ps.advance = nil
+	-- still blocked after a while: sprint past it along the far lane (only if it isn't hunting / facing us)
+	if O.slip ~= false and (ps.slip or now - ps.blocked > SLIP_AFTER) and not ctx.hunting and not ctx.face and trapOk and (ctx.dist[me] or 99) <= 3 then
+		local _, p2 = bfsPrev(g, me)
+		local r = pathTo(p2, me, goal)
+		if r then ps.slip = true; return r, "SLIP", s0, ctx end
+	end
+	ps.slip = false
 	return {me}, "waiting", s0, ctx
+end
+-- sprint lane: while passing the scarecrow, run the far-wall lane (>5 studs from its path = outside CatchRadius), at full speed
+local function slipAim(st, aim, root)
+	local m = monsterModel(st)
+	if not m or hdist(root.Position, m.pos) > 2.2 * st.cs then return aim end
+	local d = Vector3.new(aim.X - root.Position.X, 0, aim.Z - root.Position.Z)
+	if d.Magnitude < 1e-3 then return aim end
+	d = d.Unit
+	local perp = Vector3.new(-d.Z, 0, d.X)
+	local side = perp:Dot(Vector3.new(m.pos.X - root.Position.X, 0, m.pos.Z - root.Position.Z)) >= 0 and -1 or 1
+	local c = cellPos(st, posCell(st, root.Position))
+	local lat = perp:Dot(Vector3.new(root.Position.X - c.X, 0, root.Position.Z - c.Z))
+	return aim + perp * (side * SLIP_LANE - lat)
 end
 -- steps from `me` over cells we can safely enter (plain BFS when AVOID is off)
 local function reachSteps(st, g, me)
@@ -5163,16 +5235,10 @@ local function aimPoint(st, route, root, tp, routeIndex)
     if last > nextIndex then
 		local horizontal = math.abs(dx) > 1e-3
 		local lateral = horizontal and math.abs(root.Position.Z - p.Z) or math.abs(root.Position.X - p.X)
-		-- Do NOT fall back to the next cell when we are slightly off-center.
-		-- That fallback was the cause of Auto visibly stopping at every cell on
-		-- long straight runs: MoveTo() was being given only one cell at a time
-		-- until the character re-centered. Keep the long straight target and
-		-- preserve the current lateral position so Humanoid movement can correct
-		-- itself continuously without stopping.
-		if horizontal then
-			p = Vector3.new(p.X, p.Y, root.Position.Z)
+		if lateral <= math.max(st.cs * 0.5 - 2.5, 0.5) then
+			if horizontal then p = Vector3.new(p.X, p.Y, root.Position.Z) else p = Vector3.new(root.Position.X, p.Y, p.Z) end
 		else
-			p = Vector3.new(root.Position.X, p.Y, p.Z)
+			p = cellPos(st, route[nextIndex])
 		end
 	end
 	return Vector3.new(p.X, root.Position.Y, p.Z)
@@ -5192,7 +5258,7 @@ local function walk(token, getTarget, stop, label, opts)
 	local s0 = getState()
 	local floor0 = s0 and s0.floor
 	local ps, lastPos, lastT, lastInt, lastDraw, waitStart = {}, nil, os.clock(), 0, 0, os.clock()
-    local route, routeMode, routeSpare, plannedGoal, plannedAt, routeCursor, activeAim, lastMoveTo
+    local route, routeMode, routeSpare, plannedGoal, plannedAt, routeCursor, activeAim
     routeCursor = 1
 	while running and token == moveToken do
 		local st, root, hum = getState(), getRoot(), getHum()
@@ -5216,7 +5282,7 @@ local function walk(token, getTarget, stop, label, opts)
             routeIndex = routeIndexFor(route, me, 1)
         end
         if routeIndex then routeCursor = routeIndex end
-        local replanInterval = opts.directGoal and 2.0 or 0.35
+        local replanInterval = 0.35
         local needsPlan = not plannedAt or now - plannedAt >= replanInterval or goal ~= plannedGoal
             or (route and not routeIndex)
         if needsPlan then
@@ -5245,79 +5311,23 @@ local function walk(token, getTarget, stop, label, opts)
 		end
 		if opts.onMove then opts.onMove() end
 		if opts.timeout and now - waitStart > opts.timeout then hum:MoveTo(root.Position); return "timeout" end
-		-- Keep a continuous look-ahead MoveTo target. The previous Auto movement
-        -- only refreshed Humanoid:MoveTo when the target changed. Roblox can time
-        -- out a MoveTo internally, which made Auto stop on a cell and then move
-        -- again when the next route update happened.
-        local aim
+		local aim
         local movementTarget = tp
-
-        -- Egg/manual MOVE behaviour: when the remaining route from the
-        -- player's current cell to the egg is one uninterrupted straight
-        -- corridor, send Humanoid:MoveTo directly to the egg itself.
-        -- The old Auto code converted this into a cell-centre target through
-        -- aimPoint(), which is why Auto could pause on every cell even though
-        -- clicking MOVE on the same egg drove straight to it.
-        local directCorridor = false
-        if opts.directGoal and route and #route - routeCursor >= 1 then
-            local first = routeCursor
-            local second = first + 1
-            local x0, z0 = Common.CellXZ(st.n, route[first])
-            local x1, z1 = Common.CellXZ(st.n, route[second])
-            local dx, dz = x1 - x0, z1 - z0
-            directCorridor = true
-            for i = second + 1, #route do
-                local px, pz = Common.CellXZ(st.n, route[i - 1])
-                local cx, cz = Common.CellXZ(st.n, route[i])
-                if math.abs(cx - px - dx) > 1e-3 or math.abs(cz - pz - dz) > 1e-3 then
-                    directCorridor = false
-                    break
-                end
-            end
-        end
-
-        if directCorridor then
-            -- Keep the real egg position as the MoveTo destination instead
-            -- of the next cell. This is the same movement style as the
-            -- Overview-tab MOVE button and is refreshed continuously below.
-            aim = Vector3.new(movementTarget.X, root.Position.Y, movementTarget.Z)
-        elseif #route - routeCursor >= 1 then
-            aim = aimPoint(st, route, root, movementTarget, routeCursor)
-        elseif mode == "waiting" or mode == "trapped" then
-            aim = nil
-        else
-            aim = Vector3.new(movementTarget.X, root.Position.Y, movementTarget.Z)
-        end
-
+        if #route - routeCursor >= 1 then aim = aimPoint(st, route, root, movementTarget, routeCursor)
+		elseif mode == "waiting" or mode == "trapped" then aim = nil
+        else aim = Vector3.new(movementTarget.X, root.Position.Y, movementTarget.Z) end
+        if aim and ps.slip then aim = slipAim(st, aim, root) end
         local activeCell = activeAim and posCell(st, activeAim)
         local activeIndex = activeCell and routeIndexFor(route, activeCell, routeCursor)
         local activeStillValid = activeAim and activeIndex and activeIndex > routeCursor
-            and hdist(root.Position, activeAim) > st.cs * 0.20
-
-        if activeStillValid and aim then
-            -- If the old target is still farther ahead on the same valid route,
-            -- keep it instead of collapsing to the newly entered cell.
-            local activeDist = hdist(root.Position, activeAim)
-            local newDist = hdist(root.Position, aim)
-            if activeDist > newDist + 0.5 then
-                aim = activeAim
-            end
-        end
-
+            and hdist(root.Position, activeAim) > st.cs * 0.35
+        if activeStillValid then aim = activeAim end
         if aim then
-            -- Refresh every 0.30s even when the target has not changed. This
-            -- prevents Humanoid:MoveTo timeout/stalling on long straight runs.
-            if not activeAim
-                or (aim - activeAim).Magnitude >= 0.5
-                or now - lastMoveTo >= 0.30 then
-                hum:MoveTo(aim)
-                activeAim = aim
-                lastMoveTo = now
+            if not activeAim or (aim - activeAim).Magnitude >= 0.75 then
+                hum:MoveTo(aim); activeAim = aim
             end
         elseif activeAim then
-            hum:MoveTo(root.Position)
-            activeAim = nil
-            lastMoveTo = now
+            hum:MoveTo(root.Position); activeAim = nil
         end
         if needsPlan and now - lastDraw >= 0.2 then
 			lastDraw = now
@@ -5476,15 +5486,9 @@ local function scoutEggs(token)
 				local p = posOf(egg); local ec = p and posCell(st, p)
 				local tried = scoutTried[egg]
 				if not tried then tried = {n = 0}; scoutTried[egg] = tried end
-				if ec and tried.n < 4 then
-					local vis, order = sightCells(st, g, ec)
-					for _, c in ipairs(order) do
-						local d = dist[c]
-						if d and not tried[c] then
-							local s = d + vis[c] * 0.6
-							if not bScore or s < bScore then bScore, bEgg, bCell = s, egg, c end
-						end
-					end
+				if ec and tried.n < 2 then
+					local d = dist[ec]
+					if d and (not bScore or d < bScore) then bScore, bEgg, bCell = d, egg, ec end
 				end
 			end
 		end
@@ -5547,6 +5551,8 @@ local function autoLoop(token)
 			end
 		end
 		if token ~= moveToken or not autoOn then return end
+		local eggsBefore = {}
+		for _, e in ipairs(getEggs()) do eggsBefore[e] = true end
 		local r = walk(token, exitTarget, EXIT_STOP, "EXIT", {interrupt = function(state) return O.hatch and hasEligibleEgg(state) end})
 		if r == "cancelled" then return end
 		if r == "reconsider" then continue end
@@ -5554,8 +5560,25 @@ local function autoLoop(token)
 		local eggsAppeared = false
 		while running and token == moveToken do
 			local s3 = getState()
-			if not s3 or s3.floor ~= floor or os.clock() - t > 8 then break end
-			if O.hatch and hasEligibleEgg(s3) then eggsAppeared = true; break end
+			if not s3 then break end
+			if s3.floor ~= floor then
+				local t2 = os.clock()
+				while running and token == moveToken and os.clock() - t2 < 8 do
+					local list = getEggs()
+					local fresh = false
+					for _, e in ipairs(list) do
+						if not eggsBefore[e] then fresh = true; break end
+					end
+					if not fresh and next(eggsBefore) == nil and #list > 0 then fresh = true end
+					if fresh then break end
+					setStatus("waiting for eggs to refresh"); task.wait(0.2)
+				end
+				task.wait(0.3)
+				eggsAppeared = true
+				break
+			end
+			if os.clock() - t > 8 then break end
+			
 			setStatus("✅ at exit, waiting for next floor..."); task.wait(0.2)
 		end
 		if eggsAppeared then continue end
