@@ -5108,130 +5108,53 @@ local function routeBlocked(g, route, ctx, me)
 end
 
 -- returns route (starting at `me`), mode, spare seconds on our own cell, ctx
+local function bfsAvoid(g, me, bad)
+	local prev, depth, q, h = {}, {[me] = 0}, {me}, 1
+	while q[h] do
+		local c = q[h]; h += 1
+		for _, nb in ipairs(nbrs(g, c)) do
+			if depth[nb] == nil and not bad(nb) then depth[nb] = depth[c] + 1; prev[nb] = c; q[#q + 1] = nb end
+		end
+	end
+	return prev, depth
+end
+-- simple + fast: walk the shortest route that avoids a small bubble around the scarecrow; break away if inside it
 local function decide(st, g, me, goal, ps, opts)
 	local ctx = dangerCtx(st, g)
 	if not ctx then
-		ps.refuge, ps.advance, ps.slip, ps.blocked, ps.fleeing, ps.hold = nil, nil, false, nil, false, false
-		local _, prev = bfsPrev(g, me)
-		return pathTo(prev, me, goal), "clear", nil, nil
+		ps.blocked = nil
+		local _, p = bfsPrev(g, me)
+		return pathTo(p, me, goal), "clear", nil, nil
 	end
-	local stay, enter = opts.stay or STAY_SLACK, opts.enter or 0
-	local s0 = slack(ctx, me, 0)
-	local steps, prev = safeSearch(g, me, ctx, 60)
-	-- dead-end goal (corner egg): only commit if, once hunted, we can get in AND back out to the mouth in time
-	local mouth, depth = branchInfo(g, goal)
-	local trapOk = true
-	if mouth and ctx.hunting then
-		local inT = goal == me and 0 or ((bfsCached(g, me)[mouth] or 0) + depth) * ctx.ct
-		trapOk = eta(ctx, mouth) - inT - depth * ctx.ct - ctx.pad >= (goal == me and 1 or 3)
-	end
-	if steps[goal] ~= nil and trapOk then
-		local ok
-		if goal == me then ok = s0 >= stay
-		else
-			ok = slack(ctx, goal, steps[goal] * ctx.ct) >= enter
-			if ok and not ps.moving then -- hysteresis: starting to walk needs a bit more margin than continuing
-				local p = pathTo(prev, me, goal)
-				for i = 2, #(p or {}) do if slack(ctx, p[i], (i - 1) * ctx.ct) < 1 then ok = false; break end end
-			end
-		end
-		if ok then
-			ps.moving = true
-			ps.refuge, ps.advance, ps.slip, ps.blocked, ps.fleeing, ps.hold = nil, nil, false, nil, false, false
-			return pathTo(prev, me, goal), (s0 < 4 and "racing" or "normal"), s0, ctx
-		end
-	end
-	local gd = bfsCached(g, goal)
-	-- too close to stand still (or trapped in a dead end while hunted): run to the best refuge / dodge cell
-	if s0 < math.max(stay, 1.2) or not trapOk or (ps.fleeing and s0 < 2.5) then
-		ps.fleeing, ps.moving = true, false
-		-- commit to the current refuge while it is still safely reachable (stops left/right flip-flopping)
-		local r = ps.refuge
-		if not (r and r ~= me and steps[r] ~= nil and slack(ctx, r, steps[r] * ctx.ct) >= 0.5) then
-			r = pickRefuge(g, me, ctx, steps, ps.refuge, gd)
-		end
-		if r then ps.refuge, ps.advance, ps.slip = r, nil, false; return pathTo(prev, me, r), "FLEEING", s0, ctx end
-		local ep = escapePath(g, me, ctx)
-		if ep then return ep, "ESCAPING", s0, ctx end
-		local bestN, bestV
-		for _, nb in ipairs(nbrs(g, me)) do
-			local v = eta(ctx, nb)
-			if not bestV or v > bestV then bestN, bestV = nb, v end
-		end
-		if bestN then return {me, bestN}, "desperate", s0, ctx end
-		return {me}, "trapped", s0, ctx
-	end
-	ps.fleeing, ps.moving = false, false
 	local now = os.clock()
+	local R = ctx.hunting and 3 or (ctx.face and 2.2 or 2)  -- bubble radius in cells (path distance)
+	if ps.blocked and now - ps.blocked > 5 then R = math.min(R, 1.2) end -- never wait long
+	local d = ctx.dist
+	local function bad(c) return (d[c] or 99) <= R end
+	if bad(me) then
+		local ep = escapePath(g, me, ctx)
+		if ep and #ep > 1 then return ep, "ESCAPING", nil, ctx end
+	end
+	local mouth, depth = branchInfo(g, goal)
+	local trapBad = mouth and ctx.hunting and goal ~= me and (d[mouth] or 99) <= depth + 4
+	local prev, dep = bfsAvoid(g, me, bad)
+	if not trapBad and dep[goal] ~= nil then
+		ps.blocked = nil
+		return pathTo(prev, me, goal), "go", nil, ctx
+	end
 	ps.blocked = ps.blocked or now
-	if ctx.hunting then
-		-- hunted and blocked: LURE it. Stay ~4 cells ahead (so it keeps following, no hiding) and lead it away from the goal
-		local dang = dangling(g)
-		local function ok(c) return c ~= me and steps[c] ~= nil and slack(ctx, c, steps[c] * ctx.ct) >= 0.5 end
-		local l = ps.lure
-		if not (l and ok(l)) then
-			l = nil
-			local bs
-			for c, n in pairs(steps) do
-				if ok(c) then
-					local sc = -math.abs((ctx.dist[c] or 20) - 4) * 1.5 + math.min(gd[c] or 0, 24) * 0.8 + dodgeShape(g, c) - n * 0.2 - (dang[c] and 10 or 0)
-					if not bs or sc > bs then l, bs = c, sc end
-				end
-			end
-			ps.lure = l
-		end
-		if l then return pathTo(prev, me, l), "LURING", s0, ctx end
+	local dang, best, bs = dangling(g), nil, nil
+	for c, n in pairs(dep) do
+		local sc = math.min(d[c] or 20, 8) - n * 0.3 + dodgeShape(g, c) - (dang[c] and 8 or 0) + (c == me and 2 or 0) + (c == ps.retreat and 3 or 0)
+		if not bs or sc > bs then best, bs = c, sc end
 	end
-	if not ctx.hunting and now - ps.blocked < BLOCK_HIDE then
-		-- blocked: back off far, out of the scarecrow's line of sight, so it wanders away from the goal
-		local vis, dang = sightCells(st, g, ctx.b), dangling(g)
-		local plainP = select(2, bfsPrev(g, me))
-		local onRoute = {}
-		for _, c in ipairs(pathTo(plainP, me, goal) or {}) do onRoute[c] = true end
-		local function off(c) return c == me or not onRoute[c] end
-		local r = ps.retreat
-		if not (r and steps[r] ~= nil and off(r) and slack(ctx, r, steps[r] * ctx.ct) >= 1) then
-			r = nil
-			local bs
-			for c, n in pairs(steps) do
-				if off(c) and slack(ctx, c, n * ctx.ct) >= 1 then
-					local sc = math.min(slack(ctx, c, n * ctx.ct), 8) + dodgeShape(g, c) - n * 0.5 + (c == me and 2 or 0)
-					if vis[c] ~= nil then sc -= 4 end
-					if dang[c] then sc -= 8 end
-					if not bs or sc > bs then r, bs = c, sc end
-				end
-			end
-			ps.retreat = r
-		end
-		if r and r ~= me then return pathTo(prev, me, r), "BACKING OFF", s0, ctx end
-		return {me}, "waiting for hallway", s0, ctx
-	end
-	ps.retreat = nil
-	local best, bScore
-	for c, s in pairs(steps) do
-		local d = gd[c]
-		if d then
-			local sl = slack(ctx, c, s * ctx.ct)
-			if sl >= 2 then
-				local sc = -d * 10 + math.min(sl, 6) - s * 0.1 + dodgeShape(g, c) * 2
-				if c == ps.advance then sc += 4 end
-				if not bScore or sc > bScore then best, bScore = c, sc end
-			end
-		end
-	end
-	if best and best ~= me and (gd[best] or 99) < (gd[me] or 99) then
-		ps.advance, ps.refuge = best, nil
-		return pathTo(prev, me, best), "advancing", s0, ctx
-	end
-	ps.advance = nil
-	-- still blocked after a while: sprint past it along the far lane (only if it isn't hunting / facing us)
-	if O.slip ~= false and (ps.slip or now - ps.blocked > SLIP_AFTER) and not ctx.hunting and not ctx.face and trapOk and (ctx.dist[me] or 99) <= 3 then
-		local _, p2 = bfsPrev(g, me)
-		local r = pathTo(p2, me, goal)
-		if r then ps.slip = true; return r, "SLIP", s0, ctx end
-	end
-	ps.slip = false
-	return {me}, "waiting", s0, ctx
+	ps.retreat = best
+	if best and best ~= me then return pathTo(prev, me, best), "BACKING OFF", nil, ctx end
+	return {me}, "waiting", nil, ctx
+end
+-- cells we can walk to (plain BFS; the scarecrow bubble only matters for the main route)
+local function reachSteps(st, g, me)
+	return bfsCached(g, me), dangerCtx(st, g)
 end
 -- sprint lane: while passing the scarecrow, run the far-wall lane (>5 studs from its path = outside CatchRadius), at full speed
 local function slipAim(st, aim, root)
@@ -5246,13 +5169,6 @@ local function slipAim(st, aim, root)
 	local lat = perp:Dot(Vector3.new(root.Position.X - c.X, 0, root.Position.Z - c.Z))
 	return aim + perp * (side * SLIP_LANE - lat)
 end
--- steps from `me` over cells we can safely enter (plain BFS when AVOID is off)
-local function reachSteps(st, g, me)
-	local ctx = dangerCtx(st, g)
-	if ctx then return (safeSearch(g, me, ctx, 80)), ctx end
-	return bfsCached(g, me), nil
-end
-
 -- blue path (pooled) ---------------------------------------------------------------------------
 local pathFolder = new("Folder", {Name = "HMV2_Path"}, Workspace)
 local segs, activeSegmentCount = {}, 0
@@ -5488,7 +5404,7 @@ local function nearestCandy(st, g, me)
 		if not candyIgnore[c] then
 			local p = posOf(c); local cell = p and posCell(st, p)
 			local s = cell and steps[cell]
-			if s and (not ctx or slack(ctx, cell, s * ctx.ct) >= 2) and (not bd or s < bd) then best, bd = c, s end
+			if s and (not ctx or (ctx.dist[cell] or 99) > 3) and (not bd or s < bd) then best, bd = c, s end
 		end
 	end
 	return best
