@@ -4969,14 +4969,40 @@ local function slack(ctx, c, t)
 	if c == ctx.a and ctx.a ~= ctx.b and t < ctx.clearA + ctx.pad * 0.6 then return -1 end
 	return eta(ctx, c) - t - ctx.pad
 end
-local function safeSearch(g, me, ctx, maxSteps)
+-- A failed movement edge is treated as a temporary obstacle.  This lets the
+-- planner route around a wall corner or scarecrow hitbox push instead of
+-- retrying the same route forever.
+local function edgeKey(a, b)
+	if a > b then a, b = b, a end
+	return tostring(a) .. ":" .. tostring(b)
+end
+local function edgeBlocked(blocked, a, b)
+	local untilTime = blocked and blocked[edgeKey(a, b)]
+	return untilTime and untilTime > os.clock()
+end
+local function bfsAvoiding(g, src, dst, blocked)
+	local prev, q, h = {}, {src}, 1
+	while q[h] do
+		local c = q[h]; h += 1
+		if c == dst then return pathTo(prev, src, dst) end
+		for _, nb in ipairs(nbrs(g, c)) do
+			if prev[nb] == nil and nb ~= src and not edgeBlocked(blocked, c, nb) then
+				prev[nb] = c; q[#q + 1] = nb
+			end
+		end
+	end
+	return nil
+end
+local function safeSearch(g, me, ctx, maxSteps, blocked)
 	local steps, prev, order, h = {[me] = 0}, {}, {me}, 1
 	while order[h] do
 		local c = order[h]; h += 1
 		local s = steps[c] + 1
 		if s <= maxSteps then
 			for _, nb in ipairs(nbrs(g, c)) do
-				if steps[nb] == nil and slack(ctx, nb, s * ctx.ct) >= 0 then steps[nb] = s; prev[nb] = c; order[#order + 1] = nb end
+				if steps[nb] == nil and not edgeBlocked(blocked, c, nb) and slack(ctx, nb, s * ctx.ct) >= 0 then
+					steps[nb] = s; prev[nb] = c; order[#order + 1] = nb
+				end
 			end
 		end
 	end
@@ -5058,12 +5084,11 @@ local function decide(st, g, me, goal, ps, opts)
 	local ctx = dangerCtx(st, g)
 	if not ctx then
 		ps.refuge, ps.advance, ps.slip, ps.blocked, ps.fleeing = nil, nil, false, nil, false
-		local _, prev = bfsPrev(g, me)
-		return pathTo(prev, me, goal), "clear", nil, nil
+		return bfsAvoiding(g, me, goal, ps.blockedEdges), "clear", nil, nil
 	end
 	local stay, enter = opts.stay or STAY_SLACK, opts.enter or 0
 	local s0 = slack(ctx, me, 0)
-	local steps, prev = safeSearch(g, me, ctx, 60)
+	local steps, prev = safeSearch(g, me, ctx, 60, ps.blockedEdges)
 	-- dead-end goal (corner egg): only commit if, once hunted, we can get in AND back out to the mouth in time
 	local mouth, depth = branchInfo(g, goal)
 	local trapOk = true
@@ -5142,8 +5167,7 @@ local function decide(st, g, me, goal, ps, opts)
 	ps.advance = nil
 	-- still blocked after a while: sprint past it along the far lane (only if it isn't hunting / facing us)
 	if O.slip ~= false and (ps.slip or now - ps.blocked > SLIP_AFTER) and not ctx.hunting and not ctx.face and trapOk and (ctx.dist[me] or 99) <= 3 then
-		local _, p2 = bfsPrev(g, me)
-		local r = pathTo(p2, me, goal)
+		local r = bfsAvoiding(g, me, goal, ps.blockedEdges)
 		if r then ps.slip = true; return r, "SLIP", s0, ctx end
 	end
 	ps.slip = false
@@ -5309,7 +5333,7 @@ local function walk(token, getTarget, stop, label, opts)
 	opts = opts or {}
 	local s0 = getState()
 	local floor0 = s0 and s0.floor
-	local ps, lastPos, lastT, lastInt, lastDraw, waitStart = {}, nil, os.clock(), 0, 0, os.clock()
+	local ps, lastPos, lastT, lastInt, lastDraw, waitStart = {blockedEdges = {}, edgeAttempts = {}}, nil, os.clock(), 0, 0, os.clock()
     local route, routeMode, routeSpare, plannedGoal, plannedAt, routeCursor, activeAim
     routeCursor = 1
 	while running and token == moveToken do
@@ -5328,7 +5352,10 @@ local function walk(token, getTarget, stop, label, opts)
 		end
 		local atGoal
 		if type(stop) == "function" then atGoal = stop(st, root, tp) else atGoal = hdist(root.Position, tp) <= stop end
-		if atGoal and not opts.onHold then hum:MoveTo(root.Position); return "arrived" end
+	if atGoal and not opts.onHold then hum:MoveTo(root.Position); return "arrived" end
+		for key, untilTime in pairs(ps.blockedEdges) do
+			if untilTime <= now then ps.blockedEdges[key] = nil end
+		end
         local routeIndex = route and routeIndexFor(route, me, routeCursor)
         if not routeIndex and route then
             routeIndex = routeIndexFor(route, me, 1)
@@ -5337,8 +5364,10 @@ local function walk(token, getTarget, stop, label, opts)
         local replanInterval = 0.35
         local needsPlan = not plannedAt or now - plannedAt >= replanInterval or goal ~= plannedGoal
             or (route and not routeIndex)
-        if needsPlan then
-            route, routeMode, routeSpare = decide(st, g, me, goal, ps, opts)
+		if needsPlan then
+			-- An old MoveTo may point through the route we just rejected.
+			if activeAim then hum:MoveTo(root.Position); activeAim = nil end
+			route, routeMode, routeSpare = decide(st, g, me, goal, ps, opts)
             plannedGoal, plannedAt, routeCursor = goal, now, 1
             routeIndex = route and routeIndexFor(route, me, 1)
         end
@@ -5363,31 +5392,46 @@ local function walk(token, getTarget, stop, label, opts)
 		end
 		if opts.onMove then opts.onMove() end
 		if opts.timeout and now - waitStart > opts.timeout then hum:MoveTo(root.Position); return "timeout" end
+		local movementTarget = tp
+		local nextCell = route[routeCursor + 1]
 		local aim
-        local movementTarget = tp
-        if #route - routeCursor >= 1 then aim = aimPoint(st, route, root, movementTarget, routeCursor)
-		elseif mode == "waiting" or mode == "trapped" or mode == "hiding" then aim = nil
-        else aim = Vector3.new(movementTarget.X, root.Position.Y, movementTarget.Z) end
-        if aim and ps.slip then aim = slipAim(st, aim, root) end
-        local activeCell = activeAim and posCell(st, activeAim)
-        local activeIndex = activeCell and routeIndexFor(route, activeCell, routeCursor)
-        local activeStillValid = activeAim and activeIndex and activeIndex > routeCursor
-            and hdist(root.Position, activeAim) > st.cs * 0.35
-        if activeStillValid then aim = activeAim end
-        if aim then
-            if not activeAim or (aim - activeAim).Magnitude >= 0.75 then
-                hum:MoveTo(aim); activeAim = aim
-            end
-        elseif activeAim then
-            hum:MoveTo(root.Position); activeAim = nil
-        end
+		if nextCell then
+			-- Use the next cell centre, not the end of a long straight run.  A
+			-- replan can otherwise make the old long MoveTo skim a wall corner.
+			local p = cellPos(st, nextCell)
+			aim = Vector3.new(p.X, root.Position.Y, p.Z)
+			if ps.slip then aim = slipAim(st, aim, root) end
+			if not activeAim or (aim - activeAim).Magnitude >= 0.25 then
+				local key = edgeKey(me, nextCell)
+				ps.edgeAttempts[key] = (ps.edgeAttempts[key] or 0) + 1
+				if ps.edgeAttempts[key] > 3 then
+					ps.blockedEdges[key] = now + 5
+					activeAim, plannedAt = nil, nil
+					hum:MoveTo(root.Position)
+					setStatus("↻ repeated corridor; choosing another path")
+					task.wait(0.05)
+					continue
+				end
+				hum:MoveTo(aim); activeAim = aim
+			end
+		elseif mode == "waiting" or mode == "trapped" or mode == "hiding" then
+			if activeAim then hum:MoveTo(root.Position); activeAim = nil end
+		else
+			aim = Vector3.new(movementTarget.X, root.Position.Y, movementTarget.Z)
+			if not activeAim or (aim - activeAim).Magnitude >= 0.25 then hum:MoveTo(aim); activeAim = aim end
+		end
         if needsPlan and now - lastDraw >= 0.2 then
 			lastDraw = now
             drawRoute(st, route, movementTarget, root.Position.Y, routeCursor)
 			setStatus(("→ %s  [%s%s]"):format(label, mode, s0v and (" · spare %.1fs"):format(s0v) or ""))
 		end
-		if aim and now - lastT > 1.2 then
-            if lastPos and hdist(root.Position, lastPos) < 1 and activeAim then hum:MoveTo(activeAim) end
+		if aim and now - lastT > 1.1 then
+			if lastPos and hdist(root.Position, lastPos) < 1 and nextCell then
+				ps.blockedEdges[edgeKey(me, nextCell)] = now + 4.5
+				activeAim, plannedAt = nil, nil
+				hum:MoveTo(root.Position)
+				setStatus("↻ blocked corridor; choosing another path")
+			end
 			lastPos, lastT = root.Position, now
 		end
 		task.wait(0.08)
