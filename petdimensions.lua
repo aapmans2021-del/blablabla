@@ -5189,8 +5189,10 @@ local function walk(token, getTarget, stop, label, opts)
 		if atGoal and not opts.onHold then hum:MoveTo(root.Position); return "arrived" end
         local routeIndex = route and routeIndexFor(route, me, routeCursor)
         if routeIndex then routeCursor = routeIndex end
-        local replanInterval = opts.directGoal and 1 or 0.35
-        local needsPlan = not plannedAt or now - plannedAt >= replanInterval or goal ~= plannedGoal or (route and not routeIndex)
+        local atDirectGoal = opts.directGoal and opts.onHold and goal == me
+        local replanInterval = opts.directGoal and (atDirectGoal and 0.35 or math.huge) or 0.35
+        local needsPlan = not plannedAt or now - plannedAt >= replanInterval or goal ~= plannedGoal
+            or (route and not routeIndex) or (atDirectGoal and routeMode == "egg route")
         if needsPlan then
             route, routeMode, routeSpare = decide(st, g, me, goal, ps, opts)
             plannedGoal, plannedAt, routeCursor = goal, now, 1
