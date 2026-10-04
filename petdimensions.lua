@@ -5068,12 +5068,19 @@ local function plan(st, g, me, goal, ps)
 			if r then ps.waitSince = nil; ps.fleeTo = nil; return r, "advancing", dme end
 		end
 	end
-	-- 3) already at the closest safe cell: hold position, leave the moment it approaches
+	-- 3) NEW: never stand still. No fully safe route and nothing better to advance to -> take the
+	-- soft-cost route (penalises cells near the scarecrow) immediately; re-planned every tick, and the
+	-- flee check above takes over the moment the scarecrow gets close.
 	ps.fleeTo = nil
-	ps.waitSince = ps.waitSince or os.clock()
-	if os.clock() - ps.waitSince < 8 then return nil, "waiting for path", dme end
-	local _, p2 = dijkstra(g, me, dm, false, hunting and HUNT_R or AVOID_R)
-	return pathTo(p2, me, goal), "risky", dme
+	local R = hunting and HUNT_R or AVOID_R
+	local _, p2 = dijkstra(g, me, dm, true, R) -- cells right next to the scarecrow blocked
+	local r2 = pathTo(p2, me, goal)
+	if not r2 then
+		_, p2 = dijkstra(g, me, dm, false, R)
+		r2 = pathTo(p2, me, goal)
+	end
+	if r2 then return r2, "cautious", dme end
+	return nil, "no route", dme
 end
 
 -- ───────── blue path (pooled) ─────────
