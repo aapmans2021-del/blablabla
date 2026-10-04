@@ -631,7 +631,7 @@ pcall(function()
                 hrp.CFrame = safe
             end
         end
-    end
+    end)
 end)
 
 localPlayer.CharacterAdded:Connect(function()
@@ -5949,6 +5949,9 @@ env.HMV2 = {Destroy = destroy, GetState = getState, Opt = O,
 	end}
 print("🎃 Halloween Maze v4 loaded" .. (hubMain and " (docked into the hub)" or ""))	
 end)
+--[[ The pasted source resumes here with an incomplete fragment of an earlier
+-- farm loop. It has no matching opening scope in this file, so it cannot run.
+-- The complete maze and hub code above has already finished loading.
                     Library.Network.Fire("Farm Coin", CurrentCometId, petUid)
                 end)
             end
@@ -6436,3 +6439,4 @@ task.spawn(function()
             end
             continue
         end
+]]
