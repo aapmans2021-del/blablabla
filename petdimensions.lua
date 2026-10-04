@@ -5068,7 +5068,7 @@ local function safeFlee(g, me, dm, sP, sS, goal, prevTarget)
 	end
 	return nil
 end
-local function plan(st, g, me, goal, ps)
+local function plan(st, g, me, goal, ps, pursueGoal)
 	local dm, hunting
 	if avoidOn then dm, hunting = danger(st, g) end
 	if not dm then
@@ -5076,6 +5076,11 @@ local function plan(st, g, me, goal, ps)
 		local _, prev = dijkstra(g, me, nil, false, 0)
 		return pathTo(prev, me, goal), "normal", nil
 	end
+    if pursueGoal then
+        ps.fleeTo, ps.advanceTo, ps.approachTo = nil, nil, nil
+        local _, prev = dijkstra(g, me, dm, false, hunting and HUNT_R or AVOID_R)
+        return pathTo(prev, me, goal), "egg pursuit", dm[me] or 99
+    end
     local routeGoal = goal
     if (dm[goal] or 99) == 0 then
         local approachDist = dijkstra(g, me, dm, true, AVOID_R)
@@ -5283,7 +5288,7 @@ end
 end
 
 -- returns "arrived" | "lost" | "cancelled" | "floor"
-local function walk(token, getTarget, stop, label, shouldInterrupt)
+local function walk(token, getTarget, stop, label, shouldInterrupt, pursueGoal)
     local s0 = getState()
     local floor0 = s0 and s0.floor
     local ps, lastPos, lastT = {}, nil, os.clock()
@@ -5324,7 +5329,7 @@ local function walk(token, getTarget, stop, label, shouldInterrupt)
             or routeInvalid or activeBlocked or not plannedTarget or hdist(tp, plannedTarget) >= 0.75
         local mode, dme
         if needsPlan then
-            route, mode, dme = plan(st, g, me, goal, ps)
+            route, mode, dme = plan(st, g, me, goal, ps, pursueGoal)
             plannedAt, plannedGoal, plannedTarget = now, goal, tp
             routeCursor = 1
             routeIndex = route and routeIndexFor(route, me, routeCursor)
@@ -5497,7 +5502,7 @@ local function hatchAt(token, egg, force)
 		if not ep then result = "gone"; break end
         if not sameCellTarget(st, root, ep) then
 			setAutoHatch(false)
-            local r = walk(token, function() if egg.Parent then return posOf(egg) end end, sameCellTarget, "Egg")
+            local r = walk(token, function() if egg.Parent then return posOf(egg) end end, sameCellTarget, "Egg", nil, true)
 			if r ~= "arrived" then result = r; break end
 			last = os.clock()
 			continue
@@ -5713,7 +5718,7 @@ local function startJob(fn)
 end
 local function moveEgg(egg)
 	startJob(function(t)
-        local r = walk(t, function() if egg.Parent then return posOf(egg) end end, sameCellTarget, "Egg")
+        local r = walk(t, function() if egg.Parent then return posOf(egg) end end, sameCellTarget, "Egg", nil, true)
 		if r == "arrived" and hatchOn then hatchAt(t, egg, true) end
 	end)
 end
@@ -6328,7 +6333,7 @@ env.HMV2 = {Destroy = destroy, GetState = getState,
         local eggConfig = settingsForEgg(best:GetAttribute("ID"))
         eggConfig.hatchSeconds = sec or eggConfig.hatchSeconds
 		startJob(function(t)
-            local r = walk(t, function() if best.Parent then return posOf(best) end end, sameCellTarget, "Egg")
+            local r = walk(t, function() if best.Parent then return posOf(best) end end, sameCellTarget, "Egg", nil, true)
 			if r == "arrived" then hatchAt(t, best, true) end
 		end)
 		return "started " .. tostring(best:GetAttribute("ID"))
