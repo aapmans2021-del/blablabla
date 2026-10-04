@@ -4616,7 +4616,11 @@ task.spawn(function()
 -- It runs inside its own task.spawn closure, so it adds no locals to the hub's scope.
 -- ======================================================================
 task.spawn(function()
-local env = (getgenv and getgenv()) or _G
+local env = _G
+if type(getgenv) == "function" then
+    local ok, executorEnv = pcall(getgenv)
+    if ok and type(executorEnv) == "table" then env = executorEnv end
+end
 if env.HMV2 and env.HMV2.Destroy then pcall(env.HMV2.Destroy) end
 
 local Players = game:GetService("Players")
@@ -5253,10 +5257,14 @@ local function aimPoint(st, route, root, tp, routeIndex)
         return Vector3.new(p.X, root.Position.Y, p.Z)
     end
     local nextIndex = first + 1
-    local direction = route[nextIndex] - route[first]
+    local firstX, firstZ = Common.CellXZ(st.n, route[first])
+    local nextX, nextZ = Common.CellXZ(st.n, route[nextIndex])
+    local stepX, stepZ = nextX - firstX, nextZ - firstZ
     local targetIndex = nextIndex
-    for i = nextIndex + 1, math.min(#route, nextIndex + 7) do
-        if route[i] - route[i - 1] ~= direction then break end
+    for i = nextIndex + 1, #route do
+        local previousX, previousZ = Common.CellXZ(st.n, route[i - 1])
+        local currentX, currentZ = Common.CellXZ(st.n, route[i])
+        if currentX - previousX ~= stepX or currentZ - previousZ ~= stepZ then break end
         targetIndex = i
     end
     if targetIndex == #route and posCell(st, tp) == route[targetIndex] then
@@ -5264,10 +5272,11 @@ local function aimPoint(st, route, root, tp, routeIndex)
     end
     local p = cellPos(st, route[targetIndex])
     if targetIndex > nextIndex then
-        local lateral = (math.abs(direction) == 1) and math.abs(root.Position.Z - p.Z) or math.abs(root.Position.X - p.X)
+        local horizontal = stepX ~= 0
+        local lateral = horizontal and math.abs(root.Position.Z - p.Z) or math.abs(root.Position.X - p.X)
         local laneMargin = math.max(st.cs * 0.5 - 2.25, 0.5)
         if lateral <= laneMargin then
-            if math.abs(direction) == 1 then p = Vector3.new(p.X, p.Y, root.Position.Z)
+            if horizontal then p = Vector3.new(p.X, p.Y, root.Position.Z)
             else p = Vector3.new(root.Position.X, p.Y, p.Z) end
         end
     end
