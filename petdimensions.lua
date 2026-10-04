@@ -4981,7 +4981,8 @@ end
 
 -- returns route (starting at `me`), mode, spare seconds on our own cell, ctx
 local function decide(st, g, me, goal, ps, opts)
-    if opts.directGoal and (goal ~= me or not opts.safetyActive) then
+    -- Eggs use the same full BFS as the exit: never creep cell-by-cell.
+    if opts.directGoal then
         ps.refuge, ps.advance = nil, nil
         local _, prev = bfsPrev(g, me)
         return pathTo(prev, me, goal), "egg route", nil, nil
@@ -5059,7 +5060,24 @@ local function drawRoute(st, route, tp, y, firstIndex)
 	local pts = {}
 	local root = getRoot()
 	if root then pts[1] = Vector3.new(root.Position.X, y, root.Position.Z) end
-    for i = firstIndex or 2, #route do local p = cellPos(st, route[i]); pts[#pts + 1] = Vector3.new(p.X, y, p.Z) end
+	local startAt = firstIndex or 2
+	local lastPx, lastPz
+	for i = startAt, #route do
+		local p = cellPos(st, route[i])
+		local px, pz = Common.CellXZ(st.n, route[i])
+		local isTurn = i == startAt or i == #route
+		if not isTurn and lastPx then
+			local prev = route[i - 1]
+			local ppx, ppz = Common.CellXZ(st.n, prev)
+			local nextC = route[i + 1]
+			local npx, npz = Common.CellXZ(st.n, nextC)
+			if (npx - px) ~= (px - ppx) or (npz - pz) ~= (pz - ppz) then isTurn = true end
+		end
+		if isTurn then
+			pts[#pts + 1] = Vector3.new(p.X, y, p.Z)
+			lastPx, lastPz = px, pz
+		end
+	end
 	if tp and #route <= 1 then pts[#pts + 1] = Vector3.new(tp.X, y, tp.Z) end
 	local k = 0
 	for i = 1, #pts - 1 do
@@ -5148,7 +5166,7 @@ local function aimPoint(st, route, root, tp, routeIndex)
 		if lateral <= math.max(st.cs * 0.5 - 2.5, 0.5) then
 			if horizontal then p = Vector3.new(p.X, p.Y, root.Position.Z) else p = Vector3.new(root.Position.X, p.Y, p.Z) end
 		else
-			p = cellPos(st, route[2])
+			p = cellPos(st, route[nextIndex])
 		end
 	end
 	return Vector3.new(p.X, root.Position.Y, p.Z)
@@ -5188,16 +5206,17 @@ local function walk(token, getTarget, stop, label, opts)
 		if type(stop) == "function" then atGoal = stop(st, root, tp) else atGoal = hdist(root.Position, tp) <= stop end
 		if atGoal and not opts.onHold then hum:MoveTo(root.Position); return "arrived" end
         local routeIndex = route and routeIndexFor(route, me, routeCursor)
+        if not routeIndex and route then
+            routeIndex = routeIndexFor(route, me, 1)
+        end
         if routeIndex then routeCursor = routeIndex end
-        if opts.directGoal then opts.safetyActive = atGoal end
-        local atDirectGoal = opts.directGoal and opts.onHold and atGoal
-        local replanInterval = opts.directGoal and (atDirectGoal and 0.35 or math.huge) or 0.35
+        local replanInterval = opts.directGoal and 2.0 or 0.35
         local needsPlan = not plannedAt or now - plannedAt >= replanInterval or goal ~= plannedGoal
-            or (route and not routeIndex) or (atDirectGoal and routeMode == "egg route")
+            or (route and not routeIndex)
         if needsPlan then
             route, routeMode, routeSpare = decide(st, g, me, goal, ps, opts)
             plannedGoal, plannedAt, routeCursor = goal, now, 1
-            routeIndex = route and routeIndexFor(route, me, routeCursor)
+            routeIndex = route and routeIndexFor(route, me, 1)
         end
 		if not route then
             if activeAim then hum:MoveTo(root.Position); activeAim = nil end
@@ -5209,7 +5228,7 @@ local function walk(token, getTarget, stop, label, opts)
 		end
 		if hum.WalkSpeed ~= O.speed then hum.WalkSpeed = O.speed end
         local mode, s0v = routeMode, routeSpare
-        local holding = atGoal and #route <= 1 and (mode == "clear" or mode == "normal" or mode == "racing")
+        local holding = atGoal and opts.onHold and (goal == me or (#route - (routeCursor or 1) <= 0))
 		if holding then
 			waitStart = now
 			hum:MoveTo(root.Position)
@@ -5221,7 +5240,7 @@ local function walk(token, getTarget, stop, label, opts)
 		if opts.onMove then opts.onMove() end
 		if opts.timeout and now - waitStart > opts.timeout then hum:MoveTo(root.Position); return "timeout" end
 		local aim
-        local movementTarget = opts.directGoal and cellPos(st, goal) or tp
+        local movementTarget = tp
         if #route - routeCursor >= 1 then aim = aimPoint(st, route, root, movementTarget, routeCursor)
 		elseif mode == "waiting" or mode == "trapped" then aim = nil
         else aim = Vector3.new(movementTarget.X, root.Position.Y, movementTarget.Z) end
@@ -5313,8 +5332,7 @@ local function hatchAt(token, egg, force)
 	local cfg = settingsForEgg(name)
 	local tHatch, reasserts, last = 0, 0, os.clock()
 	local opts = {
-		stay = O.escape and STAY_SLACK or 0, enter = O.escape and ENTER_SLACK or 0, timeout = 150,
-        directGoal = true,
+		stay = 0, enter = 0, timeout = 150, directGoal = true,
 		onMove = function() setAutoHatch(false); last = os.clock() end,
 	}
 	opts.onHold = function(st)
@@ -5337,8 +5355,7 @@ local function hatchAt(token, egg, force)
 		if cfg.hatchSeconds > 0 and tHatch >= cfg.hatchSeconds then rejected[egg] = "done"; return "done" end
 	end
 	local r = walk(token, function() if egg.Parent then return posOf(egg) end end,
-		function(st, root, tp) return hdist(root.Position, tp) <= EGG_REACH and posCell(st, root.Position) == posCell(st, tp) end,
-		"Egg", opts)
+		EGG_REACH, "Egg", opts)
 	setAutoHatch(false)
 	if r == "arrived" then r = "done" end
 	if r == "timeout" then rejected[egg] = rejected[egg] or "unreachable (scarecrow)" end
