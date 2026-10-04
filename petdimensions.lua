@@ -5325,7 +5325,8 @@ local function walk(token, getTarget, stop, label, shouldInterrupt, pursueGoal)
             activeBlocked = monsterCell == activeCell
         end
         local routeInvalid = route ~= nil and routeIndex == nil
-        local needsPlan = not plannedAt or now - plannedAt >= 0.35 or goal ~= plannedGoal
+        local replanInterval = pursueGoal and 0.75 or 0.35
+        local needsPlan = not plannedAt or now - plannedAt >= replanInterval or goal ~= plannedGoal
             or routeInvalid or activeBlocked or not plannedTarget or hdist(tp, plannedTarget) >= 0.75
         local mode, dme
         if needsPlan then
@@ -5339,12 +5340,13 @@ local function walk(token, getTarget, stop, label, shouldInterrupt, pursueGoal)
             setStatus("⏳ " .. tostring(mode or "no route")); task.wait(0.12); continue
         end
         routeCursor = routeIndex
+        local movementTarget = pursueGoal and cellPos(st, goal) or tp
         if needsPlan then
-            drawRoute(st, route, tp, root.Position.Y, routeIndex)
+            drawRoute(st, route, movementTarget, root.Position.Y, routeIndex)
             setStatus(("→ %s  [%s%s]"):format(label, mode, dme and (" · scarecrow " .. dme) or ""))
         end
         if hum.WalkSpeed ~= desiredSpeed then hum.WalkSpeed = desiredSpeed end
-        local aim = aimPoint(st, route, root, tp, routeIndex)
+        local aim = aimPoint(st, route, root, movementTarget, routeIndex)
         local activeIndex = activeCell and routeIndexFor(route, activeCell, routeIndex)
         local activeStillValid = activeAim and activeIndex and activeIndex > routeIndex
             and hdist(root.Position, activeAim) > st.cs * 0.35 and not activeBlocked
@@ -5573,9 +5575,18 @@ local function pickEgg(st, g, me, allowUnknown)
 	return best
 end
 
-local function hasReachableEgg(st, root)
-    local me = root and posCell(st, root.Position)
-    return me ~= nil and pickEgg(st, grid(st), me, true) ~= nil
+local function hasEligibleEgg(st)
+    for _, egg in ipairs(getEggs()) do
+        local name = egg:GetAttribute("ID")
+        local config = name and settingsForEgg(name)
+        if name and config.enabled and not rejected[egg] then
+            local mult, left = eggLuck(st, egg)
+            if not ((mult > 0 and mult < config.minLuck) or (left and left <= 0)) then
+                return true
+            end
+        end
+    end
+    return false
 end
 
 -- ───────── egg scouting ─────────
@@ -5670,7 +5681,7 @@ local function autoLoop(token)
 		end
 		if token ~= moveToken or not autoOn then return end
         local r = walk(token, exitTarget, EXIT_STOP, "EXIT", function(state)
-            return hatchOn and hasReachableEgg(state, getRoot())
+            return hatchOn and hasEligibleEgg(state)
         end)
 		if r == "cancelled" then return end
         if r == "reconsider" then continue end
@@ -5679,7 +5690,7 @@ local function autoLoop(token)
 		while running and token == moveToken do
 			local s3 = getState()
 			if not s3 or s3.floor ~= floor or os.clock() - t > 8 then break end
-            if hatchOn and hasReachableEgg(s3, getRoot()) then eggsAppeared = true; break end
+            if hatchOn and hasEligibleEgg(s3) then eggsAppeared = true; break end
 			setStatus("✅ at exit, waiting for next floor..."); task.wait(0.2)
 		end
         if eggsAppeared then continue end
@@ -6126,6 +6137,14 @@ minimapStatusLbl = label(miniStatusCard, "Idle", UDim2.new(1, -16, 1, -8), Color
 minimapStatusLbl.Position = UDim2.fromOffset(8, 4)
 minimapStatusLbl.TextYAlignment = Enum.TextYAlignment.Center
 local mapDetached = false
+local function mazeUiVisible()
+    local current = Root
+    while current and current:IsA("GuiObject") do
+        if not current.Visible then return false end
+        current = current.Parent
+    end
+    return true
+end
 local function updateMapOverlayScale()
     local camera = Workspace.CurrentCamera
     if not camera then return end
@@ -6143,7 +6162,7 @@ local function hookMapOverlayCamera()
     updateMapOverlayScale()
 end
 updateMinimapAttachment = function()
-    local detached = minimapWhenHidden and not Root.Visible
+    local detached = minimapWhenHidden and not mazeUiVisible()
     if detached ~= mapDetached then
         mapDetached = detached
         if detached then
@@ -6161,7 +6180,11 @@ updateMinimapAttachment = function()
     mapOverlayGui.Enabled = detached
     if detached then updateMapOverlayScale() end
 end
-bind(Root:GetPropertyChangedSignal("Visible"), updateMinimapAttachment)
+local visibilityAncestor = Root
+while visibilityAncestor and visibilityAncestor:IsA("GuiObject") do
+    bind(visibilityAncestor:GetPropertyChangedSignal("Visible"), updateMinimapAttachment)
+    visibilityAncestor = visibilityAncestor.Parent
+end
 bind(Workspace:GetPropertyChangedSignal("CurrentCamera"), hookMapOverlayCamera)
 hookMapOverlayCamera()
 updateMinimapAttachment()
@@ -6191,7 +6214,7 @@ local function dots(name, count, color, size, z)
 	return p
 end
 local function updateMinimap()
-    if not Root.Visible and not mapOverlayGui.Enabled then return end
+    if not mazeUiVisible() and not mapOverlayGui.Enabled then return end
 	local st = getState(); if not st then return end
 	local g = grid(st)
 	local key = st.walls .. ":" .. tostring(st.floor)
@@ -6261,7 +6284,7 @@ end
 loop(0.25, onUpdateInfo)
 loop(0.5, refreshESP)
 loop(1, refreshEggList)
-loop(0.12, updateMinimap)
+loop(0.25, updateMinimap)
 loop(0.25, function() -- blue path preview while idle
 	if preview and not jobRunning then
 		local st, root = getState(), getRoot()
