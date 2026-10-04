@@ -5033,7 +5033,7 @@ end
 local function decide(st, g, me, goal, ps, opts)
 	local ctx = dangerCtx(st, g)
 	if not ctx then
-		ps.refuge, ps.advance, ps.slip, ps.blocked = nil, nil, false, nil
+		ps.refuge, ps.advance, ps.slip, ps.blocked, ps.fleeing = nil, nil, false, nil, false
 		local _, prev = bfsPrev(g, me)
 		return pathTo(prev, me, goal), "clear", nil, nil
 	end
@@ -5051,14 +5051,19 @@ local function decide(st, g, me, goal, ps, opts)
 		local ok
 		if goal == me then ok = s0 >= stay else ok = slack(ctx, goal, steps[goal] * ctx.ct) >= enter end
 		if ok then
-			ps.refuge, ps.advance, ps.slip, ps.blocked = nil, nil, false, nil
+			ps.refuge, ps.advance, ps.slip, ps.blocked, ps.fleeing = nil, nil, false, nil, false
 			return pathTo(prev, me, goal), (s0 < 4 and "racing" or "normal"), s0, ctx
 		end
 	end
 	local gd = bfsCached(g, goal)
 	-- too close to stand still (or trapped in a dead end while hunted): run to the best refuge / dodge cell
-	if s0 < math.max(stay, 1.2) or not trapOk then
-		local r = pickRefuge(g, me, ctx, steps, ps.refuge, gd)
+	if s0 < math.max(stay, 1.2) or not trapOk or (ps.fleeing and s0 < 2.5) then
+		ps.fleeing = true
+		-- commit to the current refuge while it is still safely reachable (stops left/right flip-flopping)
+		local r = ps.refuge
+		if not (r and r ~= me and steps[r] ~= nil and slack(ctx, r, steps[r] * ctx.ct) >= 0.5) then
+			r = pickRefuge(g, me, ctx, steps, ps.refuge, gd)
+		end
 		if r then ps.refuge, ps.advance, ps.slip = r, nil, false; return pathTo(prev, me, r), "FLEEING", s0, ctx end
 		local bestN, bestV
 		for _, nb in ipairs(nbrs(g, me)) do
@@ -5068,6 +5073,7 @@ local function decide(st, g, me, goal, ps, opts)
 		if bestN then return {me, bestN}, "desperate", s0, ctx end
 		return {me}, "trapped", s0, ctx
 	end
+	ps.fleeing = false
 	-- safe now but the goal is blocked: creep to the best safe cell near it (prefer dodge-shaped cells)
 	local now = os.clock()
 	ps.blocked = ps.blocked or now
@@ -5553,9 +5559,13 @@ local function autoLoop(token)
 		if token ~= moveToken or not autoOn then return end
 		local eggsBefore = {}
 		for _, e in ipairs(getEggs()) do eggsBefore[e] = true end
-		local r = walk(token, exitTarget, EXIT_STOP, "EXIT", {interrupt = function(state) return O.hatch and hasEligibleEgg(state) end})
+		local r = walk(token, exitTarget, EXIT_STOP, "EXIT", {interrupt = function(state)
+		if not O.hatch then return false end
+		local rt = getRoot(); local m = rt and posCell(state, rt.Position)
+		return m and pickEgg(state, grid(state), m, not O.scout) ~= nil
+	end})
 		if r == "cancelled" then return end
-		if r == "reconsider" then continue end
+		if r == "reconsider" then task.wait(0.3); continue end
 		local t = os.clock()
 		local eggsAppeared = false
 		while running and token == moveToken do
@@ -5866,7 +5876,7 @@ do
 	toggle(tg2, "SCOUT", "scout", nil, third)
 	local tg3 = row(28, true)
 	toggle(tg3, "PATH", "path", refreshPathVisibility, half)
-	toggle(tg3, "PIN MAP", "pin", nil, half)
+	toggle(tg3, "MAP WHEN HIDDEN", "pin", nil, half)
 
 	local ac = row(32, true)
 	button(ac, "🍬 CANDY", third, Color3.fromRGB(110, 90, 30), function() startJob(collectCandy) end)
@@ -5975,7 +5985,7 @@ do
 		BorderSizePixel = 0, ClipsDescendants = true}, MM)
 	wallLayer = new("Frame", {Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1}, canvas)
 	dotLayer = new("Frame", {Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1, ZIndex = 5}, canvas)
-	speedCard = new("Frame", {Position = UDim2.fromOffset(346, 300), Size = UDim2.fromOffset(250, 96), BackgroundColor3 = COL.card, BorderSizePixel = 0}, Root)
+	speedCard = new("Frame", {Position = UDim2.fromOffset(346, 300), Size = UDim2.fromOffset(250, 122), BackgroundColor3 = COL.card, BorderSizePixel = 0}, Root)
 	corner(speedCard, 10)
 	speedLbl = label(speedCard, "⚙ Speeds: -", UDim2.new(1, -16, 1, -12), Color3.fromRGB(190, 200, 215), 12)
 	speedLbl.Position = UDim2.fromOffset(8, 6); speedLbl.TextYAlignment = Enum.TextYAlignment.Top
@@ -5983,9 +5993,9 @@ do
 	mapOverlayGui = new("ScreenGui", {Name = "HMV2_Pin", ResetOnSpawn = false, IgnoreGuiInset = true, DisplayOrder = 1000,
 		ZIndexBehavior = Enum.ZIndexBehavior.Sibling, Enabled = false}, PlayerGui)
 	local overlayScale = new("UIScale", {Scale = 1}, mapOverlayGui)
-	mapOverlayRoot = new("Frame", {Name = "Overlay", Size = UDim2.fromOffset(250, 450), AnchorPoint = Vector2.new(1, 0),
+	mapOverlayRoot = new("Frame", {Name = "Overlay", Size = UDim2.fromOffset(250, 476), AnchorPoint = Vector2.new(1, 0),
 		Position = UDim2.new(1, -12, 0, 12), BackgroundTransparency = 1, Active = true}, mapOverlayGui)
-	local statusCard = new("Frame", {Name = "NavigationStatus", Position = UDim2.fromOffset(0, 402), Size = UDim2.fromOffset(250, 48),
+	local statusCard = new("Frame", {Name = "NavigationStatus", Position = UDim2.fromOffset(0, 428), Size = UDim2.fromOffset(250, 48),
 		BackgroundColor3 = COL.card, BorderSizePixel = 0}, mapOverlayRoot)
 	corner(statusCard, 8)
 	minimapStatusLbl = label(statusCard, "Idle", UDim2.new(1, -16, 1, -8), Color3.fromRGB(150, 210, 255), 13)
@@ -5996,7 +6006,7 @@ do
 		local cam = Workspace.CurrentCamera
 		if not cam then return end
 		local v = cam.ViewportSize
-		overlayScale.Scale = math.max(math.min((v.X - 24) / 250, (v.Y - 24) / 450, 1), 0.35)
+		overlayScale.Scale = math.max(math.min((v.X - 24) / 250, (v.Y - 24) / 476, 1), 0.35)
 	end
 	rescale()
 	bind(Workspace:GetPropertyChangedSignal("CurrentCamera"), rescale)
@@ -6120,9 +6130,10 @@ local function onUpdateInfo()
 		scareLbl.TextColor3 = d <= 3 and Color3.fromRGB(255, 80, 80) or COL.scare
 		local unknown = 0
 		for _, e in ipairs(getEggs()) do if eggLuck(st, e) == 0 then unknown += 1 end end
-		speedLbl.Text = ("⚙ You: %.2f cells/s\n🎃 Scarecrow (worst case): %.2f cells/s\n   seen walk %s · hunt %s\n🔍 Unknown-luck eggs: %d"):format(
+		speedLbl.Text = ("⚙ You: %.2f cells/s\n🎃 Scarecrow (worst case): %.2f cells/s\n   seen walk %s · hunt %s\n🔍 Unknown-luck eggs: %d\n🍀 %s"):format(
 			O.speed / st.cs, scareCps(st, m.hunting), scareSeen.walk and ("%.2f"):format(scareSeen.walk) or "?",
-			scareSeen.hunt and ("%.2f"):format(scareSeen.hunt) or "?", unknown)
+			scareSeen.hunt and ("%.2f"):format(scareSeen.hunt) or "?", unknown,
+			#parts > 0 and table.concat(parts, " | ") or "no eggs")
 	else
 		scareText = ""; scareLbl.Text = "🎃 Scarecrow: not found"; scareLbl.TextColor3 = COL.scare
 		speedLbl.Text = "⚙ Speeds: scarecrow not found"
