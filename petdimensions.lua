@@ -4927,7 +4927,7 @@ end
 -- ── v5 scarecrow avoidance ────────────────────────────────────────────────────────────────────
 local MARGIN_BASE, MARGIN_FACING = 1.0, 1.2 -- cells we keep from the scarecrow; larger if it faces / heads for us
 local FACE_SIGN = 1                          -- verified: the client pivots the model with lookAt(pos, pos+heading), so LookVector = facing
-local BLOCK_HIDE = 14                     -- seconds we hide out of sight before creeping back to slip past
+local BLOCK_HIDE = 6                      -- seconds we hide out of sight before creeping back to slip past
 local SLIP_LANE, SLIP_AFTER = 5.9, 3          -- game: CatchRadius 5, corridor half-width 7 (cell 16, wall 2) -> only a lane ~5.9 studs off-centre clears it
 local function scareMargin(st, m, me)
 	if m.hunting then return MARGIN_FACING end
@@ -5102,7 +5102,25 @@ local function decide(st, g, me, goal, ps, opts)
 	ps.fleeing = false
 	local now = os.clock()
 	ps.blocked = ps.blocked or now
-	if now - ps.blocked < BLOCK_HIDE then
+	if ctx.hunting then
+		-- hunted and blocked: LURE it. Stay ~4 cells ahead (so it keeps following, no hiding) and lead it away from the goal
+		local dang = dangling(g)
+		local function ok(c) return c ~= me and steps[c] ~= nil and slack(ctx, c, steps[c] * ctx.ct) >= 0.5 end
+		local l = ps.lure
+		if not (l and ok(l)) then
+			l = nil
+			local bs
+			for c, n in pairs(steps) do
+				if ok(c) then
+					local sc = -math.abs((ctx.dist[c] or 20) - 4) * 1.5 + math.min(gd[c] or 0, 24) * 0.8 + dodgeShape(g, c) - n * 0.2 - (dang[c] and 10 or 0)
+					if not bs or sc > bs then l, bs = c, sc end
+				end
+			end
+			ps.lure = l
+		end
+		if l then return pathTo(prev, me, l), "LURING", s0, ctx end
+	end
+	if not ctx.hunting and now - ps.blocked < BLOCK_HIDE then
 		-- blocked: back off far, out of the scarecrow's line of sight, so it wanders away from the goal
 		local vis, dang = sightCells(st, g, ctx.b), dangling(g)
 		local r = ps.retreat
@@ -5395,6 +5413,7 @@ local function walk(token, getTarget, stop, label, opts)
 	return "cancelled"
 end
 
+local eggWork
 local candyIgnore = setmetatable({}, {__mode = "k"})
 local function nearestCandy(st, g, me)
 	local steps, ctx = reachSteps(st, g, me)
@@ -5422,7 +5441,8 @@ local function collectCandy(token)
 			setStatus("⏳ candy near scarecrow..."); task.wait(0.3); continue
 		end
 		idleSince = nil
-		local r = walk(token, function() if c.Parent then return posOf(c) end end, CANDY_STOP, "Candy", {timeout = 25})
+		local r = walk(token, function() if c.Parent then return posOf(c) end end, CANDY_STOP, "Candy", {timeout = 25, interrupt = function(s) return autoOn and eggWork(s) end})
+		if r == "reconsider" then return r end
 		if r == "cancelled" or r == "floor" then return r end
 		if r == "arrived" or r == "timeout" then
 			tries[c] = (tries[c] or 0) + 1
@@ -5570,12 +5590,34 @@ local function scoutEggs(token)
 	return "cancelled"
 end
 
+-- true while there is egg work to do (a hatchable egg, or one we can still scout) - checked constantly while walking
+eggWork = function(st)
+	if not O.hatch then return false end
+	local rt = getRoot(); local me = rt and posCell(st, rt.Position)
+	if not me then return false end
+	local g = grid(st)
+	if pickEgg(st, g, me, not O.scout) then return true end
+	if O.scout then
+		local dist = bfsCached(g, me)
+		for _, egg in ipairs(getEggs()) do
+			local name = egg:GetAttribute("ID")
+			if name and settingsForEgg(name).enabled and not rejected[egg] and eggLuck(st, egg) == 0 then
+				local p = posOf(egg); local ec = p and posCell(st, p)
+				local t = scoutTried[egg]
+				if ec and dist[ec] and (not t or t.n < 2) then return true end
+			end
+		end
+	end
+	return false
+end
 local function exitTarget(st) local p = cellPos(st, st.exit); return p + Vector3.new(0, 6, 0) end
 local function autoLoop(token)
 	while running and token == moveToken and autoOn do
 		local st = getState()
 		if not st then task.wait(0.3); continue end
 		local floor = st.floor
+		local newFloor, startEggs = false, {}
+		for _, e in ipairs(getEggs()) do startEggs[e] = true end
 		if O.candyFirst then
 			local root = getRoot()
 			local me = root and posCell(st, root.Position)
@@ -5586,30 +5628,39 @@ local function autoLoop(token)
 			while running and token == moveToken and autoOn do
 				local s2, root = getState(), getRoot()
 				local me = s2 and root and posCell(s2, root.Position)
-				if not me or s2.floor ~= floor then break end
+				if not me then break end
+				if s2.floor ~= floor then newFloor = true; break end
 				local egg = pickEgg(s2, grid(s2), me, not O.scout)
 				if egg then
 					local r = hatchAt(token, egg, false)
 					if r == "cancelled" then return end
-					if r == "floor" then break end
+					if r == "floor" then newFloor = true; break end
 					if r == "lost" or r == "gone" or r == "failed" then rejected[egg] = rejected[egg] or r end
 				elseif O.scout then
 					local result = scoutEggs(token)
 					if result == "cancelled" then return end
+					if result == "floor" then newFloor = true end
 					if result ~= "scouted" then break end
 				else
 					break
 				end
 			end
 		end
+		if newFloor then -- we crossed the exit (or the floor changed) mid-egg-work: wait for the new eggs, then scout/hatch again
+			local t0 = os.clock()
+			while running and token == moveToken and autoOn and os.clock() - t0 < 8 do
+				local fresh = false
+				for _, e in ipairs(getEggs()) do if not startEggs[e] then fresh = true; break end end
+				if fresh then break end
+				setStatus("new floor - waiting for eggs"); task.wait(0.2)
+			end
+			task.wait(0.4)
+			continue
+		end
 		if token ~= moveToken or not autoOn then return end
 		local eggsBefore = {}
 		for _, e in ipairs(getEggs()) do eggsBefore[e] = true end
-		local r = walk(token, exitTarget, EXIT_STOP, "EXIT", {interrupt = function(state)
-		if not O.hatch then return false end
-		local rt = getRoot(); local m = rt and posCell(state, rt.Position)
-		return m and pickEgg(state, grid(state), m, not O.scout) ~= nil
-	end})
+		local r = walk(token, exitTarget, EXIT_STOP, "EXIT", {interrupt = eggWork})
 		if r == "cancelled" then return end
 		if r == "reconsider" then task.wait(0.3); continue end
 		local t = os.clock()
