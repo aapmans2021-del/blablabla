@@ -4927,7 +4927,7 @@ end
 -- ── v5 scarecrow avoidance ────────────────────────────────────────────────────────────────────
 local MARGIN_BASE, MARGIN_FACING = 1.0, 1.2 -- cells we keep from the scarecrow; larger if it faces / heads for us
 local FACE_SIGN = 1                          -- verified: the client pivots the model with lookAt(pos, pos+heading), so LookVector = facing
-local BLOCK_HIDE = 6                      -- seconds we hide out of sight before creeping back to slip past
+local BLOCK_HIDE = 25                     -- seconds we hide out of sight before creeping back to slip past
 local SLIP_LANE, SLIP_AFTER = 5.9, 3          -- game: CatchRadius 5, corridor half-width 7 (cell 16, wall 2) -> only a lane ~5.9 studs off-centre clears it
 local function scareMargin(st, m, me)
 	if m.hunting then return MARGIN_FACING end
@@ -5053,17 +5053,58 @@ local function escapePath(g, me, ctx)
 	if best then return pathTo(prev, me, best) end
 end
 
+-- hallway zone: the corridor (chain of cells with <=2 exits) around a cell, up to and including the junctions at its ends
+local function zoneOf(g, c)
+	g.zone = g.zone or {}
+	local z = g.zone[c]
+	if z then return z end
+	z = {[c] = true}
+	if #nbrs(g, c) <= 2 then
+		local q, h = {c}, 1
+		while q[h] do
+			local x = q[h]; h += 1
+			for _, nb in ipairs(nbrs(g, x)) do
+				if not z[nb] then
+					z[nb] = true
+					if #nbrs(g, nb) <= 2 then q[#q + 1] = nb end
+				end
+			end
+		end
+	end
+	g.zone[c] = z
+	return z
+end
+-- is the scarecrow anywhere in a hallway our route needs? (unless it hunts us from behind while we run away from it)
+local function routeBlocked(g, route, ctx, me)
+	if ctx.hunting and route[2] and (ctx.dist[route[2]] or 0) > (ctx.dist[me] or 0) then return false end
+	local z, z2 = zoneOf(g, ctx.b), zoneOf(g, ctx.a)
+	for i = 2, #route do
+		local c = route[i]
+		if z[c] or z2[c] then return true end
+	end
+	return false
+end
+
 -- returns route (starting at `me`), mode, spare seconds on our own cell, ctx
 local function decide(st, g, me, goal, ps, opts)
 	local ctx = dangerCtx(st, g)
 	if not ctx then
-		ps.refuge, ps.advance, ps.slip, ps.blocked, ps.fleeing = nil, nil, false, nil, false
+		ps.refuge, ps.advance, ps.slip, ps.blocked, ps.fleeing, ps.hold = nil, nil, false, nil, false, false
 		local _, prev = bfsPrev(g, me)
 		return pathTo(prev, me, goal), "clear", nil, nil
 	end
 	local stay, enter = opts.stay or STAY_SLACK, opts.enter or 0
 	local s0 = slack(ctx, me, 0)
 	local steps, prev = safeSearch(g, me, ctx, 60)
+	-- hallway logic: if the scarecrow is in a hallway our route needs, HOLD (retreat off the route) until it has left it for good
+	local _, pp = bfsPrev(g, me)
+	local plain = pathTo(pp, me, goal)
+	local nowT = os.clock()
+	if plain and #plain > 1 and routeBlocked(g, plain, ctx, me) then ps.hold, ps.clearAt = true, nil
+	elseif ps.hold then
+		ps.clearAt = ps.clearAt or nowT
+		if nowT - ps.clearAt > 0.6 then ps.hold, ps.clearAt = false, nil end
+	end
 	-- dead-end goal (corner egg): only commit if, once hunted, we can get in AND back out to the mouth in time
 	local mouth, depth = branchInfo(g, goal)
 	local trapOk = true
@@ -5071,11 +5112,11 @@ local function decide(st, g, me, goal, ps, opts)
 		local inT = goal == me and 0 or ((bfsCached(g, me)[mouth] or 0) + depth) * ctx.ct
 		trapOk = eta(ctx, mouth) - inT - depth * ctx.ct - ctx.pad >= (goal == me and 1 or 3)
 	end
-	if steps[goal] ~= nil and trapOk then
+	if steps[goal] ~= nil and trapOk and not ps.hold then
 		local ok
 		if goal == me then ok = s0 >= stay else ok = slack(ctx, goal, steps[goal] * ctx.ct) >= enter end
 		if ok then
-			ps.refuge, ps.advance, ps.slip, ps.blocked, ps.fleeing = nil, nil, false, nil, false
+			ps.refuge, ps.advance, ps.slip, ps.blocked, ps.fleeing, ps.hold = nil, nil, false, nil, false, false
 			return pathTo(prev, me, goal), (s0 < 4 and "racing" or "normal"), s0, ctx
 		end
 	end
@@ -5120,17 +5161,20 @@ local function decide(st, g, me, goal, ps, opts)
 		end
 		if l then return pathTo(prev, me, l), "LURING", s0, ctx end
 	end
-	if not ctx.hunting and now - ps.blocked < BLOCK_HIDE then
+	if ps.hold and not ctx.hunting and now - ps.blocked < BLOCK_HIDE then
 		-- blocked: back off far, out of the scarecrow's line of sight, so it wanders away from the goal
 		local vis, dang = sightCells(st, g, ctx.b), dangling(g)
+		local zone, z2, onRoute = zoneOf(g, ctx.b), zoneOf(g, ctx.a), {}
+		for _, c in ipairs(plain or {}) do onRoute[c] = true end
+		local function off(c) return not (zone[c] or z2[c] or onRoute[c]) end
 		local r = ps.retreat
-		if not (r and steps[r] ~= nil and vis[r] == nil and slack(ctx, r, steps[r] * ctx.ct) >= 1) then
+		if not (r and steps[r] ~= nil and off(r) and slack(ctx, r, steps[r] * ctx.ct) >= 1) then
 			r = nil
 			local bs
 			for c, n in pairs(steps) do
-				if slack(ctx, c, n * ctx.ct) >= 1 then
-					local sc = math.min(ctx.dist[c] or 20, 14) + dodgeShape(g, c) - n * 0.3
-					if vis[c] ~= nil then sc -= 100 end
+				if off(c) and slack(ctx, c, n * ctx.ct) >= 1 then
+					local sc = math.min(ctx.dist[c] or 20, 10) + dodgeShape(g, c) - n * 0.3
+					if vis[c] ~= nil then sc -= 4 end
 					if dang[c] then sc -= 8 end
 					if not bs or sc > bs then r, bs = c, sc end
 				end
@@ -5138,7 +5182,7 @@ local function decide(st, g, me, goal, ps, opts)
 			ps.retreat = r
 		end
 		if r and r ~= me then return pathTo(prev, me, r), "BACKING OFF", s0, ctx end
-		return {me}, "hiding", s0, ctx
+		return {me}, "waiting for hallway", s0, ctx
 	end
 	ps.retreat = nil
 	local best, bScore
@@ -5384,7 +5428,7 @@ local function walk(token, getTarget, stop, label, opts)
 		local aim
         local movementTarget = tp
         if #route - routeCursor >= 1 then aim = aimPoint(st, route, root, movementTarget, routeCursor)
-		elseif mode == "waiting" or mode == "trapped" or mode == "hiding" then aim = nil
+		elseif mode == "waiting" or mode == "trapped" or mode == "hiding" or mode == "waiting for hallway" then aim = nil
         else aim = Vector3.new(movementTarget.X, root.Position.Y, movementTarget.Z) end
         if aim and ps.slip then aim = slipAim(st, aim, root) end
         local activeCell = activeAim and posCell(st, activeAim)
