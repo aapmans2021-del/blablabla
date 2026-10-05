@@ -4641,8 +4641,12 @@ local function timeAwareRoute(g, me, goal, ctx, blocked)
 				-- Keep a real timing cushion outside the one-cell kill hitbox.  A
 				-- zero/near-zero margin can look safe on paper but loses to update
 				-- latency, cornering, and the character's physical width.
+				-- Use the same full physical clearance as every other movement mode.
+				-- The former one-cell hitbox estimate allowed a route that was
+				-- technically ahead of the scarecrow on the graph, but close enough
+				-- for its real catch radius to kill the player while cornering.
 				if steps[nextCell] == nil and not edgeBlocked(blocked, cell, nextCell)
-					and hitboxEta(ctx, nextCell) > nextStep * ctx.ct + math.max(0.35, ctx.ct * 0.75) then
+					and slack(ctx, nextCell, nextStep * ctx.ct) >= 0 then
 					steps[nextCell], prev[nextCell] = nextStep, cell
 					q[#q + 1] = nextCell
 				end
@@ -4670,6 +4674,24 @@ local function decide(st, g, me, goal, ps, opts)
 	if #liveRoute > 1 then
 		ps.refuge, ps.advance, ps.retreat, ps.slip, ps.blocked, ps.fleeing = nil, nil, nil, false, nil, false
 		return liveRoute, "REPOSITIONING", spare, ctx
+	end
+
+	-- A direct line of sight is what turns a wandering scarecrow into an
+	-- aggressive pursuer. If we are exposed nearby, break sight first rather
+	-- than oscillating along the same hallway while repeatedly replanning.
+	local visible, steps, prev = sightCells(st, g, ctx.b), safeSearch(g, me, ctx, 60, ps.blockedEdges)
+	if visible[me] ~= nil and (ctx.dist[me] or math.huge) <= 8 then
+		local refuge, refugeScore
+		for cell, step in pairs(steps) do
+			if cell ~= me and visible[cell] == nil and slack(ctx, cell, step * ctx.ct) >= 1 then
+				local score = step - math.min(ctx.dist[cell] or 0, 12) * 0.08
+				if not refugeScore or score < refugeScore then refuge, refugeScore = cell, score end
+			end
+		end
+		if refuge then
+			ps.refuge, ps.advance, ps.retreat, ps.slip, ps.blocked, ps.fleeing = refuge, nil, nil, false, nil, true
+			return pathTo(prev, me, refuge), "BREAKING SIGHT", spare, ctx
+		end
 	end
 	-- No fully-safe forward step right now. Fall through to the conservative
 	-- refuge / escape / slip planner instead of treating the scarecrow as a
