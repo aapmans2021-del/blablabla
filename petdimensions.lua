@@ -4165,7 +4165,7 @@ local EXIT_STOP, CANDY_STOP = 3, 3.5
 -- state ----------------------------------------------------------------------------------------
 local running, moveToken, jobRunning, autoOn = true, 0, false, false
 local O = {slip = true, avoid = true, candyFirst = true, candyEsp = true, hatch = true, escape = true, scout = true,
-	path = true, pin = false, zoom = false, minLuck = 10, hatchSeconds = 60, speed = 20}
+	path = true, pin = false, afk = false, zoom = false, minLuck = 10, hatchSeconds = 60, speed = 20}
 local eggNames, eggSettings, savedEggSettings = {}, {}, {}
 local rejected = setmetatable({}, {__mode = "k"})
 local hatchOwned = false
@@ -4205,7 +4205,7 @@ do
 	local okRead, s = pcall(function() return isfile and isfile(SFILE) and HttpService:JSONDecode(readfile(SFILE)) end)
 	if okRead and type(s) == "table" then
 		local map = {avoid = "avoid", candyFirst = "candyFirst", candyEsp = "candyEsp", hatchOn = "hatch", escapeOn = "escape",
-			scoutOn = "scout", pathVisible = "path", minimapWhenHidden = "pin", zoom = "zoom"}
+			scoutOn = "scout", pathVisible = "path", minimapWhenHidden = "pin", afkView = "afk", zoom = "zoom"}
 		for jsonKey, key in pairs(map) do if s[jsonKey] ~= nil then O[key] = s[jsonKey] == true end end
 		O.minLuck = tonumber(s.minLuck) or O.minLuck
 		O.hatchSeconds = tonumber(s.hatchSeconds) or O.hatchSeconds
@@ -4224,7 +4224,7 @@ local function saveSettings()
 		if writefile then
 			writefile(SFILE, HttpService:JSONEncode({speed = O.speed, avoid = O.avoid, candyFirst = O.candyFirst,
 				candyEsp = O.candyEsp, zoom = O.zoom, hatchOn = O.hatch, escapeOn = O.escape, scoutOn = O.scout,
-				pathVisible = O.path, minimapWhenHidden = O.pin, minLuck = O.minLuck, hatchSeconds = O.hatchSeconds,
+				pathVisible = O.path, minimapWhenHidden = O.pin, afkView = O.afk, minLuck = O.minLuck, hatchSeconds = O.hatchSeconds,
 				eggSettings = eggSettings}))
 		end
 	end)
@@ -4663,6 +4663,41 @@ local function decide(st, g, me, goal, ps, opts)
 		ps.refuge, ps.advance, ps.slip, ps.blocked, ps.fleeing = nil, nil, false, nil, false
 		return bfsAvoiding(g, me, goal, ps.blockedEdges), "clear", nil, nil
 	end
+	-- Hunting is authoritative server state, not a prediction. Never let a
+	-- destination route override it: first take a safe route to a cell that
+	-- breaks the maze's straight-line sight. This avoids the old left/right
+	-- oscillation and prevents a fast corner pass through the CatchRadius.
+	local visible, escapeSteps, escapePrev = sightCells(st, g, ctx.b), safeSearch(g, me, ctx, 60, ps.blockedEdges)
+	local nearMonster = (ctx.dist[me] or math.huge) <= 9
+	if nearMonster and (ctx.hunting or visible[me] ~= nil) then
+		-- Commit to a valid cover target. Re-picking one every 0.1 seconds is
+		-- what caused back-and-forth movement when the monster changed segments.
+		local cover = ps.refuge
+		if cover == me or not (cover and escapeSteps[cover] ~= nil and visible[cover] == nil
+			and slack(ctx, cover, escapeSteps[cover] * ctx.ct) >= 1.25) then
+			cover = nil
+			local coverScore
+			for cell, step in pairs(escapeSteps) do
+				if cell ~= me and visible[cell] == nil and slack(ctx, cell, step * ctx.ct) >= 1.25 then
+					-- Prefer nearby cover, but reward increasing graph distance so the
+					-- bot cannot pick a hiding cell immediately beside the monster.
+					local score = step - math.min(ctx.dist[cell] or 0, 16) * 0.22
+					if not coverScore or score < coverScore then cover, coverScore = cell, score end
+				end
+			end
+		end
+		if cover then
+			ps.refuge, ps.advance, ps.retreat, ps.slip, ps.blocked, ps.fleeing = cover, nil, nil, false, nil, true
+			return pathTo(escapePrev, me, cover), ctx.hunting and "HUNT: TAKING COVER" or "BREAKING SIGHT", nil, ctx
+		end
+		-- If no covered cell is reachable in time, only move away. Do not try
+		-- to squeeze past the scarecrow toward an egg, candy, or exit.
+		local flee = escapePath(g, me, ctx)
+		if flee and #flee > 1 then
+			ps.fleeing = true
+			return flee, "HUNT: FALLING BACK", nil, ctx
+		end
+	end
 	-- Prefer a route that is safe for its whole duration. Do not return a
 	-- one-cell "wait" result here: doing that made all recovery logic below
 	-- unreachable, so one moving scarecrow could permanently strand the bot.
@@ -4964,6 +4999,15 @@ local function walk(token, getTarget, stop, label, opts)
 		local g = grid(st)
 		local me, goal = posCell(st, root.Position), posCell(st, tp)
 		if not (me and goal) then task.wait(0.1); continue end
+		-- A retry count only means anything while we are failing to cross the
+		-- same edge. Once we enter the next cell, clear its failure memory;
+		-- otherwise ordinary backtracking eventually marks good corridors bad.
+		if ps.lastCell and ps.lastCell ~= me then
+			local crossed = edgeKey(ps.lastCell, me)
+			ps.edgeAttempts[crossed] = nil
+			ps.blockedEdges[crossed] = nil
+		end
+		ps.lastCell = me
 		-- Crossing an exit while pursuing candy/an egg is still a floor change.
 		-- Report it immediately so Auto restarts its scan instead of continuing
 		-- with stale targets and walking straight through the following floor.
@@ -5576,8 +5620,9 @@ do
 	scareLbl = label(info, "🎃 Scarecrow: -", UDim2.new(1, -8, 0, 22), COL.scare, 14)
 	statusLbl = label(row(22), "Idle", UDim2.fromScale(1, 1), Color3.fromRGB(150, 210, 255), 13)
 	setStatus = function(t)
-		if statusLbl and statusLbl.Parent then statusLbl.Text = t end
-		if minimapStatusLbl and minimapStatusLbl.Parent then minimapStatusLbl.Text = t end
+		local shown = (O.afk and "AFK VIEW · F7 · " or "") .. t
+		if statusLbl and statusLbl.Parent then statusLbl.Text = shown end
+		if minimapStatusLbl and minimapStatusLbl.Parent then minimapStatusLbl.Text = shown end
 	end
 end
 
@@ -5625,6 +5670,11 @@ do
 	local tg3 = row(28, true)
 	toggle(tg3, "PATH", "path", refreshPathVisibility, half)
 	toggle(tg3, "MAP WHEN HIDDEN", "pin", nil, half)
+	local tg4 = row(28, true)
+	toggle(tg4, "AFK VIEW (F7)", "afk", function(on)
+		if on then O.pin = true end
+		Root.Visible = not on
+	end, UDim2.new(1, 0, 1, 0))
 
 	local ac = row(32, true)
 	button(ac, "🍬 CANDY", third, Color3.fromRGB(110, 90, 30), function() startJob(collectCandy) end)
@@ -5790,7 +5840,7 @@ local function mazeUiVisible()
 end
 local mapDetached = false
 local function updatePin()
-	local detach = O.pin and not mazeUiVisible()
+	local detach = (O.pin or O.afk) and not mazeUiVisible()
 	if detach ~= mapDetached then
 		mapDetached = detach
 		if detach then
@@ -5802,6 +5852,10 @@ local function updatePin()
 		end
 	end
 	mapOverlayGui.Enabled = detach
+end
+if O.afk then
+	O.pin = true
+	Root.Visible = false
 end
 
 local mmKey
@@ -5915,6 +5969,12 @@ loop(0.25, function() -- blue path preview while idle
 end)
 bind(UIS.InputBegan, function(i, gp)
 	if not gp and i.KeyCode == Enum.KeyCode.X then stopAll() end
+	if not gp and i.KeyCode == Enum.KeyCode.F7 then
+		O.afk = not O.afk
+		if O.afk then O.pin = true end
+		Root.Visible = not O.afk
+		saveSettings()
+	end
 end)
 bind(RunService.Heartbeat, function()
 	local hum = getHum()
