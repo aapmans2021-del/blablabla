@@ -621,6 +621,83 @@ pcall(function()
             return
         end
 
+        local kind = tostring(attack.kind)
+        if kind ~= "slam" and kind ~= "barrage" and kind ~= "sweep" and kind ~= "leap" and kind ~= "land" then
+            return
+        end
+
+        local now = os.clock()
+        local windup = tonumber(attack.windup) or 0
+        local duration
+
+        if kind == "sweep" then
+            duration = windup + math.max(0.05, tonumber(attack.seconds) or 2) + 0.35
+        elseif kind == "leap" then
+            duration = windup + math.max(0, tonumber(attack.air) or 1) + 0.7
+        elseif kind == "land" then
+            duration = 0.9
+        else
+            duration = windup + 0.8
+        end
+
+        ExpeditionAttackSequence += 1
+        table.insert(ExpeditionActiveAttacks, {
+            kind = kind,
+            at = attack.at,
+            radius = attack.radius,
+            length = attack.length,
+            width = attack.width,
+            clear = attack.clear,
+            start = attack.start,
+            arc = attack.arc,
+            windup = windup,
+            seconds = attack.seconds,
+            started = now,
+            expires = now + duration,
+            sequence = ExpeditionAttackSequence,
+        })
+        ExpeditionDodgeUntil = math.max(ExpeditionDodgeUntil, now + duration)
+    end)
+end)
+
+-- Continuously maintain the safe position while an attack is active. This
+-- is intentionally independent from the visible FX folder.
+task.spawn(function()
+    while true do
+        task.wait(0.025)
+
+        local now = os.clock()
+        for i = #ExpeditionActiveAttacks, 1, -1 do
+            local attack = ExpeditionActiveAttacks[i]
+            if not attack or attack.expires <= now then
+                table.remove(ExpeditionActiveAttacks, i)
+            end
+        end
+
+        if not AutoFarmExpedition or not ExpeditionDodgeEnabled or #ExpeditionActiveAttacks == 0 then
+            if ExpeditionDodgeActive then
+                EndExpeditionDodge()
+            end
+            continue
+        end
+
+        local character = localPlayer.Character
+        local hrp = character and character:FindFirstChild("HumanoidRootPart")
+        if not hrp then
+            EndExpeditionDodge()
+            continue
+        end
+
+        -- Before the telegraph resolves, we can wait. Once the player's
+        -- current position becomes dangerous, move immediately to a safe
+        -- point inside the combat radius.
+        if not IsPointDangerous(hrp.Position, now) then
+            if ExpeditionDodgeActive and now >= ExpeditionDodgeUntil then
+                EndExpeditionDodge()
+            end
+            continue
+        end
+
         if not ExpeditionDodgeActive then
             BeginExpeditionDodge()
         else
@@ -631,7 +708,7 @@ pcall(function()
                 hrp.CFrame = safe
             end
         end
-    end)
+    end
 end)
 
 localPlayer.CharacterAdded:Connect(function()
@@ -908,6 +985,417 @@ task.spawn(function()
             end)
 
             local pets = GetAllEquippedPetUIDs()
+            for _, petUid in ipairs(pets) do
+                pcall(function()
+                    Library.Network.Fire("Farm Coin", CurrentCometId, petUid)
+                end)
+            end
+        end
+        task.wait(0.05)
+    end
+end)
+
+-- Fast attack loop
+task.spawn(function()
+    while true do
+        if FastAttackSpeed then
+            local targetId = nil
+            if AutoFarmComet then
+                targetId = CurrentCometId
+            elseif AutoFarmHackerBoss then
+                targetId = CurrentHackerBossId
+            elseif AutoFarmExpedition then
+                targetId = CurrentExpeditionTargetId
+            elseif AutoFarmRobot or AutoFarmTurkey then
+                targetId = CurrentTargetId
+            end
+
+            if targetId then
+                if DamageRemote then
+                    pcall(function()
+                        DamageRemote:FireServer(targetId)
+                    end)
+                end
+
+                local pets = GetAllEquippedPetUIDs()
+                for _, petUid in ipairs(pets) do
+                    pcall(function()
+                        Library.Network.Fire("Farm Coin", targetId, petUid)
+                    end)
+                end
+            end
+        end
+        task.wait(FastAttackInterval)
+    end
+end)
+
+-- Expedition Auto Farm Loop
+-- Picks a random living expedition mob, selects/taps it, and sends the
+-- equipped pets once. Damage/Fast Attack can then keep hitting the target.
+task.spawn(function()
+    while true do
+        task.wait(0.15)
+
+        if AutoFarmExpedition and localPlayer:GetAttribute("ExpeditionRun") then
+            if not CurrentExpeditionTarget or not IsExpeditionMob(CurrentExpeditionTarget) then
+                CurrentExpeditionTarget = FindRandomExpeditionMob(CurrentExpeditionTarget)
+                CurrentExpeditionTargetId = CurrentExpeditionTarget
+                    and tostring(CurrentExpeditionTarget:GetAttribute("ID"))
+                    or nil
+                LastExpeditionPetSendTarget = nil
+            end
+
+            if CurrentExpeditionTarget and IsExpeditionMob(CurrentExpeditionTarget) then
+                local targetId = tostring(CurrentExpeditionTarget:GetAttribute("ID"))
+                CurrentExpeditionTargetId = targetId
+
+                pcall(function()
+                    Library.Signal.Fire("Select Coin", CurrentExpeditionTarget)
+                end)
+
+                -- Same original pet-send sequence as robots/turkey, once per
+                -- individual expedition mob.
+                if LastExpeditionPetSendTarget ~= CurrentExpeditionTarget then
+                    local myPets = GetAllEquippedPetUIDs()
+                    if #myPets > 0 then
+                        pcall(function()
+                            Library.Network.Invoke("Join Coin", targetId, myPets)
+                        end)
+
+                        for _, petUid in ipairs(myPets) do
+                            pcall(function()
+                                Library.Network.Fire("Change Pet Target", petUid, "Coin", targetId)
+                            end)
+                        end
+
+                        LastExpeditionPetSendTarget = CurrentExpeditionTarget
+                    end
+                end
+            else
+                CurrentExpeditionTarget = nil
+                CurrentExpeditionTargetId = nil
+                LastExpeditionPetSendTarget = nil
+            end
+        else
+            CurrentExpeditionTarget = nil
+            CurrentExpeditionTargetId = nil
+            LastExpeditionPetSendTarget = nil
+        end
+    end
+end)
+
+-- Expedition damage uses the same target as the normal mob farm.
+task.spawn(function()
+    while true do
+        task.wait(0.05)
+        if AutoFarmExpedition and CurrentExpeditionTargetId
+            and localPlayer:GetAttribute("ExpeditionRun") then
+            pcall(function()
+                if DamageRemote then
+                    DamageRemote:FireServer(CurrentExpeditionTargetId)
+                end
+            end)
+        end
+    end
+end)
+
+-- EXPEDITION ATTACK DODGE
+-- Keep the player close enough that expedition mobs can still target them.
+-- The expedition source does not expose a numeric arena radius, so the dodge
+-- uses a conservative target-relative radius instead of making large jumps.
+local function GetSafeExpeditionDodgeCFrame(hrp, targetPosition)
+    local offset = hrp.Position - targetPosition
+    local flatOffset = Vector3.new(offset.X, 0, offset.Z)
+
+    if flatOffset.Magnitude < 0.5 then
+        flatOffset = Vector3.new(hrp.CFrame.RightVector.X, 0, hrp.CFrame.RightVector.Z)
+    end
+
+    if flatOffset.Magnitude < 0.05 then
+        flatOffset = Vector3.new(1, 0, 0)
+    end
+
+    local radial = flatOffset.Unit
+    local perpendicular = Vector3.new(-radial.Z, 0, radial.X)
+
+    -- Alternate sides so repeated attacks do not send the player farther away.
+    if math.random(0, 1) == 0 then
+        perpendicular = -perpendicular
+    end
+
+    local candidate = targetPosition + perpendicular * ExpeditionDodgeRadius
+
+    -- Put the player on actual ground. This prevents the dodge from placing
+    -- the HumanoidRootPart in mid-air and falling through the expedition map.
+    local rayParams = RaycastParams.new()
+    rayParams.FilterType = Enum.RaycastFilterType.Exclude
+    rayParams.FilterDescendantsInstances = {localPlayer.Character, CurrentExpeditionTarget}
+    rayParams.IgnoreWater = true
+
+    local rayOrigin = candidate + Vector3.new(0, 60, 0)
+    local rayResult = Workspace:Raycast(rayOrigin, Vector3.new(0, -140, 0), rayParams)
+    if rayResult then
+        candidate = rayResult.Position + Vector3.new(0, 3, 0)
+    else
+        -- If no floor was found, do not perform the teleport at all.
+        return nil
+    end
+
+    -- Final safety check: never place the player farther than the combat radius.
+    local finalOffset = Vector3.new(candidate.X - targetPosition.X, 0, candidate.Z - targetPosition.Z)
+    if finalOffset.Magnitude > ExpeditionMaxCombatRadius then
+        candidate = targetPosition + finalOffset.Unit * ExpeditionMaxCombatRadius
+        local floorCheck = Workspace:Raycast(candidate + Vector3.new(0, 60, 0), Vector3.new(0, -140, 0), rayParams)
+        if not floorCheck then
+            return nil
+        end
+        candidate = floorCheck.Position + Vector3.new(0, 3, 0)
+    end
+
+    return CFrame.new(candidate, Vector3.new(targetPosition.X, candidate.Y, targetPosition.Z))
+end
+
+task.spawn(function()
+    while true do
+        task.wait(0.05)
+
+        if AutoFarmExpedition then
+            local character = localPlayer.Character
+            local hrp = character and character:FindFirstChild("HumanoidRootPart")
+            local fxFolder = Workspace:FindFirstChild("__AUTUMNBOSS_FX")
+
+            if hrp and CurrentExpeditionTarget and CurrentExpeditionTarget.Parent and fxFolder and #fxFolder:GetChildren() > 0 then
+                if not ExpeditionIsEvading then
+                    local targetPart = CurrentExpeditionTarget:FindFirstChild("Coin")
+                    local targetPosition = targetPart and targetPart.Position or CurrentExpeditionTarget:GetPivot().Position
+                    local safeDodge = GetSafeExpeditionDodgeCFrame(hrp, targetPosition)
+
+                    if safeDodge then
+                        ExpeditionIsEvading = true
+                        ExpeditionSavedCFrame = hrp.CFrame
+                        hrp.CFrame = safeDodge
+                    end
+                end
+            elseif ExpeditionIsEvading and hrp then
+                ExpeditionIsEvading = false
+                if ExpeditionSavedCFrame then
+                    hrp.CFrame = ExpeditionSavedCFrame
+                end
+                ExpeditionSavedCFrame = nil
+            end
+        elseif ExpeditionIsEvading then
+            local character = localPlayer.Character
+            local hrp = character and character:FindFirstChild("HumanoidRootPart")
+            if hrp and ExpeditionSavedCFrame then
+                hrp.CFrame = ExpeditionSavedCFrame
+            end
+            ExpeditionIsEvading = false
+            ExpeditionSavedCFrame = nil
+        end
+    end
+end)
+
+
+-- Hacker Boss Auto Farm Loop
+-- Uses the same coin selection / Join Coin / Change Pet Target sequence
+-- as the other auto farms, targeting the live Hacker Prime boss coin.
+task.spawn(function()
+    while true do
+        task.wait(0.15)
+
+        if AutoFarmHackerBoss then
+            if not CurrentHackerBoss or not CurrentHackerBoss.Parent then
+                CurrentHackerBoss = FindHackerBoss()
+                CurrentHackerBossId = CurrentHackerBoss and tostring(CurrentHackerBoss:GetAttribute("ID")) or nil
+            end
+
+            if CurrentHackerBoss and CurrentHackerBoss.Parent then
+                CurrentHackerBossId = tostring(CurrentHackerBoss:GetAttribute("ID"))
+                FocusPetsContinuous(CurrentHackerBoss)
+            else
+                CurrentHackerBoss = nil
+                CurrentHackerBossId = nil
+            end
+        else
+            CurrentHackerBoss = nil
+            CurrentHackerBossId = nil
+        end
+    end
+end)
+
+-- Main Auto Farm Loop
+task.spawn(function()
+    while true do
+        task.wait(0.15)
+        if AutoFarmRobot then
+            if not CurrentTarget or not CurrentTarget.Parent then
+                CurrentTarget = GetNextRobot()
+            end
+            if CurrentTarget and CurrentTarget.Parent then
+                CurrentTargetId = tostring(CurrentTarget:GetAttribute("ID"))
+                FocusPetsContinuous(CurrentTarget)
+            else
+                CurrentTargetId = nil
+            end
+        else
+            if not AutoFarmTurkey then
+                CurrentTarget = nil
+                CurrentTargetId = nil
+            end
+        end
+        
+        if AutoFarmTurkey then
+            if not CurrentTarget or not CurrentTarget.Parent then
+                CurrentTarget = FindTurkey()
+            end
+            if CurrentTarget and CurrentTarget.Parent then
+                CurrentTargetId = tostring(CurrentTarget:GetAttribute("ID"))
+                FocusPetsContinuous(CurrentTarget)
+            else
+                CurrentTargetId = nil
+            end
+        else
+            if not AutoFarmRobot then
+                CurrentTarget = nil
+                CurrentTargetId = nil
+            end
+        end
+    end
+end)
+
+-- Damage Spam Loop
+task.spawn(function()
+    while true do
+        task.wait(0.05)
+        if CurrentTargetId and DamageRemote and (AutoFarmRobot or AutoFarmTurkey) then
+            pcall(function()
+                DamageRemote:FireServer(CurrentTargetId)
+            end)
+        end
+    end
+end)
+
+-- Hacker Boss damage loop
+task.spawn(function()
+    while true do
+        task.wait(0.05)
+        if AutoFarmHackerBoss and CurrentHackerBossId and DamageRemote then
+            pcall(function()
+                DamageRemote:FireServer(CurrentHackerBossId)
+            end)
+        end
+    end
+end)
+
+-- GENERIC CLOSEST-COIN FARM
+-- Target scanning is deliberately separated from attacking. This keeps the
+-- expensive Workspace scan from running at the same rate as the hit remotes.
+local ClosestCoinScanInterval = 0.10
+local ClosestCoinHitInterval = 0.05
+local CachedEquippedPets = {}
+local CachedPetsRefreshAt = 0
+local LastCoinInteractionTarget = nil
+local LastCoinTeleportTarget = nil
+
+local function RefreshCachedEquippedPets(force)
+    local now = os.clock()
+    if not force and now < CachedPetsRefreshAt then
+        return CachedEquippedPets
+    end
+
+    local pets = {}
+    pcall(function()
+        pets = GetAllEquippedPetUIDs()
+    end)
+
+    CachedEquippedPets = pets or {}
+    CachedPetsRefreshAt = now + 0.50
+    return CachedEquippedPets
+end
+
+-- Find and select the target at a lower rate than the actual attack loop.
+task.spawn(function()
+    while true do
+        if AutoTap or AutoTeleportClosestCoin then
+            local previous = CurrentCoinTarget
+            local target = FindClosestCoin(previous)
+
+            if target and target.Parent then
+                local targetId = target:GetAttribute("ID")
+                if targetId ~= nil then
+                    targetId = tostring(targetId)
+                    local changed = target ~= CurrentCoinTarget
+
+                    CurrentCoinTarget = target
+                    CurrentCoinTargetId = targetId
+
+                    -- Selection is only sent when the target changes. Sending
+                    -- it every frame is unnecessary and causes extra client work.
+                    if changed or LastCoinInteractionTarget ~= target then
+                        pcall(function()
+                            Library.Signal.Fire("Select Coin", target)
+                        end)
+                        LastCoinInteractionTarget = target
+
+                        if AutoTap then
+                            local pets = RefreshCachedEquippedPets(true)
+                            if #pets > 0 then
+                                pcall(function()
+                                    Library.Network.Invoke("Join Coin", targetId, pets)
+                                end)
+
+                                for _, petUid in ipairs(pets) do
+                                    pcall(function()
+                                        Library.Network.Fire("Change Pet Target", petUid, "Coin", targetId)
+                                    end)
+                                end
+                            end
+                        end
+                    end
+
+                    -- Teleport only when the target changes instead of
+                    -- repeatedly setting CFrame every frame.
+                    if AutoTeleportClosestCoin and (changed or LastCoinTeleportTarget ~= target) then
+                        TeleportToClosestCoin(target)
+                        LastCoinTeleportTarget = target
+                    elseif not AutoTeleportClosestCoin then
+                        LastCoinTeleportTarget = nil
+                    end
+                else
+                    ResetCoinTarget()
+                    LastCoinInteractionTarget = nil
+                    LastCoinTeleportTarget = nil
+                end
+            else
+                ResetCoinTarget()
+                LastCoinInteractionTarget = nil
+                LastCoinTeleportTarget = nil
+            end
+        else
+            ResetCoinTarget()
+            LastCoinInteractionTarget = nil
+            LastCoinTeleportTarget = nil
+        end
+
+        task.wait(ClosestCoinScanInterval)
+    end
+end)
+
+-- Dedicated hit loop. It uses the same direct damage/Farm Coin calls as the
+-- existing Expedition/Turkey/Comet attack paths, but avoids rebuilding the
+-- pet list on every hit.
+task.spawn(function()
+    while true do
+        if AutoTap and CurrentCoinTargetId then
+            local targetId = CurrentCoinTargetId
+            local pets = RefreshCachedEquippedPets(false)
+
+            if DamageRemote then
+                pcall(function()
+                    DamageRemote:FireServer(targetId)
+                end)
+            end
+
             for _, petUid in ipairs(pets) do
                 pcall(function()
                     Library.Network.Fire("Farm Coin", targetId, petUid)
@@ -4165,7 +4653,7 @@ local EXIT_STOP, CANDY_STOP = 3, 3.5
 -- state ----------------------------------------------------------------------------------------
 local running, moveToken, jobRunning, autoOn = true, 0, false, false
 local O = {slip = true, avoid = true, candyFirst = true, candyEsp = true, hatch = true, escape = true, scout = true,
-	path = true, pin = false, afk = false, zoom = false, minLuck = 10, hatchSeconds = 60, speed = 20}
+	path = true, pin = false, zoom = false, minLuck = 10, hatchSeconds = 60, speed = 20}
 local eggNames, eggSettings, savedEggSettings = {}, {}, {}
 local rejected = setmetatable({}, {__mode = "k"})
 local hatchOwned = false
@@ -4205,7 +4693,7 @@ do
 	local okRead, s = pcall(function() return isfile and isfile(SFILE) and HttpService:JSONDecode(readfile(SFILE)) end)
 	if okRead and type(s) == "table" then
 		local map = {avoid = "avoid", candyFirst = "candyFirst", candyEsp = "candyEsp", hatchOn = "hatch", escapeOn = "escape",
-			scoutOn = "scout", pathVisible = "path", minimapWhenHidden = "pin", afkView = "afk", zoom = "zoom"}
+			scoutOn = "scout", pathVisible = "path", minimapWhenHidden = "pin", zoom = "zoom"}
 		for jsonKey, key in pairs(map) do if s[jsonKey] ~= nil then O[key] = s[jsonKey] == true end end
 		O.minLuck = tonumber(s.minLuck) or O.minLuck
 		O.hatchSeconds = tonumber(s.hatchSeconds) or O.hatchSeconds
@@ -4224,7 +4712,7 @@ local function saveSettings()
 		if writefile then
 			writefile(SFILE, HttpService:JSONEncode({speed = O.speed, avoid = O.avoid, candyFirst = O.candyFirst,
 				candyEsp = O.candyEsp, zoom = O.zoom, hatchOn = O.hatch, escapeOn = O.escape, scoutOn = O.scout,
-				pathVisible = O.path, minimapWhenHidden = O.pin, afkView = O.afk, minLuck = O.minLuck, hatchSeconds = O.hatchSeconds,
+				pathVisible = O.path, minimapWhenHidden = O.pin, minLuck = O.minLuck, hatchSeconds = O.hatchSeconds,
 				eggSettings = eggSettings}))
 		end
 	end)
@@ -4439,7 +4927,7 @@ end
 -- ── v5 scarecrow avoidance ────────────────────────────────────────────────────────────────────
 local MARGIN_BASE, MARGIN_FACING = 1.0, 1.2 -- cells we keep from the scarecrow; larger if it faces / heads for us
 local FACE_SIGN = 1                          -- verified: the client pivots the model with lookAt(pos, pos+heading), so LookVector = facing
-local BLOCK_HIDE = 2.5                    -- only a short fallback; race planning below is preferred
+local BLOCK_HIDE = 25                     -- seconds we hide out of sight before creeping back to slip past
 local SLIP_LANE, SLIP_AFTER = 5.9, 3          -- game: CatchRadius 5, corridor half-width 7 (cell 16, wall 2) -> only a lane ~5.9 studs off-centre clears it
 local function scareMargin(st, m, me)
 	if m.hunting then return MARGIN_FACING end
@@ -4469,53 +4957,48 @@ local function dangerCtx(st, g)
 	local ct = st.cs / math.max(O.speed, 1) * TURN_PENALTY
 	local clearA = 0
 	if m.a ~= m.b and m.f < 0.8 then clearA = (0.8 - m.f) * math.max(m.seg, mt) end
-	return {m = m, dist = bfsCached(g, b), a = m.a, b = b, tb = m.tb, mt = mt, ct = ct, clearA = clearA,
-		pad = 0.5 * ct + scareMargin(st, m, me) * mt + SAFETY_BUF, hunting = m.hunting, face = scareMargin(st, m, me) > MARGIN_BASE,
-		cs = st.cs}
+	local margin = scareMargin(st, m, me)
+	local cfgM = getCfg().Monster or {}
+	local mins = math.max(0, (Workspace:GetServerTimeNow() - (tonumber(st.runStartedAt) or Workspace:GetServerTimeNow())) / 60)
+	local los = not m.hunting -- wandering: only being SEEN (straight wall-free line, within sense range) matters; hunting: it knows where we are
+	return {m = m, st = st, g = g, dist = bfsCached(g, b), a = m.a, b = b, tb = m.tb, mt = mt, ct = ct, clearA = clearA, vd = {}, los = los,
+		margin = margin, S = (tonumber(cfgM.SenseStart) or 2) + (tonumber(cfgM.SensePerMinute) or 0.6) * math.min(mins, 20) + 2,
+		pad = los and (0.5 * ct + SAFETY_BUF) or (0.5 * ct + margin * mt + SAFETY_BUF), hunting = m.hunting, face = margin > MARGIN_BASE}
 end
-local function eta(ctx, c)
+local LOS_NEAR = 3 -- cells: unseen but this close, it can still walk into us
+local function eta(ctx, c) -- earliest time (s from now) cell c becomes unsafe
 	local d = ctx.dist[c]
-	if d == nil then return 1e9 end
-	return ctx.tb + d * ctx.mt
+	if not ctx.los then
+		if d == nil then return 1e9 end
+		return ctx.tb + d * ctx.mt
+	end
+	local e = ctx.vd[c]
+	if e == nil then
+		e = 1e9
+		if d ~= nil and d <= LOS_NEAR then e = ctx.tb + (d - ctx.margin) * ctx.mt end
+		for x, k in pairs((sightCells(ctx.st, ctx.g, c))) do
+			local dx = ctx.dist[x]
+			if dx and k <= ctx.S then
+				local tv = ctx.tb + dx * ctx.mt
+				if tv < e then e = tv end
+			end
+		end
+		ctx.vd[c] = e
+	end
+	return e
 end
 local function slack(ctx, c, t)
 	if c == ctx.a and ctx.a ~= ctx.b and t < ctx.clearA + ctx.pad * 0.6 then return -1 end
 	return eta(ctx, c) - t - ctx.pad
 end
--- A failed movement edge is treated as a temporary obstacle.  This lets the
--- planner route around a wall corner or scarecrow hitbox push instead of
--- retrying the same route forever.
-local function edgeKey(a, b)
-	if a > b then a, b = b, a end
-	return tostring(a) .. ":" .. tostring(b)
-end
-local function edgeBlocked(blocked, a, b)
-	local untilTime = blocked and blocked[edgeKey(a, b)]
-	return untilTime and untilTime > os.clock()
-end
-local function bfsAvoiding(g, src, dst, blocked)
-	local prev, q, h = {}, {src}, 1
-	while q[h] do
-		local c = q[h]; h += 1
-		if c == dst then return pathTo(prev, src, dst) end
-		for _, nb in ipairs(nbrs(g, c)) do
-			if prev[nb] == nil and nb ~= src and not edgeBlocked(blocked, c, nb) then
-				prev[nb] = c; q[#q + 1] = nb
-			end
-		end
-	end
-	return nil
-end
-local function safeSearch(g, me, ctx, maxSteps, blocked)
+local function safeSearch(g, me, ctx, maxSteps)
 	local steps, prev, order, h = {[me] = 0}, {}, {me}, 1
 	while order[h] do
 		local c = order[h]; h += 1
 		local s = steps[c] + 1
 		if s <= maxSteps then
 			for _, nb in ipairs(nbrs(g, c)) do
-				if steps[nb] == nil and not edgeBlocked(blocked, c, nb) and slack(ctx, nb, s * ctx.ct) >= 0 then
-					steps[nb] = s; prev[nb] = c; order[#order + 1] = nb
-				end
+				if steps[nb] == nil and slack(ctx, nb, s * ctx.ct) >= 0 then steps[nb] = s; prev[nb] = c; order[#order + 1] = nb end
 			end
 		end
 	end
@@ -4592,240 +5075,86 @@ local function escapePath(g, me, ctx)
 	if best then return pathTo(prev, me, best) end
 end
 
--- The conservative safe-search uses the full scarecrow margin.  That is
--- correct for waiting, but it can make the bot hide even when it can cross a
--- corridor and arrive at the destination before the scarecrow can enter any
--- of those cells.  This admits that route with a small hitbox buffer instead.
-local function winningRaceRoute(g, me, goal, ctx, blocked)
-	local route = bfsAvoiding(g, me, goal, blocked)
-	if not route then return nil end
-	local hitboxBuffer = math.max(0.2, ctx.ct * 0.35)
-	for i = 1, #route do
-		local playerTime = (i - 1) * ctx.ct
-		if eta(ctx, route[i]) - playerTime < hitboxBuffer then
-			return nil
-		end
-	end
-	return route, eta(ctx, goal) - (#route - 1) * ctx.ct
-end
-
--- Plan in player-time, not in a persistent "hide" state.  The scarecrow's
--- graph distance is converted into the first moment its one-cell kill hitbox
--- can reach a cell.  Every cell in the selected route must be crossed before
--- that moment.  When the goal is temporarily impossible, return the safe
--- route that makes the most progress toward it, then recompute on the next
--- tick from the live scarecrow state.
-local function hitboxEta(ctx, cell)
-	local distance = ctx.dist[cell]
-	if distance == nil then return math.huge end
-	return ctx.tb + math.max(0, distance - 1) * ctx.mt
-end
-local function timeAwareRoute(g, me, goal, ctx, blocked)
-	local steps, prev, q, head = {[me] = 0}, {}, {me}, 1
-	local toGoal = bfsCached(g, goal)
-	local best, bestScore = me, math.huge
-	while q[head] do
-		local cell = q[head]; head += 1
-		local step = steps[cell]
-		local remaining = toGoal[cell]
-		if remaining then
-			local score = remaining * 100 - math.min(hitboxEta(ctx, cell) - step * ctx.ct, 10)
-			if score < bestScore then best, bestScore = cell, score end
-		end
-		if cell == goal then
-			return pathTo(prev, me, goal), true, hitboxEta(ctx, goal) - step * ctx.ct
-		end
-		if step < 80 then
-			for _, nextCell in ipairs(nbrs(g, cell)) do
-				local nextStep = step + 1
-				-- Keep a real timing cushion outside the one-cell kill hitbox.  A
-				-- zero/near-zero margin can look safe on paper but loses to update
-				-- latency, cornering, and the character's physical width.
-				-- Use the same full physical clearance as every other movement mode.
-				-- The former one-cell hitbox estimate allowed a route that was
-				-- technically ahead of the scarecrow on the graph, but close enough
-				-- for its real catch radius to kill the player while cornering.
-				if steps[nextCell] == nil and not edgeBlocked(blocked, cell, nextCell)
-					and slack(ctx, nextCell, nextStep * ctx.ct) >= 0 then
-					steps[nextCell], prev[nextCell] = nextStep, cell
-					q[#q + 1] = nextCell
+-- hallway zone: the corridor (chain of cells with <=2 exits) around a cell, up to and including the junctions at its ends
+local function zoneOf(g, c)
+	g.zone = g.zone or {}
+	local z = g.zone[c]
+	if z then return z end
+	z = {[c] = true}
+	if #nbrs(g, c) <= 2 then
+		local q, h = {c}, 1
+		while q[h] do
+			local x = q[h]; h += 1
+			for _, nb in ipairs(nbrs(g, x)) do
+				if not z[nb] then
+					z[nb] = true
+					if #nbrs(g, nb) <= 2 then q[#q + 1] = nb end
 				end
 			end
 		end
 	end
-	return pathTo(prev, me, best) or {me}, false, hitboxEta(ctx, best) - (steps[best] or 0) * ctx.ct
+	g.zone[c] = z
+	return z
+end
+-- is the scarecrow anywhere in a hallway our route needs? (unless it hunts us from behind while we run away from it)
+local function routeBlocked(g, route, ctx, me)
+	if ctx.hunting and route[2] and (ctx.dist[route[2]] or 0) > (ctx.dist[me] or 0) then return false end
+	local z, z2 = zoneOf(g, ctx.b), zoneOf(g, ctx.a)
+	for i = 2, #route do
+		local c = route[i]
+		if z[c] or z2[c] then return true end
+	end
+	return false
 end
 
 -- returns route (starting at `me`), mode, spare seconds on our own cell, ctx
+local function bfsAvoid(g, me, bad)
+	local prev, depth, q, h = {}, {[me] = 0}, {me}, 1
+	while q[h] do
+		local c = q[h]; h += 1
+		for _, nb in ipairs(nbrs(g, c)) do
+			if depth[nb] == nil and not bad(nb) then depth[nb] = depth[c] + 1; prev[nb] = c; q[#q + 1] = nb end
+		end
+	end
+	return prev, depth
+end
+-- simple + fast: walk the shortest route that avoids a small bubble around the scarecrow; break away if inside it
 local function decide(st, g, me, goal, ps, opts)
 	local ctx = dangerCtx(st, g)
 	if not ctx then
-		ps.refuge, ps.advance, ps.slip, ps.blocked, ps.fleeing = nil, nil, false, nil, false
-		return bfsAvoiding(g, me, goal, ps.blockedEdges), "clear", nil, nil
+		ps.blocked = nil
+		local _, p = bfsPrev(g, me)
+		return pathTo(p, me, goal), "clear", nil, nil
 	end
-	-- Hunting is authoritative server state, not a prediction. Never let a
-	-- destination route override it: first take a safe route to a cell that
-	-- breaks the maze's straight-line sight. This avoids the old left/right
-	-- oscillation and prevents a fast corner pass through the CatchRadius.
-	local visible, escapeSteps, escapePrev = sightCells(st, g, ctx.b), safeSearch(g, me, ctx, 60, ps.blockedEdges)
-	local nearMonster = (ctx.dist[me] or math.huge) <= 9
-	if nearMonster and (ctx.hunting or visible[me] ~= nil) then
-		-- Commit to a valid cover target. Re-picking one every 0.1 seconds is
-		-- what caused back-and-forth movement when the monster changed segments.
-		local cover = ps.refuge
-		if cover == me or not (cover and escapeSteps[cover] ~= nil and visible[cover] == nil
-			and slack(ctx, cover, escapeSteps[cover] * ctx.ct) >= 1.25) then
-			cover = nil
-			local coverScore
-			for cell, step in pairs(escapeSteps) do
-				if cell ~= me and visible[cell] == nil and slack(ctx, cell, step * ctx.ct) >= 1.25 then
-					-- Prefer nearby cover, but reward increasing graph distance so the
-					-- bot cannot pick a hiding cell immediately beside the monster.
-					local score = step - math.min(ctx.dist[cell] or 0, 16) * 0.22
-					if not coverScore or score < coverScore then cover, coverScore = cell, score end
-				end
-			end
-		end
-		if cover then
-			ps.refuge, ps.advance, ps.retreat, ps.slip, ps.blocked, ps.fleeing = cover, nil, nil, false, nil, true
-			return pathTo(escapePrev, me, cover), ctx.hunting and "HUNT: TAKING COVER" or "BREAKING SIGHT", nil, ctx
-		end
-		-- If no covered cell is reachable in time, only move away. Do not try
-		-- to squeeze past the scarecrow toward an egg, candy, or exit.
-		local flee = escapePath(g, me, ctx)
-		if flee and #flee > 1 then
-			ps.fleeing = true
-			return flee, "HUNT: FALLING BACK", nil, ctx
-		end
-	end
-	-- Prefer a route that is safe for its whole duration. Do not return a
-	-- one-cell "wait" result here: doing that made all recovery logic below
-	-- unreachable, so one moving scarecrow could permanently strand the bot.
-	local liveRoute, reachesGoal, spare = timeAwareRoute(g, me, goal, ctx, ps.blockedEdges)
-	if reachesGoal then
-		ps.refuge, ps.advance, ps.retreat, ps.slip, ps.blocked, ps.fleeing = nil, nil, nil, false, nil, false
-		return liveRoute, "TIMED ROUTE", spare, ctx
-	end
-	if #liveRoute > 1 then
-		ps.refuge, ps.advance, ps.retreat, ps.slip, ps.blocked, ps.fleeing = nil, nil, nil, false, nil, false
-		return liveRoute, "REPOSITIONING", spare, ctx
-	end
-
-	-- A direct line of sight is what turns a wandering scarecrow into an
-	-- aggressive pursuer. If we are exposed nearby, break sight first rather
-	-- than oscillating along the same hallway while repeatedly replanning.
-	local visible, steps, prev = sightCells(st, g, ctx.b), safeSearch(g, me, ctx, 60, ps.blockedEdges)
-	if visible[me] ~= nil and (ctx.dist[me] or math.huge) <= 8 then
-		local refuge, refugeScore
-		for cell, step in pairs(steps) do
-			if cell ~= me and visible[cell] == nil and slack(ctx, cell, step * ctx.ct) >= 1 then
-				local score = step - math.min(ctx.dist[cell] or 0, 12) * 0.08
-				if not refugeScore or score < refugeScore then refuge, refugeScore = cell, score end
-			end
-		end
-		if refuge then
-			ps.refuge, ps.advance, ps.retreat, ps.slip, ps.blocked, ps.fleeing = refuge, nil, nil, false, nil, true
-			return pathTo(prev, me, refuge), "BREAKING SIGHT", spare, ctx
-		end
-	end
-	-- No fully-safe forward step right now. Fall through to the conservative
-	-- refuge / escape / slip planner instead of treating the scarecrow as a
-	-- permanent obstacle. Expired blocked edges are cleaned by walk().
-
-	local stay, enter = opts.stay or STAY_SLACK, opts.enter or 0
-	local s0 = slack(ctx, me, 0)
-	local steps, prev = safeSearch(g, me, ctx, 60, ps.blockedEdges)
-	-- dead-end goal (corner egg): only commit if, once hunted, we can get in AND back out to the mouth in time
-	local mouth, depth = branchInfo(g, goal)
-	local trapOk = true
-	if mouth and ctx.hunting then
-		local inT = goal == me and 0 or ((bfsCached(g, me)[mouth] or 0) + depth) * ctx.ct
-		trapOk = eta(ctx, mouth) - inT - depth * ctx.ct - ctx.pad >= (goal == me and 1 or 3)
-	end
-	if steps[goal] ~= nil and trapOk then
-		local ok
-		if goal == me then ok = s0 >= stay else ok = slack(ctx, goal, steps[goal] * ctx.ct) >= enter end
-		if ok then
-			ps.refuge, ps.advance, ps.slip, ps.blocked, ps.fleeing = nil, nil, false, nil, false
-			return pathTo(prev, me, goal), (s0 < 4 and "racing" or "normal"), s0, ctx
-		end
-	end
-	local gd = bfsCached(g, goal)
-	-- Prefer a continuous run whenever we can cross every route cell before the
-	-- scarecrow can reach that cell.  This is intentionally checked before the
-	-- flee/hide branch: being close is not a reason to hide if we are winning.
-	local race, raceSpare = winningRaceRoute(g, me, goal, ctx, ps.blockedEdges)
-	if race then
-		ps.refuge, ps.advance, ps.retreat, ps.slip, ps.blocked, ps.fleeing = nil, nil, nil, false, nil, false
-		return race, "BEATING SCARECROW", raceSpare, ctx
-	end
-	-- too close to stand still (or trapped in a dead end while hunted): run to the best refuge / dodge cell
-	if s0 < math.max(stay, 1.2) or not trapOk or (ps.fleeing and s0 < 2.5) then
-		ps.fleeing = true
-		-- commit to the current refuge while it is still safely reachable (stops left/right flip-flopping)
-		local r = ps.refuge
-		if not (r and r ~= me and steps[r] ~= nil and slack(ctx, r, steps[r] * ctx.ct) >= 0.5) then
-			r = pickRefuge(g, me, ctx, steps, ps.refuge, gd)
-		end
-		if r then ps.refuge, ps.advance, ps.slip = r, nil, false; return pathTo(prev, me, r), "FLEEING", s0, ctx end
-		local ep = escapePath(g, me, ctx)
-		if ep then return ep, "ESCAPING", s0, ctx end
-		local bestN, bestV
-		for _, nb in ipairs(nbrs(g, me)) do
-			local v = eta(ctx, nb)
-			if not bestV or v > bestV then bestN, bestV = nb, v end
-		end
-		if bestN then return {me, bestN}, "desperate", s0, ctx end
-		return {me}, "trapped", s0, ctx
-	end
-	ps.fleeing = false
 	local now = os.clock()
+	local R = ctx.hunting and 3 or (ctx.face and 2.2 or 2)  -- bubble radius in cells (path distance)
+	if ps.blocked and now - ps.blocked > 5 then R = math.min(R, 1.2) end -- never wait long
+	local d = ctx.dist
+	local function bad(c) return (d[c] or 99) <= R end
+	if bad(me) then
+		local ep = escapePath(g, me, ctx)
+		if ep and #ep > 1 then return ep, "ESCAPING", nil, ctx end
+	end
+	local mouth, depth = branchInfo(g, goal)
+	local trapBad = mouth and ctx.hunting and goal ~= me and (d[mouth] or 99) <= depth + 4
+	local prev, dep = bfsAvoid(g, me, bad)
+	if not trapBad and dep[goal] ~= nil then
+		ps.blocked = nil
+		return pathTo(prev, me, goal), "go", nil, ctx
+	end
 	ps.blocked = ps.blocked or now
-	if now - ps.blocked < BLOCK_HIDE then
-		-- blocked: back off far, out of the scarecrow's line of sight, so it wanders away from the goal
-		local vis, dang = sightCells(st, g, ctx.b), dangling(g)
-		local r = ps.retreat
-		if not (r and steps[r] ~= nil and vis[r] == nil and slack(ctx, r, steps[r] * ctx.ct) >= 1) then
-			r = nil
-			local bs
-			for c, n in pairs(steps) do
-				if slack(ctx, c, n * ctx.ct) >= 1 then
-					local sc = math.min(ctx.dist[c] or 20, 14) + dodgeShape(g, c) - n * 0.3
-					if vis[c] ~= nil then sc -= 100 end
-					if dang[c] then sc -= 8 end
-					if not bs or sc > bs then r, bs = c, sc end
-				end
-			end
-			ps.retreat = r
-		end
-		if r and r ~= me then return pathTo(prev, me, r), "BACKING OFF", s0, ctx end
-		return {me}, "hiding", s0, ctx
+	local dang, best, bs = dangling(g), nil, nil
+	for c, n in pairs(dep) do
+		local sc = math.min(d[c] or 20, 8) - n * 0.3 + dodgeShape(g, c) - (dang[c] and 8 or 0) + (c == me and 2 or 0) + (c == ps.retreat and 3 or 0)
+		if not bs or sc > bs then best, bs = c, sc end
 	end
-	ps.retreat = nil
-	local best, bScore
-	for c, s in pairs(steps) do
-		local d = gd[c]
-		if d then
-			local sl = slack(ctx, c, s * ctx.ct)
-			if sl >= 2 then
-				local sc = -d * 10 + math.min(sl, 6) - s * 0.1 + dodgeShape(g, c) * 2
-				if c == ps.advance then sc += 4 end
-				if not bScore or sc > bScore then best, bScore = c, sc end
-			end
-		end
-	end
-	if best and best ~= me and (gd[best] or 99) < (gd[me] or 99) then
-		ps.advance, ps.refuge = best, nil
-		return pathTo(prev, me, best), "advancing", s0, ctx
-	end
-	ps.advance = nil
-	-- still blocked after a while: sprint past it along the far lane (only if it isn't hunting / facing us)
-	if O.slip ~= false and (ps.slip or now - ps.blocked > SLIP_AFTER) and not ctx.hunting and not ctx.face and trapOk and (ctx.dist[me] or 99) <= 3 then
-		local r = bfsAvoiding(g, me, goal, ps.blockedEdges)
-		if r then ps.slip = true; return r, "SLIP", s0, ctx end
-	end
-	ps.slip = false
-	return {me}, "waiting", s0, ctx
+	ps.retreat = best
+	if best and best ~= me then return pathTo(prev, me, best), "BACKING OFF", nil, ctx end
+	return {me}, "waiting", nil, ctx
+end
+-- cells we can walk to (plain BFS; the scarecrow bubble only matters for the main route)
+local function reachSteps(st, g, me)
+	return bfsCached(g, me), dangerCtx(st, g)
 end
 -- sprint lane: while passing the scarecrow, run the far-wall lane (>5 studs from its path = outside CatchRadius), at full speed
 local function slipAim(st, aim, root)
@@ -4840,13 +5169,6 @@ local function slipAim(st, aim, root)
 	local lat = perp:Dot(Vector3.new(root.Position.X - c.X, 0, root.Position.Z - c.Z))
 	return aim + perp * (side * SLIP_LANE - lat)
 end
--- steps from `me` over cells we can safely enter (plain BFS when AVOID is off)
-local function reachSteps(st, g, me)
-	local ctx = dangerCtx(st, g)
-	if ctx then return (safeSearch(g, me, ctx, 80)), ctx end
-	return bfsCached(g, me), nil
-end
-
 -- blue path (pooled) ---------------------------------------------------------------------------
 local pathFolder = new("Folder", {Name = "HMV2_Path"}, Workspace)
 local segs, activeSegmentCount = {}, 0
@@ -4987,8 +5309,8 @@ local function walk(token, getTarget, stop, label, opts)
 	opts = opts or {}
 	local s0 = getState()
 	local floor0 = s0 and s0.floor
-	local ps, lastPos, lastT, lastInt, lastDraw, waitStart = {blockedEdges = {}, edgeAttempts = {}}, nil, os.clock(), 0, 0, os.clock()
-    local route, routeMode, routeSpare, plannedGoal, plannedAt, plannedMonster, routeCursor, activeAim
+	local ps, lastPos, lastT, lastInt, lastDraw, waitStart = {}, nil, os.clock(), 0, 0, os.clock()
+    local route, routeMode, routeSpare, plannedGoal, plannedAt, routeCursor, activeAim
     routeCursor = 1
 	while running and token == moveToken do
 		local st, root, hum = getState(), getRoot(), getHum()
@@ -4999,23 +5321,6 @@ local function walk(token, getTarget, stop, label, opts)
 		local g = grid(st)
 		local me, goal = posCell(st, root.Position), posCell(st, tp)
 		if not (me and goal) then task.wait(0.1); continue end
-		-- A retry count only means anything while we are failing to cross the
-		-- same edge. Once we enter the next cell, clear its failure memory;
-		-- otherwise ordinary backtracking eventually marks good corridors bad.
-		if ps.lastCell and ps.lastCell ~= me then
-			local crossed = edgeKey(ps.lastCell, me)
-			ps.edgeAttempts[crossed] = nil
-			ps.blockedEdges[crossed] = nil
-		end
-		ps.lastCell = me
-		-- Crossing an exit while pursuing candy/an egg is still a floor change.
-		-- Report it immediately so Auto restarts its scan instead of continuing
-		-- with stale targets and walking straight through the following floor.
-		if label ~= "EXIT" and me == st.exit then
-			hum:MoveTo(root.Position)
-			setStatus("🚪 exit crossed; refreshing next floor")
-			return "exit"
-		end
 		local now = os.clock()
 		if opts.interrupt and now - lastInt >= 0.3 then
 			lastInt = now
@@ -5023,27 +5328,18 @@ local function walk(token, getTarget, stop, label, opts)
 		end
 		local atGoal
 		if type(stop) == "function" then atGoal = stop(st, root, tp) else atGoal = hdist(root.Position, tp) <= stop end
-	if atGoal and not opts.onHold then hum:MoveTo(root.Position); return "arrived" end
-		for key, untilTime in pairs(ps.blockedEdges) do
-			if untilTime <= now then ps.blockedEdges[key] = nil end
-		end
+		if atGoal and not opts.onHold then hum:MoveTo(root.Position); return "arrived" end
         local routeIndex = route and routeIndexFor(route, me, routeCursor)
         if not routeIndex and route then
             routeIndex = routeIndexFor(route, me, 1)
         end
         if routeIndex then routeCursor = routeIndex end
-        -- Replan as the scarecrow advances through a segment, not just on a
-        -- coarse timer.  Its route/direction changes are included in the key.
-        local monster = monsterModel(st)
-        local monsterKey = monster and (tostring(monster.a) .. ":" .. tostring(monster.b) .. ":" .. tostring(math.floor((monster.f or 0) * 20))) or "none"
-        local replanInterval = 0.10
+        local replanInterval = 0.35
         local needsPlan = not plannedAt or now - plannedAt >= replanInterval or goal ~= plannedGoal
-            or monsterKey ~= plannedMonster or (route and not routeIndex)
+            or (route and not routeIndex)
         if needsPlan then
-			-- Do not stop an unchanged cell crossing: the new command below will
-			-- immediately replace it only when the live route actually changes.
             route, routeMode, routeSpare = decide(st, g, me, goal, ps, opts)
-            plannedGoal, plannedAt, plannedMonster, routeCursor = goal, now, monsterKey, 1
+            plannedGoal, plannedAt, routeCursor = goal, now, 1
             routeIndex = route and routeIndexFor(route, me, 1)
         end
 		if not route then
@@ -5067,46 +5363,31 @@ local function walk(token, getTarget, stop, label, opts)
 		end
 		if opts.onMove then opts.onMove() end
 		if opts.timeout and now - waitStart > opts.timeout then hum:MoveTo(root.Position); return "timeout" end
-		local movementTarget = tp
-		local nextCell = route[routeCursor + 1]
 		local aim
-		if nextCell then
-			-- Use the next cell centre, not the end of a long straight run.  A
-			-- replan can otherwise make the old long MoveTo skim a wall corner.
-			local p = cellPos(st, nextCell)
-			aim = Vector3.new(p.X, root.Position.Y, p.Z)
-			if ps.slip then aim = slipAim(st, aim, root) end
-			if not activeAim or (aim - activeAim).Magnitude >= 0.25 then
-				local key = edgeKey(me, nextCell)
-				ps.edgeAttempts[key] = (ps.edgeAttempts[key] or 0) + 1
-				if ps.edgeAttempts[key] > 3 then
-					ps.blockedEdges[key] = now + 5
-					activeAim, plannedAt = nil, nil
-					hum:MoveTo(root.Position)
-					setStatus("↻ repeated corridor; choosing another path")
-					task.wait(0.05)
-					continue
-				end
-				hum:MoveTo(aim); activeAim = aim
-			end
-		elseif mode == "waiting" or mode == "trapped" or mode == "hiding" then
-			if activeAim then hum:MoveTo(root.Position); activeAim = nil end
-		else
-			aim = Vector3.new(movementTarget.X, root.Position.Y, movementTarget.Z)
-			if not activeAim or (aim - activeAim).Magnitude >= 0.25 then hum:MoveTo(aim); activeAim = aim end
-		end
+        local movementTarget = tp
+        if #route - routeCursor >= 1 then aim = aimPoint(st, route, root, movementTarget, routeCursor)
+		elseif mode == "waiting" or mode == "trapped" or mode == "hiding" or mode == "waiting for hallway" then aim = nil
+        else aim = Vector3.new(movementTarget.X, root.Position.Y, movementTarget.Z) end
+        if aim and ps.slip then aim = slipAim(st, aim, root) end
+        local activeCell = activeAim and posCell(st, activeAim)
+        local activeIndex = activeCell and routeIndexFor(route, activeCell, routeCursor)
+        local activeStillValid = activeAim and activeIndex and activeIndex > routeCursor
+            and hdist(root.Position, activeAim) > st.cs * 0.35
+        if activeStillValid then aim = activeAim end
+        if aim then
+            if not activeAim or (aim - activeAim).Magnitude >= 0.75 then
+                hum:MoveTo(aim); activeAim = aim
+            end
+        elseif activeAim then
+            hum:MoveTo(root.Position); activeAim = nil
+        end
         if needsPlan and now - lastDraw >= 0.2 then
 			lastDraw = now
             drawRoute(st, route, movementTarget, root.Position.Y, routeCursor)
 			setStatus(("→ %s  [%s%s]"):format(label, mode, s0v and (" · spare %.1fs"):format(s0v) or ""))
 		end
-		if aim and now - lastT > 1.1 then
-			if lastPos and hdist(root.Position, lastPos) < 1 and nextCell then
-				ps.blockedEdges[edgeKey(me, nextCell)] = now + 4.5
-				activeAim, plannedAt = nil, nil
-				hum:MoveTo(root.Position)
-				setStatus("↻ blocked corridor; choosing another path")
-			end
+		if aim and now - lastT > 1.2 then
+            if lastPos and hdist(root.Position, lastPos) < 1 and activeAim then hum:MoveTo(activeAim) end
 			lastPos, lastT = root.Position, now
 		end
 		task.wait(0.08)
@@ -5114,6 +5395,7 @@ local function walk(token, getTarget, stop, label, opts)
 	return "cancelled"
 end
 
+local eggWork
 local candyIgnore = setmetatable({}, {__mode = "k"})
 local function nearestCandy(st, g, me)
 	local steps, ctx = reachSteps(st, g, me)
@@ -5122,7 +5404,7 @@ local function nearestCandy(st, g, me)
 		if not candyIgnore[c] then
 			local p = posOf(c); local cell = p and posCell(st, p)
 			local s = cell and steps[cell]
-			if s and (not ctx or slack(ctx, cell, s * ctx.ct) >= 2) and (not bd or s < bd) then best, bd = c, s end
+			if s and (not ctx or (ctx.dist[cell] or 99) > 3) and (not bd or s < bd) then best, bd = c, s end
 		end
 	end
 	return best
@@ -5141,8 +5423,9 @@ local function collectCandy(token)
 			setStatus("⏳ candy near scarecrow..."); task.wait(0.3); continue
 		end
 		idleSince = nil
-		local r = walk(token, function() if c.Parent then return posOf(c) end end, CANDY_STOP, "Candy", {timeout = 25})
-		if r == "cancelled" or r == "floor" or r == "exit" then return r end
+		local r = walk(token, function() if c.Parent then return posOf(c) end end, CANDY_STOP, "Candy", {timeout = 25, interrupt = function(s) return autoOn and eggWork(s) end})
+		if r == "reconsider" then return r end
+		if r == "cancelled" or r == "floor" then return r end
 		if r == "arrived" or r == "timeout" then
 			tries[c] = (tries[c] or 0) + 1
 			if tries[c] >= 3 or r == "timeout" then candyIgnore[c] = true end
@@ -5268,7 +5551,7 @@ local function scoutEggs(token)
 			if not bEgg.Parent or eggLuck(s, bEgg) > 0 then return nil end
 			return cellPos(s, bCell)
 		end, st.cs * 0.3, "Scout", {timeout = 40})
-		if r == "cancelled" or r == "floor" or r == "exit" then return r end
+		if r == "cancelled" or r == "floor" then return r end
 		local tried = scoutTried[bEgg]
 		if r == "lost" and bEgg.Parent then
 			local latest = getState()
@@ -5289,73 +5572,77 @@ local function scoutEggs(token)
 	return "cancelled"
 end
 
+-- true while there is egg work to do (a hatchable egg, or one we can still scout) - checked constantly while walking
+eggWork = function(st)
+	if not O.hatch then return false end
+	local rt = getRoot(); local me = rt and posCell(st, rt.Position)
+	if not me then return false end
+	local g = grid(st)
+	if pickEgg(st, g, me, not O.scout) then return true end
+	if O.scout then
+		local dist = bfsCached(g, me)
+		for _, egg in ipairs(getEggs()) do
+			local name = egg:GetAttribute("ID")
+			if name and settingsForEgg(name).enabled and not rejected[egg] and eggLuck(st, egg) == 0 then
+				local p = posOf(egg); local ec = p and posCell(st, p)
+				local t = scoutTried[egg]
+				if ec and dist[ec] and (not t or t.n < 2) then return true end
+			end
+		end
+	end
+	return false
+end
 local function exitTarget(st) local p = cellPos(st, st.exit); return p + Vector3.new(0, 6, 0) end
 local function autoLoop(token)
-	local function refreshAfterExit(oldFloor)
-		local deadline = os.clock() + 8
-		while running and token == moveToken and autoOn and os.clock() < deadline do
-			local state = getState()
-			if state and state.floor ~= oldFloor then
-				setStatus("🔄 next floor detected; refreshing targets")
-				-- Let the server replace the egg/candy instances before scanning.
-				task.wait(0.45)
-				return true
-			end
-			task.wait(0.1)
-		end
-		return false
-	end
 	while running and token == moveToken and autoOn do
 		local st = getState()
 		if not st then task.wait(0.3); continue end
 		local floor = st.floor
+		local newFloor, startEggs = false, {}
+		for _, e in ipairs(getEggs()) do startEggs[e] = true end
 		if O.candyFirst then
 			local root = getRoot()
 			local me = root and posCell(st, root.Position)
 			local pendingEgg = O.hatch and me and pickEgg(st, grid(st), me, true)
-			if not pendingEgg then
-				local candyResult = collectCandy(token)
-				if candyResult == "cancelled" then return end
-				if candyResult == "floor" or candyResult == "exit" then
-					refreshAfterExit(floor)
-					continue
-				end
-			end
+			if not pendingEgg and collectCandy(token) == "cancelled" then return end
 		end
 		if O.hatch then
-			local changedFloor = false
 			while running and token == moveToken and autoOn do
 				local s2, root = getState(), getRoot()
 				local me = s2 and root and posCell(s2, root.Position)
-				if not me or s2.floor ~= floor then break end
+				if not me then break end
+				if s2.floor ~= floor then newFloor = true; break end
 				local egg = pickEgg(s2, grid(s2), me, not O.scout)
 				if egg then
 					local r = hatchAt(token, egg, false)
 					if r == "cancelled" then return end
-					if r == "floor" or r == "exit" then changedFloor = true; break end
+					if r == "floor" then newFloor = true; break end
 					if r == "lost" or r == "gone" or r == "failed" then rejected[egg] = rejected[egg] or r end
 				elseif O.scout then
 					local result = scoutEggs(token)
 					if result == "cancelled" then return end
-					if result == "floor" or result == "exit" then changedFloor = true; break end
+					if result == "floor" then newFloor = true end
 					if result ~= "scouted" then break end
 				else
 					break
 				end
 			end
-			if changedFloor then
-				refreshAfterExit(floor)
-				continue
+		end
+		if newFloor then -- we crossed the exit (or the floor changed) mid-egg-work: wait for the new eggs, then scout/hatch again
+			local t0 = os.clock()
+			while running and token == moveToken and autoOn and os.clock() - t0 < 8 do
+				local fresh = false
+				for _, e in ipairs(getEggs()) do if not startEggs[e] then fresh = true; break end end
+				if fresh then break end
+				setStatus("new floor - waiting for eggs"); task.wait(0.2)
 			end
+			task.wait(0.4)
+			continue
 		end
 		if token ~= moveToken or not autoOn then return end
 		local eggsBefore = {}
 		for _, e in ipairs(getEggs()) do eggsBefore[e] = true end
-		local r = walk(token, exitTarget, EXIT_STOP, "EXIT", {interrupt = function(state)
-		if not O.hatch then return false end
-		local rt = getRoot(); local m = rt and posCell(state, rt.Position)
-		return m and pickEgg(state, grid(state), m, not O.scout) ~= nil
-	end})
+		local r = walk(token, exitTarget, EXIT_STOP, "EXIT", {interrupt = eggWork})
 		if r == "cancelled" then return end
 		if r == "reconsider" then task.wait(0.3); continue end
 		local t = os.clock()
@@ -5620,9 +5907,8 @@ do
 	scareLbl = label(info, "🎃 Scarecrow: -", UDim2.new(1, -8, 0, 22), COL.scare, 14)
 	statusLbl = label(row(22), "Idle", UDim2.fromScale(1, 1), Color3.fromRGB(150, 210, 255), 13)
 	setStatus = function(t)
-		local shown = (O.afk and "AFK VIEW · F7 · " or "") .. t
-		if statusLbl and statusLbl.Parent then statusLbl.Text = shown end
-		if minimapStatusLbl and minimapStatusLbl.Parent then minimapStatusLbl.Text = shown end
+		if statusLbl and statusLbl.Parent then statusLbl.Text = t end
+		if minimapStatusLbl and minimapStatusLbl.Parent then minimapStatusLbl.Text = t end
 	end
 end
 
@@ -5670,11 +5956,6 @@ do
 	local tg3 = row(28, true)
 	toggle(tg3, "PATH", "path", refreshPathVisibility, half)
 	toggle(tg3, "MAP WHEN HIDDEN", "pin", nil, half)
-	local tg4 = row(28, true)
-	toggle(tg4, "AFK VIEW (F7)", "afk", function(on)
-		if on then O.pin = true end
-		Root.Visible = not on
-	end, UDim2.new(1, 0, 1, 0))
 
 	local ac = row(32, true)
 	button(ac, "🍬 CANDY", third, Color3.fromRGB(110, 90, 30), function() startJob(collectCandy) end)
@@ -5840,7 +6121,7 @@ local function mazeUiVisible()
 end
 local mapDetached = false
 local function updatePin()
-	local detach = (O.pin or O.afk) and not mazeUiVisible()
+	local detach = O.pin and not mazeUiVisible()
 	if detach ~= mapDetached then
 		mapDetached = detach
 		if detach then
@@ -5852,10 +6133,6 @@ local function updatePin()
 		end
 	end
 	mapOverlayGui.Enabled = detach
-end
-if O.afk then
-	O.pin = true
-	Root.Visible = false
 end
 
 local mmKey
@@ -5969,12 +6246,6 @@ loop(0.25, function() -- blue path preview while idle
 end)
 bind(UIS.InputBegan, function(i, gp)
 	if not gp and i.KeyCode == Enum.KeyCode.X then stopAll() end
-	if not gp and i.KeyCode == Enum.KeyCode.F7 then
-		O.afk = not O.afk
-		if O.afk then O.pin = true end
-		Root.Visible = not O.afk
-		saveSettings()
-	end
 end)
 bind(RunService.Heartbeat, function()
 	local hum = getHum()
@@ -6031,494 +6302,3 @@ env.HMV2 = {Destroy = destroy, GetState = getState, Opt = O,
 	end}
 print("🎃 Halloween Maze v4 loaded" .. (hubMain and " (docked into the hub)" or ""))	
 end)
---[[ The pasted source resumes here with an incomplete fragment of an earlier
--- farm loop. It has no matching opening scope in this file, so it cannot run.
--- The complete maze and hub code above has already finished loading.
-                    Library.Network.Fire("Farm Coin", CurrentCometId, petUid)
-                end)
-            end
-        end
-        task.wait(0.05)
-    end
-end)
-
--- Fast attack loop
-task.spawn(function()
-    while true do
-        if FastAttackSpeed then
-            local targetId = nil
-            if AutoFarmComet then
-                targetId = CurrentCometId
-            elseif AutoFarmHackerBoss then
-                targetId = CurrentHackerBossId
-            elseif AutoFarmExpedition then
-                targetId = CurrentExpeditionTargetId
-            elseif AutoFarmRobot or AutoFarmTurkey then
-                targetId = CurrentTargetId
-            end
-
-            if targetId then
-                if DamageRemote then
-                    pcall(function()
-                        DamageRemote:FireServer(targetId)
-                    end)
-                end
-
-                local pets = GetAllEquippedPetUIDs()
-                for _, petUid in ipairs(pets) do
-                    pcall(function()
-                        Library.Network.Fire("Farm Coin", targetId, petUid)
-                    end)
-                end
-            end
-        end
-        task.wait(FastAttackInterval)
-    end
-end)
-
--- Expedition Auto Farm Loop
--- Picks a random living expedition mob, selects/taps it, and sends the
--- equipped pets once. Damage/Fast Attack can then keep hitting the target.
-task.spawn(function()
-    while true do
-        task.wait(0.15)
-
-        if AutoFarmExpedition and localPlayer:GetAttribute("ExpeditionRun") then
-            if not CurrentExpeditionTarget or not IsExpeditionMob(CurrentExpeditionTarget) then
-                CurrentExpeditionTarget = FindRandomExpeditionMob(CurrentExpeditionTarget)
-                CurrentExpeditionTargetId = CurrentExpeditionTarget
-                    and tostring(CurrentExpeditionTarget:GetAttribute("ID"))
-                    or nil
-                LastExpeditionPetSendTarget = nil
-            end
-
-            if CurrentExpeditionTarget and IsExpeditionMob(CurrentExpeditionTarget) then
-                local targetId = tostring(CurrentExpeditionTarget:GetAttribute("ID"))
-                CurrentExpeditionTargetId = targetId
-
-                pcall(function()
-                    Library.Signal.Fire("Select Coin", CurrentExpeditionTarget)
-                end)
-
-                -- Same original pet-send sequence as robots/turkey, once per
-                -- individual expedition mob.
-                if LastExpeditionPetSendTarget ~= CurrentExpeditionTarget then
-                    local myPets = GetAllEquippedPetUIDs()
-                    if #myPets > 0 then
-                        pcall(function()
-                            Library.Network.Invoke("Join Coin", targetId, myPets)
-                        end)
-
-                        for _, petUid in ipairs(myPets) do
-                            pcall(function()
-                                Library.Network.Fire("Change Pet Target", petUid, "Coin", targetId)
-                            end)
-                        end
-
-                        LastExpeditionPetSendTarget = CurrentExpeditionTarget
-                    end
-                end
-            else
-                CurrentExpeditionTarget = nil
-                CurrentExpeditionTargetId = nil
-                LastExpeditionPetSendTarget = nil
-            end
-        else
-            CurrentExpeditionTarget = nil
-            CurrentExpeditionTargetId = nil
-            LastExpeditionPetSendTarget = nil
-        end
-    end
-end)
-
--- Expedition damage uses the same target as the normal mob farm.
-task.spawn(function()
-    while true do
-        task.wait(0.05)
-        if AutoFarmExpedition and CurrentExpeditionTargetId
-            and localPlayer:GetAttribute("ExpeditionRun") then
-            pcall(function()
-                if DamageRemote then
-                    DamageRemote:FireServer(CurrentExpeditionTargetId)
-                end
-            end)
-        end
-    end
-end)
-
--- EXPEDITION ATTACK DODGE
--- Keep the player close enough that expedition mobs can still target them.
--- The expedition source does not expose a numeric arena radius, so the dodge
--- uses a conservative target-relative radius instead of making large jumps.
-local function GetSafeExpeditionDodgeCFrame(hrp, targetPosition)
-    local offset = hrp.Position - targetPosition
-    local flatOffset = Vector3.new(offset.X, 0, offset.Z)
-
-    if flatOffset.Magnitude < 0.5 then
-        flatOffset = Vector3.new(hrp.CFrame.RightVector.X, 0, hrp.CFrame.RightVector.Z)
-    end
-
-    if flatOffset.Magnitude < 0.05 then
-        flatOffset = Vector3.new(1, 0, 0)
-    end
-
-    local radial = flatOffset.Unit
-    local perpendicular = Vector3.new(-radial.Z, 0, radial.X)
-
-    -- Alternate sides so repeated attacks do not send the player farther away.
-    if math.random(0, 1) == 0 then
-        perpendicular = -perpendicular
-    end
-
-    local candidate = targetPosition + perpendicular * ExpeditionDodgeRadius
-
-    -- Put the player on actual ground. This prevents the dodge from placing
-    -- the HumanoidRootPart in mid-air and falling through the expedition map.
-    local rayParams = RaycastParams.new()
-    rayParams.FilterType = Enum.RaycastFilterType.Exclude
-    rayParams.FilterDescendantsInstances = {localPlayer.Character, CurrentExpeditionTarget}
-    rayParams.IgnoreWater = true
-
-    local rayOrigin = candidate + Vector3.new(0, 60, 0)
-    local rayResult = Workspace:Raycast(rayOrigin, Vector3.new(0, -140, 0), rayParams)
-    if rayResult then
-        candidate = rayResult.Position + Vector3.new(0, 3, 0)
-    else
-        -- If no floor was found, do not perform the teleport at all.
-        return nil
-    end
-
-    -- Final safety check: never place the player farther than the combat radius.
-    local finalOffset = Vector3.new(candidate.X - targetPosition.X, 0, candidate.Z - targetPosition.Z)
-    if finalOffset.Magnitude > ExpeditionMaxCombatRadius then
-        candidate = targetPosition + finalOffset.Unit * ExpeditionMaxCombatRadius
-        local floorCheck = Workspace:Raycast(candidate + Vector3.new(0, 60, 0), Vector3.new(0, -140, 0), rayParams)
-        if not floorCheck then
-            return nil
-        end
-        candidate = floorCheck.Position + Vector3.new(0, 3, 0)
-    end
-
-    return CFrame.new(candidate, Vector3.new(targetPosition.X, candidate.Y, targetPosition.Z))
-end
-
-task.spawn(function()
-    while true do
-        task.wait(0.05)
-
-        if AutoFarmExpedition then
-            local character = localPlayer.Character
-            local hrp = character and character:FindFirstChild("HumanoidRootPart")
-            local fxFolder = Workspace:FindFirstChild("__AUTUMNBOSS_FX")
-
-            if hrp and CurrentExpeditionTarget and CurrentExpeditionTarget.Parent and fxFolder and #fxFolder:GetChildren() > 0 then
-                if not ExpeditionIsEvading then
-                    local targetPart = CurrentExpeditionTarget:FindFirstChild("Coin")
-                    local targetPosition = targetPart and targetPart.Position or CurrentExpeditionTarget:GetPivot().Position
-                    local safeDodge = GetSafeExpeditionDodgeCFrame(hrp, targetPosition)
-
-                    if safeDodge then
-                        ExpeditionIsEvading = true
-                        ExpeditionSavedCFrame = hrp.CFrame
-                        hrp.CFrame = safeDodge
-                    end
-                end
-            elseif ExpeditionIsEvading and hrp then
-                ExpeditionIsEvading = false
-                if ExpeditionSavedCFrame then
-                    hrp.CFrame = ExpeditionSavedCFrame
-                end
-                ExpeditionSavedCFrame = nil
-            end
-        elseif ExpeditionIsEvading then
-            local character = localPlayer.Character
-            local hrp = character and character:FindFirstChild("HumanoidRootPart")
-            if hrp and ExpeditionSavedCFrame then
-                hrp.CFrame = ExpeditionSavedCFrame
-            end
-            ExpeditionIsEvading = false
-            ExpeditionSavedCFrame = nil
-        end
-    end
-end)
-
-
--- Hacker Boss Auto Farm Loop
--- Uses the same coin selection / Join Coin / Change Pet Target sequence
--- as the other auto farms, targeting the live Hacker Prime boss coin.
-task.spawn(function()
-    while true do
-        task.wait(0.15)
-
-        if AutoFarmHackerBoss then
-            if not CurrentHackerBoss or not CurrentHackerBoss.Parent then
-                CurrentHackerBoss = FindHackerBoss()
-                CurrentHackerBossId = CurrentHackerBoss and tostring(CurrentHackerBoss:GetAttribute("ID")) or nil
-            end
-
-            if CurrentHackerBoss and CurrentHackerBoss.Parent then
-                CurrentHackerBossId = tostring(CurrentHackerBoss:GetAttribute("ID"))
-                FocusPetsContinuous(CurrentHackerBoss)
-            else
-                CurrentHackerBoss = nil
-                CurrentHackerBossId = nil
-            end
-        else
-            CurrentHackerBoss = nil
-            CurrentHackerBossId = nil
-        end
-    end
-end)
-
--- Main Auto Farm Loop
-task.spawn(function()
-    while true do
-        task.wait(0.15)
-        if AutoFarmRobot then
-            if not CurrentTarget or not CurrentTarget.Parent then
-                CurrentTarget = GetNextRobot()
-            end
-            if CurrentTarget and CurrentTarget.Parent then
-                CurrentTargetId = tostring(CurrentTarget:GetAttribute("ID"))
-                FocusPetsContinuous(CurrentTarget)
-            else
-                CurrentTargetId = nil
-            end
-        else
-            if not AutoFarmTurkey then
-                CurrentTarget = nil
-                CurrentTargetId = nil
-            end
-        end
-        
-        if AutoFarmTurkey then
-            if not CurrentTarget or not CurrentTarget.Parent then
-                CurrentTarget = FindTurkey()
-            end
-            if CurrentTarget and CurrentTarget.Parent then
-                CurrentTargetId = tostring(CurrentTarget:GetAttribute("ID"))
-                FocusPetsContinuous(CurrentTarget)
-            else
-                CurrentTargetId = nil
-            end
-        else
-            if not AutoFarmRobot then
-                CurrentTarget = nil
-                CurrentTargetId = nil
-            end
-        end
-    end
-end)
-
--- Damage Spam Loop
-task.spawn(function()
-    while true do
-        task.wait(0.05)
-        if CurrentTargetId and DamageRemote and (AutoFarmRobot or AutoFarmTurkey) then
-            pcall(function()
-                DamageRemote:FireServer(CurrentTargetId)
-            end)
-        end
-    end
-end)
-
--- Hacker Boss damage loop
-task.spawn(function()
-    while true do
-        task.wait(0.05)
-        if AutoFarmHackerBoss and CurrentHackerBossId and DamageRemote then
-            pcall(function()
-                DamageRemote:FireServer(CurrentHackerBossId)
-            end)
-        end
-    end
-end)
-
--- GENERIC CLOSEST-COIN FARM
--- Target scanning is deliberately separated from attacking. This keeps the
--- expensive Workspace scan from running at the same rate as the hit remotes.
-local ClosestCoinScanInterval = 0.10
-local ClosestCoinHitInterval = 0.05
-local CachedEquippedPets = {}
-local CachedPetsRefreshAt = 0
-local LastCoinInteractionTarget = nil
-local LastCoinTeleportTarget = nil
-
-local function RefreshCachedEquippedPets(force)
-    local now = os.clock()
-    if not force and now < CachedPetsRefreshAt then
-        return CachedEquippedPets
-    end
-
-    local pets = {}
-    pcall(function()
-        pets = GetAllEquippedPetUIDs()
-    end)
-
-    CachedEquippedPets = pets or {}
-    CachedPetsRefreshAt = now + 0.50
-    return CachedEquippedPets
-end
-
--- Find and select the target at a lower rate than the actual attack loop.
-task.spawn(function()
-    while true do
-        if AutoTap or AutoTeleportClosestCoin then
-            local previous = CurrentCoinTarget
-            local target = FindClosestCoin(previous)
-
-            if target and target.Parent then
-                local targetId = target:GetAttribute("ID")
-                if targetId ~= nil then
-                    targetId = tostring(targetId)
-                    local changed = target ~= CurrentCoinTarget
-
-                    CurrentCoinTarget = target
-                    CurrentCoinTargetId = targetId
-
-                    -- Selection is only sent when the target changes. Sending
-                    -- it every frame is unnecessary and causes extra client work.
-                    if changed or LastCoinInteractionTarget ~= target then
-                        pcall(function()
-                            Library.Signal.Fire("Select Coin", target)
-                        end)
-                        LastCoinInteractionTarget = target
-
-                        if AutoTap then
-                            local pets = RefreshCachedEquippedPets(true)
-                            if #pets > 0 then
-                                pcall(function()
-                                    Library.Network.Invoke("Join Coin", targetId, pets)
-                                end)
-
-                                for _, petUid in ipairs(pets) do
-                                    pcall(function()
-                                        Library.Network.Fire("Change Pet Target", petUid, "Coin", targetId)
-                                    end)
-                                end
-                            end
-                        end
-                    end
-
-                    -- Teleport only when the target changes instead of
-                    -- repeatedly setting CFrame every frame.
-                    if AutoTeleportClosestCoin and (changed or LastCoinTeleportTarget ~= target) then
-                        TeleportToClosestCoin(target)
-                        LastCoinTeleportTarget = target
-                    elseif not AutoTeleportClosestCoin then
-                        LastCoinTeleportTarget = nil
-                    end
-                else
-                    ResetCoinTarget()
-                    LastCoinInteractionTarget = nil
-                    LastCoinTeleportTarget = nil
-                end
-            else
-                ResetCoinTarget()
-                LastCoinInteractionTarget = nil
-                LastCoinTeleportTarget = nil
-            end
-        else
-            ResetCoinTarget()
-            LastCoinInteractionTarget = nil
-            LastCoinTeleportTarget = nil
-        end
-
-        task.wait(ClosestCoinScanInterval)
-    end
-end)
-
--- Dedicated hit loop. It uses the same direct damage/Farm Coin calls as the
--- existing Expedition/Turkey/Comet attack paths, but avoids rebuilding the
--- pet list on every hit.
-task.spawn(function()
-    while true do
-        if AutoTap and CurrentCoinTargetId then
-            local targetId = CurrentCoinTargetId
-            local pets = RefreshCachedEquippedPets(false)
-
-            if DamageRemote then
-                pcall(function()
-                    DamageRemote:FireServer(targetId)
-                end)
-            end
-
-            for _, petUid in ipairs(pets) do
-                pcall(function()
-        local kind = tostring(attack.kind)
-        if kind ~= "slam" and kind ~= "barrage" and kind ~= "sweep" and kind ~= "leap" and kind ~= "land" then
-            return
-        end
-
-        local now = os.clock()
-        local windup = tonumber(attack.windup) or 0
-        local duration
-
-        if kind == "sweep" then
-            duration = windup + math.max(0.05, tonumber(attack.seconds) or 2) + 0.35
-        elseif kind == "leap" then
-            duration = windup + math.max(0, tonumber(attack.air) or 1) + 0.7
-        elseif kind == "land" then
-            duration = 0.9
-        else
-            duration = windup + 0.8
-        end
-
-        ExpeditionAttackSequence += 1
-        table.insert(ExpeditionActiveAttacks, {
-            kind = kind,
-            at = attack.at,
-            radius = attack.radius,
-            length = attack.length,
-            width = attack.width,
-            clear = attack.clear,
-            start = attack.start,
-            arc = attack.arc,
-            windup = windup,
-            seconds = attack.seconds,
-            started = now,
-            expires = now + duration,
-            sequence = ExpeditionAttackSequence,
-        })
-        ExpeditionDodgeUntil = math.max(ExpeditionDodgeUntil, now + duration)
-    end)
-end)
-
--- Continuously maintain the safe position while an attack is active. This
--- is intentionally independent from the visible FX folder.
-task.spawn(function()
-    while true do
-        task.wait(0.025)
-
-        local now = os.clock()
-        for i = #ExpeditionActiveAttacks, 1, -1 do
-            local attack = ExpeditionActiveAttacks[i]
-            if not attack or attack.expires <= now then
-                table.remove(ExpeditionActiveAttacks, i)
-            end
-        end
-
-        if not AutoFarmExpedition or not ExpeditionDodgeEnabled or #ExpeditionActiveAttacks == 0 then
-            if ExpeditionDodgeActive then
-                EndExpeditionDodge()
-            end
-            continue
-        end
-
-        local character = localPlayer.Character
-        local hrp = character and character:FindFirstChild("HumanoidRootPart")
-        if not hrp then
-            EndExpeditionDodge()
-            continue
-        end
-
-        -- Before the telegraph resolves, we can wait. Once the player's
-        -- current position becomes dangerous, move immediately to a safe
-        -- point inside the combat radius.
-        if not IsPointDangerous(hrp.Position, now) then
-            if ExpeditionDodgeActive and now >= ExpeditionDodgeUntil then
-                EndExpeditionDodge()
-            end
-            continue
-        end
-]]
