@@ -6328,5 +6328,64 @@ env.HMV2 = {Destroy = destroy, GetState = getState, Opt = O,
 		moveEgg(best)
 		return "started " .. tostring(best:GetAttribute("ID"))
 	end}
+-- =====================================================================
+-- AUTO LOOTBAG + ORB PICKUP
+-- Isolated addition: does not modify any existing automation/UI logic.
+-- =====================================================================
+pcall(function()
+    local AutoPickupLootbags = Library.Things:FindFirstChild("Lootbags")
+    local AutoPickupOrbs = Library.Things:FindFirstChild("Orbs")
+    local AutoPickupLootbagSent = {}
+
+    -- Lootbags: use the same network request as the game's Lootbags module.
+    task.spawn(function()
+        while true do
+            task.wait(0.10)
+            if AutoPickupLootbags then
+                for _, lootbag in ipairs(AutoPickupLootbags:GetChildren()) do
+                    pcall(function()
+                        local ready = lootbag:FindFirstChild("ReadyForCollection_Attr")
+                        ready = ready and ready.Value or lootbag:GetAttribute("ReadyForCollection")
+                        if ready then
+                            local idValue = lootbag:FindFirstChild("ID_Attr")
+                            local id = idValue and idValue.Value or lootbag:GetAttribute("ID")
+                            if id ~= nil and not AutoPickupLootbagSent[lootbag] then
+                                AutoPickupLootbagSent[lootbag] = true
+                                Library.Network.Fire("Collect Lootbag", id, lootbag.CFrame.Position)
+                            end
+                        end
+                    end)
+                end
+
+                for lootbag in pairs(AutoPickupLootbagSent) do
+                    if not lootbag or not lootbag.Parent then
+                        AutoPickupLootbagSent[lootbag] = nil
+                    end
+                end
+            end
+        end
+    end)
+
+    -- Orbs: send the visible orb IDs in the same batched request used by the game.
+    task.spawn(function()
+        while true do
+            task.wait(0.25)
+            if AutoPickupOrbs then
+                local ids = {}
+                for _, orb in ipairs(AutoPickupOrbs:GetChildren()) do
+                    if orb and orb.Parent and orb.Name ~= "" then
+                        table.insert(ids, orb.Name)
+                    end
+                end
+                if #ids > 0 then
+                    pcall(function()
+                        Library.Network.Fire("Claim Orbs", ids)
+                    end)
+                end
+            end
+        end
+    end)
+end)
+
 print("🎃 Halloween Maze v4 loaded" .. (hubMain and " (docked into the hub)" or ""))	
 end)
