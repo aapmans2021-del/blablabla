@@ -4648,7 +4648,6 @@ task.spawn(function()
 --   * PIN MAP is polled (not event driven) so it can't desync from the hub's minimise button
 -- Embedded in the combined hub script; this section runs after the hub UI is built.
 -- ═════════════════════════════════════════════════════════════════════════════
-task.spawn(function()
 local env = _G
 if type(getgenv) == "function" then
     local ok, executorEnv = pcall(getgenv)
@@ -6330,62 +6329,128 @@ env.HMV2 = {Destroy = destroy, GetState = getState, Opt = O,
 	end}
 -- =====================================================================
 -- AUTO LOOTBAG + ORB PICKUP
--- Isolated addition: does not modify any existing automation/UI logic.
+-- Uses only the game's existing collection requests.
 -- =====================================================================
-pcall(function()
-    local AutoPickupLootbags = Library.Things:FindFirstChild("Lootbags")
-    local AutoPickupOrbs = Library.Things:FindFirstChild("Orbs")
-    local AutoPickupLootbagSent = {}
-
-    -- Lootbags: use the same network request as the game's Lootbags module.
-    task.spawn(function()
-        while true do
-            task.wait(0.10)
-            if AutoPickupLootbags then
-                for _, lootbag in ipairs(AutoPickupLootbags:GetChildren()) do
+task.spawn(function()
+    while true do
+        pcall(function()
+            local lootbags = Library.Things and Library.Things:FindFirstChild("Lootbags")
+            if lootbags then
+                local humanoid = Library.Player.Humanoid()
+                local torso = Library.Player.Optional.Torso()
+                if humanoid and torso then
+                    local hipHeight = humanoid.HipHeight
+                    local hasMagnet = false
                     pcall(function()
-                        local ready = lootbag:FindFirstChild("ReadyForCollection_Attr")
-                        ready = ready and ready.Value or lootbag:GetAttribute("ReadyForCollection")
-                        if ready then
-                            local idValue = lootbag:FindFirstChild("ID_Attr")
-                            local id = idValue and idValue.Value or lootbag:GetAttribute("ID")
-                            if id ~= nil and not AutoPickupLootbagSent[lootbag] then
-                                AutoPickupLootbagSent[lootbag] = true
-                                Library.Network.Fire("Collect Lootbag", id, lootbag.CFrame.Position)
-                            end
-                        end
+                        hasMagnet = Library.Gamepasses.Owns(Library.Directory.Gamepasses.Magnet.ID)
                     end)
-                end
 
-                for lootbag in pairs(AutoPickupLootbagSent) do
-                    if not lootbag or not lootbag.Parent then
-                        AutoPickupLootbagSent[lootbag] = nil
+                    for i, bag in ipairs(lootbags:GetChildren()) do
+                        pcall(function()
+                            if i % 25 == 0 then
+                                Library.RenderStepped()
+                            end
+
+                            if bag:GetAttribute("ReadyForCollection") and not bag:GetAttribute("Collected") then
+                                local distance = Library.LocalPlayer:DistanceFromCharacter(bag.CFrame.Position)
+                                local bagSize = (bag.Size.X + bag.Size.Z) / 2
+
+                                if distance <= bagSize + hipHeight + 1 then
+                                    local id = bag:GetAttribute("ID")
+                                    if id ~= nil then
+                                        bag:SetAttribute("Collected", true)
+                                        Library.Network.Fire("Collect Lootbag", id, bag.CFrame.Position)
+                                        bag:Destroy()
+                                    end
+                                else
+                                    local bodyPosition = bag:FindFirstChildOfClass("BodyPosition")
+                                    if bodyPosition then
+                                        bodyPosition.MaxForce = Vector3.new(bodyPosition.P, bodyPosition.P, bodyPosition.P)
+                                        bodyPosition.Position = torso.Position + torso.CFrame.LookVector - Vector3.new(0, hipHeight, 0)
+
+                                        if not bag:GetAttribute("DisableMagnet") then
+                                            if hasMagnet or bag:GetAttribute("FreeMagnet") then
+                                                bodyPosition.P = 17500
+                                            else
+                                                bodyPosition.P = 3500 - math.clamp(distance / (bagSize + 18), 0, 1) * 3500
+                                            end
+                                        end
+                                    end
+                                end
+                            end
+                        end)
                     end
                 end
             end
-        end
-    end)
+        end)
+        task.wait()
+    end
+end)
 
-    -- Orbs: send the visible orb IDs in the same batched request used by the game.
-    task.spawn(function()
-        while true do
-            task.wait(0.25)
-            if AutoPickupOrbs then
-                local ids = {}
-                for _, orb in ipairs(AutoPickupOrbs:GetChildren()) do
-                    if orb and orb.Parent and orb.Name ~= "" then
+task.spawn(function()
+    local pickupDistance = 12
+    local lastUpdate = 0
+
+    while true do
+        pcall(function()
+            local orbs = Library.Things and Library.Things:FindFirstChild("Orbs")
+            if not orbs then return end
+
+            local now = os.clock()
+            if now - lastUpdate >= 1 then
+                lastUpdate = now
+                local save = Library.Save.Get()
+                if save then
+                    local superMagnet = false
+                    pcall(function()
+                        superMagnet = Library.Shared.GetEnchantPower(save, "Super Magnet") > 0
+                            or Library.Gamepasses.Owns(Library.Directory.Gamepasses.Magnet.ID)
+                    end)
+
+                    if superMagnet then
+                        pickupDistance = math.huge
+                    else
+                        local upgrade = 0
+                        local magnet = 0
+                        pcall(function()
+                            upgrade = Library.Shared.GetStationUpgradeLevel(save, "Orb Pickup Distance")
+                        end)
+                        pcall(function()
+                            magnet = Library.Shared.GetEnchantPower(save, "Magnet")
+                        end)
+                        pickupDistance = upgrade * 10 + 28 + magnet
+                    end
+                end
+            end
+
+            local target = Library.Player.Optional.PrimaryPart()
+            if not target then
+                target = Library.Player.UpperTorso()
+            end
+            if not target then return end
+
+            local ids = {}
+            for _, orb in ipairs(orbs:GetChildren()) do
+                pcall(function()
+                    local bodyPosition = orb:FindFirstChildOfClass("BodyPosition")
+                    if bodyPosition then
+                        bodyPosition.P = 17500
+                        bodyPosition.MaxForce = Vector3.new(17500, 17500, 17500)
+                        bodyPosition.Position = target.Position
+                    end
+
+                    if orb.Name ~= "" and (target.Position - orb.Position).Magnitude <= pickupDistance then
                         table.insert(ids, orb.Name)
                     end
-                end
-                if #ids > 0 then
-                    pcall(function()
-                        Library.Network.Fire("Claim Orbs", ids)
-                    end)
-                end
+                end)
             end
-        end
-    end)
+
+            if #ids > 0 then
+                Library.Network.Fire("Claim Orbs", ids)
+            end
+        end)
+        task.wait(0.05)
+    end
 end)
 
-print("🎃 Halloween Maze v4 loaded" .. (hubMain and " (docked into the hub)" or ""))	
-end)
+print("🎃 Halloween Maze v4 loaded" .. (hubMain and " (docked into the hub)" or ""))
