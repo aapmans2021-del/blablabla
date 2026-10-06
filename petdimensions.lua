@@ -3090,9 +3090,6 @@ task.spawn(function()
         Normal = Color3.fromRGB(245, 245, 250),
     }
 
-    -- Formats the odds as a clean 1/X value using the nearest compact unit.
-    -- Examples: 1/999 -> 1/999, 1/1,500 -> 1/2k,
-    -- 1/250,000 -> 1/250k, 1/250,000,000 -> 1/250m.
     local function formatChanceOdds(chance)
         chance = tonumber(chance) or 0
         if chance <= 0 then
@@ -3223,7 +3220,7 @@ task.spawn(function()
             bestOption.Font = Enum.Font.GothamBold
             bestOption.TextSize = 13
             bestOption.TextWrapped = true
-            bestOption.Text = string.format("★ Best chance: %s (%s)", bestEgg.Name, formatChanceOdds(getEggBestChance(bestEgg)))
+            bestOption.Text = string.format("★ Best chance: %s (%.4g%%)", bestEgg.Name, getEggBestChance(bestEgg))
             bestOption.Parent = eggOptions
 
             local bestCorner = Instance.new("UICorner")
