@@ -4648,7 +4648,6 @@ task.spawn(function()
 --   * PIN MAP is polled (not event driven) so it can't desync from the hub's minimise button
 -- Embedded in the combined hub script; this section runs after the hub UI is built.
 -- ═════════════════════════════════════════════════════════════════════════════
-task.spawn(function()
 local env = _G
 if type(getgenv) == "function" then
     local ok, executorEnv = pcall(getgenv)
@@ -6455,4 +6454,3 @@ task.spawn(function()
 end)
 
 print("🎃 Halloween Maze v4 loaded" .. (hubMain and " (docked into the hub)" or ""))
-end)
