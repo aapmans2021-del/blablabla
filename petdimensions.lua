@@ -3050,18 +3050,28 @@ task.spawn(function()
     eggResultsLayout.Parent = eggResults
 
     local chanceEggs = collectEggChanceData()
+
     local function clearEggResults()
         for _, child in ipairs(eggResults:GetChildren()) do
-            if child:IsA("Frame") or child:IsA("TextLabel") then child:Destroy() end
+            if child:IsA("Frame") or child:IsA("TextLabel") then
+                child:Destroy()
+            end
         end
     end
 
+    -- Keep the egg list alphabetically sorted.  This is independent from the
+    -- farm/hatch logic so the chance viewer cannot change any automation state.
     local sortedEggs = {}
-    for _, egg in ipairs(chanceEggs) do table.insert(sortedEggs, egg) end
+    for _, egg in ipairs(chanceEggs) do
+        table.insert(sortedEggs, egg)
+    end
     table.sort(sortedEggs, function(a, b)
         return tostring(a.Name or ""):lower() < tostring(b.Name or ""):lower()
     end)
+
     local selectedChanceEgg = sortedEggs[1] and sortedEggs[1].Name or nil
+    local chanceMode = "Eggs"
+    local subTabButtons = {}
 
     local rarityColors = {
         Huge = Color3.fromRGB(100, 210, 255),
@@ -3071,9 +3081,8 @@ task.spawn(function()
         Normal = Color3.fromRGB(245, 245, 250),
     }
 
-    -- Formats the odds as a clean 1/X value using the nearest compact unit.
-    -- Examples: 1/999 -> 1/999, 1/1,500 -> 1/2k,
-    -- 1/250,000 -> 1/250k, 1/250,000,000 -> 1/250m.
+    -- Display odds as 1/X using the closest compact unit.
+    -- Examples: 1/999, 1/2k, 1/250m, 1/2b, 1/1t.
     local function formatChanceOdds(chance)
         chance = tonumber(chance) or 0
         if chance <= 0 then
@@ -3152,102 +3161,58 @@ task.spawn(function()
     local function renderChanceResults()
         clearEggResults()
         local rows = {}
-        if showingEasiestPets then
-            local easiestByPet = {}
-            for _, egg in ipairs(chanceEggs) do
-                for _, pet in ipairs(egg.Pets) do
-                    if pet.Category then
-                        local key = pet.Category .. ":" .. pet.Name
-                        local current = easiestByPet[key]
-                        if not current or (tonumber(pet.Chance) or 0) > current.Chance then
-                            easiestByPet[key] = {
-                                Name = pet.Category .. " | " .. pet.Name .. " | " .. egg.Name,
-                                Chance = tonumber(pet.Chance) or 0,
-                                Category = pet.Category,
-                            }
-                        end
-                    end
+
+        for _, egg in ipairs(chanceEggs) do
+            if chanceMode == "Eggs" and egg.Name == selectedChanceEgg then
+                for _, pet in ipairs(egg.Pets or {}) do
+                    table.insert(rows, {
+                        Name = pet.Name,
+                        Chance = pet.Chance,
+                        Category = pet.Category,
+                    })
                 end
-            end
-            for _, pet in pairs(easiestByPet) do table.insert(rows, pet) end
-        else
-            for _, egg in ipairs(chanceEggs) do
-                if chanceMode == "Eggs" and egg.Name == selectedChanceEgg then
-                    for _, pet in ipairs(egg.Pets) do
-                        table.insert(rows, { Name = pet.Name, Chance = pet.Chance, Category = pet.Category })
-                    end
-                elseif chanceMode ~= "Eggs" then
-                    for _, pet in ipairs(egg.Pets) do
-                        if pet.Category == chanceMode then
-                            table.insert(rows, { Name = pet.Name .. " | " .. egg.Name, Chance = pet.Chance, Category = pet.Category })
-                        end
+            elseif chanceMode ~= "Eggs" and chanceMode ~= "AllPets" then
+                for _, pet in ipairs(egg.Pets or {}) do
+                    if pet.Category == chanceMode then
+                        table.insert(rows, {
+                            Name = pet.Name .. " | " .. egg.Name,
+                            Chance = pet.Chance,
+                            Category = pet.Category,
+                        })
                     end
                 end
             end
         end
-        table.sort(rows, function(a, b) return (a.Chance or 0) > (b.Chance or 0) end)
-        for _, row in ipairs(rows) do addChanceRow(row.Name, row.Chance, row.Category) end
-    end
 
-    local function rebuildEggOptions()
-        for _, child in ipairs(eggOptions:GetChildren()) do
-            if child:IsA("TextButton") then child:Destroy() end
-        end
+        table.sort(rows, function(a, b)
+            return (tonumber(a.Chance) or 0) > (tonumber(b.Chance) or 0)
+        end)
 
-        local query = eggSearch.Text:lower()
-        for _, egg in ipairs(sortedEggs) do
-            if query == "" or egg.Name:lower():find(query, 1, true) then
-                local option = Instance.new("TextButton")
-                option.Size = UDim2.new(1, -6, 0, 28)
-                option.BackgroundColor3 = activeTheme.surface
-                option.TextColor3 = Color3.fromRGB(255, 255, 255)
-                option.Font = Enum.Font.Gotham
-                option.TextSize = 12
-                option.TextWrapped = true
-                option.Text = "  " .. egg.Name
-                option.TextXAlignment = Enum.TextXAlignment.Left
-                option.Parent = eggOptions
-
-                local optCorner = Instance.new("UICorner")
-                optCorner.CornerRadius = UDim.new(0, 4)
-                optCorner.Parent = option
-
-                option.MouseButton1Click:Connect(function()
-                    showingEasiestPets = false
-                    selectedChanceEgg = egg.Name
-                    eggSelect.Text = "Egg: " .. egg.Name
-                    eggOptions.Visible = true
-                    chanceMode = "Eggs"
-                    
-                    for modeKey, btnObj in pairs(subTabButtons) do
-                        if modeKey == "Eggs" then
-                            btnObj.BackgroundColor3 = activeTheme.accent
-                            btnObj.TextColor3 = Color3.fromRGB(255, 255, 255)
-                        else
-                            btnObj.BackgroundColor3 = activeTheme.surface
-                            btnObj.TextColor3 = Color3.fromRGB(180, 180, 190)
-                        end
-                    end
-                    renderChanceResults()
-                end)
-            end
+        for _, row in ipairs(rows) do
+            addChanceRow(row.Name, row.Chance, row.Category)
         end
     end
 
+    -- All Pets tab: every pet is shown with the egg it comes from.
+    -- The search box matches both pet names and egg names.
     local function renderAllPetsResults()
         clearEggResults()
-        local query = eggSearch.Text:lower()
+
+        local query = tostring(eggSearch.Text or ""):lower()
         local rows = {}
         local seen = {}
 
         for _, egg in ipairs(chanceEggs) do
+            local eggName = tostring(egg.Name or "Unknown Egg")
             for _, pet in ipairs(egg.Pets or {}) do
                 local petName = tostring(pet.Name or "Unknown Pet")
-                local eggName = tostring(egg.Name or "Unknown Egg")
-                local key = petName .. "\0" .. eggName
-                if not seen[key] and (query == ""
+                local key = petName .. "|" .. eggName
+
+                if not seen[key] and (
+                    query == ""
                     or petName:lower():find(query, 1, true)
-                    or eggName:lower():find(query, 1, true)) then
+                    or eggName:lower():find(query, 1, true)
+                ) then
                     seen[key] = true
                     table.insert(rows, {
                         Name = petName,
@@ -3260,8 +3225,11 @@ task.spawn(function()
         end
 
         table.sort(rows, function(a, b)
-            local an, bn = a.Name:lower(), b.Name:lower()
-            if an == bn then return a.Egg:lower() < b.Egg:lower() end
+            local an = tostring(a.Name):lower()
+            local bn = tostring(b.Name):lower()
+            if an == bn then
+                return tostring(a.Egg):lower() < tostring(b.Egg):lower()
+            end
             return an < bn
         end)
 
@@ -3302,8 +3270,57 @@ task.spawn(function()
         end
     end
 
+    local function rebuildEggOptions()
+        for _, child in ipairs(eggOptions:GetChildren()) do
+            if child:IsA("TextButton") then
+                child:Destroy()
+            end
+        end
+
+        local query = tostring(eggSearch.Text or ""):lower()
+
+        for _, egg in ipairs(sortedEggs) do
+            local eggName = tostring(egg.Name or "")
+            if query == "" or eggName:lower():find(query, 1, true) then
+                local option = Instance.new("TextButton")
+                option.Size = UDim2.new(1, -6, 0, 28)
+                option.BackgroundColor3 = activeTheme.surface
+                option.TextColor3 = Color3.fromRGB(255, 255, 255)
+                option.Font = Enum.Font.Gotham
+                option.TextSize = 12
+                option.TextWrapped = true
+                option.Text = "  " .. eggName
+                option.TextXAlignment = Enum.TextXAlignment.Left
+                option.Parent = eggOptions
+
+                local optCorner = Instance.new("UICorner")
+                optCorner.CornerRadius = UDim.new(0, 4)
+                optCorner.Parent = option
+
+                option.MouseButton1Click:Connect(function()
+                    selectedChanceEgg = egg.Name
+                    eggSelect.Text = "Egg: " .. eggName
+                    chanceMode = "Eggs"
+                    eggSearch.Text = ""
+                    eggOptions.Visible = true
+
+                    for modeKey, btnObj in pairs(subTabButtons) do
+                        if modeKey == "Eggs" then
+                            btnObj.BackgroundColor3 = activeTheme.accent
+                            btnObj.TextColor3 = Color3.fromRGB(255, 255, 255)
+                        else
+                            btnObj.BackgroundColor3 = activeTheme.surface
+                            btnObj.TextColor3 = Color3.fromRGB(180, 180, 190)
+                        end
+                    end
+
+                    renderChanceResults()
+                end)
+            end
+        end
+    end
+
     local function selectEggSubTab(mode, targetBtn)
-        showingEasiestPets = false
         chanceMode = mode
 
         if mode == "Eggs" then
@@ -3313,6 +3330,7 @@ task.spawn(function()
             eggSearch.PlaceholderText = "Search egg filter..."
             eggResults.Position = UDim2.new(0, 0, 0, 262)
             eggResults.Size = UDim2.new(1, 0, 1, -262)
+            rebuildEggOptions()
         elseif mode == "AllPets" then
             eggSearch.Visible = true
             eggSelect.Visible = false
@@ -3372,27 +3390,27 @@ task.spawn(function()
     end
 
     addEggModeButton("Eggs", 0, "Eggs")
-    addEggModeButton("Huges", 0.168, "Huge")
-    addEggModeButton("Titanics", 0.336, "Titanic")
-    addEggModeButton("Secrets", 0.504, "Secret")
-    addEggModeButton("Gargantuans", 0.672, "Gargantuan")
-    addEggModeButton("All Pets", 0.840, "AllPets")
+    addEggModeButton("All Pets", 0.168, "AllPets")
+    addEggModeButton("Huges", 0.336, "Huge")
+    addEggModeButton("Titanics", 0.504, "Titanic")
+    addEggModeButton("Secrets", 0.672, "Secret")
+    addEggModeButton("Gargantuans", 0.840, "Gargantuan")
 
-    eggSelect.MouseButton1Click:Connect(function() 
+    eggSelect.MouseButton1Click:Connect(function()
         if chanceMode == "Eggs" then
-            eggOptions.Visible = not eggOptions.Visible 
+            eggOptions.Visible = not eggOptions.Visible
         end
     end)
-    
+
     eggSearch:GetPropertyChangedSignal("Text"):Connect(function()
         if chanceMode == "AllPets" then
             renderAllPetsResults()
-        else
+        elseif chanceMode == "Eggs" then
             rebuildEggOptions()
-            eggOptions.Visible = (chanceMode == "Eggs")
+            eggOptions.Visible = true
         end
     end)
-    
+
     rebuildEggOptions()
     eggSelect.Text = selectedChanceEgg and ("Selected: " .. selectedChanceEgg) or "Select an egg"
     selectEggSubTab("Eggs", subTabButtons["Eggs"])
