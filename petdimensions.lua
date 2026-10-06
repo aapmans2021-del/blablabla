@@ -3090,30 +3090,32 @@ task.spawn(function()
         Normal = Color3.fromRGB(245, 245, 250),
     }
 
-    local function formatChanceOdds(chance)
+    -- Abbreviates odds to the closest whole-ish number with a unit.
+    -- 1/250000000 -> "1/250m", 1/1500000 -> "1/1.5m", 1/45000 -> "1/45k".
+    -- Under 1,000 stays a plain number. No commas, no percentage.
+    local function formatOdds(chance)
         chance = tonumber(chance) or 0
-        if chance <= 0 then
-            return "1/0"
+        if chance <= 0 then return "N/A" end
+
+        local odds = 100 / chance
+        if odds < 1000 then
+            return "1/" .. string.format("%.0f", odds)
         end
 
-        local denominator = 100 / chance
-        local units = {
-            { value = 1e12, suffix = "t" },
-            { value = 1e9, suffix = "b" },
-            { value = 1e6, suffix = "m" },
-            { value = 1e3, suffix = "k" },
-        }
-
-        for _, unit in ipairs(units) do
-            if denominator >= unit.value then
-                return ("1/%d%s"):format(
-                    math.floor((denominator / unit.value) + 0.5),
-                    unit.suffix
-                )
-            end
+        local units = { {1e3, "k"}, {1e6, "m"}, {1e9, "b"}, {1e12, "t"} }
+        local index = 1
+        for i, unit in ipairs(units) do
+            if odds >= unit[1] then index = i end
         end
 
-        return ("1/%d"):format(math.floor(denominator + 0.5))
+        local value = tonumber(string.format("%.2f", odds / units[index][1]))
+        if value >= 1000 and units[index + 1] then
+            index += 1
+            value = tonumber(string.format("%.2f", odds / units[index][1]))
+        end
+
+        local text = string.format("%.2f", value):gsub("0+$", ""):gsub("%.$", "")
+        return "1/" .. text .. units[index][2]
     end
 
     local function addChanceRow(name, chance, category)
@@ -3161,7 +3163,7 @@ task.spawn(function()
         chanceLabel.TextSize = 12
         chanceLabel.TextWrapped = true
         chanceLabel.TextXAlignment = Enum.TextXAlignment.Right
-        chanceLabel.Text = formatChanceOdds(chance)
+        chanceLabel.Text = formatOdds(chance)
         chanceLabel.Parent = row
     end
 
