@@ -183,13 +183,6 @@ local ExpeditionCombatRadius = 10.5
 local ExpeditionDodgeMargin = 1.75
 local ExpeditionFloorHeight = 3
 
--- Expedition dodge compatibility variables.
--- These were referenced later in the script without being initialized.
-local ExpeditionDodgeRadius = ExpeditionCombatRadius
-local ExpeditionMaxCombatRadius = ExpeditionCombatRadius
-local ExpeditionIsEvading = false
-local ExpeditionSavedCFrame = nil
-
 -- AUTO FARM FUNCTIONS
 local function GetAllEquippedPetUIDs()
     local myPets = {}
@@ -6462,3 +6455,4 @@ task.spawn(function()
 end)
 
 print("🎃 Halloween Maze v4 loaded" .. (hubMain and " (docked into the hub)" or ""))
+end)
