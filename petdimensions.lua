@@ -99,10 +99,286 @@ local FastPetSpeedValue = 100000
 local FastAttackInterval = 0.02
 local TokenRemote = nil
 
+-- Hatch state lives at the top level so every loop (including the egg-open
+-- cleanup poller, which is created long before the UI thread) reads the SAME
+-- variable instead of silently resolving an unrelated global.
+local AutoBuying = false
+local HatchWatchdogStatus = "Idle"
+local HatchLastEgg = 0
+local HatchCooldownUntil = 0
+local HatchFailures = 0
+
+-- Idle-aware waiting. Every automation loop in this script used to spin at its
+-- full attack rate even when its feature was switched off, which burned frame
+-- time for nothing. These loops now fall back to a slow tick while idle.
+local function idleWait(active, fast, slow)
+    task.wait(active and fast or slow)
+end
+
 local SaveModule = nil
 pcall(function()
     SaveModule = require(ReplicatedStorage:WaitForChild("Library"):WaitForChild("Client"):WaitForChild("Save"))
 end)
+
+-- =====================================================================
+-- DAYCARE: automatic pet-team management
+-- ---------------------------------------------------------------------
+-- The server keeps `save.PetsEquipped` as { [slotIndex] = { uid = <uid>, ... } }
+-- and every pet carries a `s` field (its size / growth score) plus `idt` and
+-- `uid`. Equipping is `Library.Network.Invoke("Equip Pet", uid)` and
+-- `Library.Network.Invoke("Unequip Pet", uid)` - the exact endpoints the game's
+-- own Inventory GUI uses.
+--
+-- Daycare fills every available slot with the strongest pets you own while
+-- permanently protecting the very best one (and any extra you ask it to keep),
+-- so the number one pet never gets dragged into a hatch team.
+-- =====================================================================
+local Daycare = {
+    Auto = false,
+    Protect = 1,          -- how many top-ranked pets must NEVER be equipped
+    SlotOverride = 0,     -- 0 = use save.MaxEquipped
+    MinSize = 0,          -- skip pets below this size
+    Interval = 10,
+    Busy = false,
+    Snapshot = nil,
+    LastRun = 0,
+    LastResult = "Idle",
+    TopPets = {},
+}
+
+local function saveData()
+    if not SaveModule or not SaveModule.Get then return nil end
+    local ok, data = pcall(function() return SaveModule.Get() end)
+    return (ok and type(data) == "table") and data or nil
+end
+
+local function shortNumber(value)
+    value = tonumber(value) or 0
+    if value >= 1e12 then return string.format("%.2fT", value / 1e12) end
+    if value >= 1e9 then return string.format("%.2fB", value / 1e9) end
+    if value >= 1e6 then return string.format("%.2fM", value / 1e6) end
+    if value >= 1e3 then return string.format("%.2fK", value / 1e3) end
+    return tostring(math.floor(value))
+end
+
+-- Declared ahead of rankPets because the ranking marks which pets are already
+-- equipped; a local defined further down would resolve to a global here.
+local function equippedUidSet(save)
+    local set = {}
+    if not save or type(save.PetsEquipped) ~= "table" then return set end
+    for _, entry in pairs(save.PetsEquipped) do
+        if type(entry) == "table" and entry.uid then
+            set[entry.uid] = true
+        elseif type(entry) == "string" then
+            set[entry] = true
+        end
+    end
+    return set
+end
+
+local function petDefinition(id)
+    local directory = Library.Directory and Library.Directory.Pets
+    return directory and directory[tostring(id)] or nil
+end
+
+-- A "power pet" is a base-rarity pet that actually carries abilities. Huge,
+-- Secret, Titanic and Gargantuan pets are excluded: they cannot be equipped
+-- through the normal team flow, so including them just starved the real team.
+-- `powers` is the save's own list of abilities, so this stays correct even if
+-- the directory's flags ever change.
+local function isPowerPet(pet)
+    if type(pet) ~= "table" or not pet.uid then return false end
+
+    local definition = petDefinition(pet.id)
+    if definition and (definition.huge or definition.secret
+        or definition.titanic or definition.gargantuan) then
+        return false
+    end
+
+    local powers = pet.powers
+    if type(powers) ~= "table" or next(powers) == nil then return false end
+    return true
+end
+
+-- Ranking of every equipable power pet the player owns, strongest first.
+local function rankPets()
+    local save = saveData()
+    if not save or type(save.Pets) ~= "table" then return {}, 0 end
+
+    local ranked = {}
+    for index, pet in pairs(save.Pets) do
+        if isPowerPet(pet) then
+            ranked[#ranked + 1] = {
+                uid = pet.uid,
+                index = tostring(index),
+                id = tostring(pet.id or "?"),
+                nick = tostring(pet.nk or ""),
+                size = tonumber(pet.s) or 0,
+                template = tonumber(pet.idt) or 0,
+                equipped = equippedUidSet(save)[pet.uid] == true,
+            }
+        end
+    end
+
+    -- `s` is the growth/size score. `idt` (the item template id) breaks ties
+    -- between identically sized pets so the ranking is deterministic between
+    -- runs instead of shuffling every pass.
+    table.sort(ranked, function(a, b)
+        if a.size ~= b.size then return a.size > b.size end
+        if a.template ~= b.template then return a.template > b.template end
+        return a.index < b.index
+    end)
+
+    return ranked, tonumber(save.MaxEquipped) or 0
+end
+
+local function equippedUidSet(save)
+    local set = {}
+    if not save or type(save.PetsEquipped) ~= "table" then return set end
+    for _, entry in pairs(save.PetsEquipped) do
+        if type(entry) == "table" and entry.uid then
+            set[entry.uid] = true
+        elseif type(entry) == "string" then
+            set[entry] = true
+        end
+    end
+    return set
+end
+
+local function saveTeam()
+    local save = saveData()
+    if not save then return false end
+    Daycare.Snapshot = {}
+    for uid in pairs(equippedUidSet(save)) do
+        Daycare.Snapshot[#Daycare.Snapshot + 1] = uid
+    end
+    return #Daycare.Snapshot > 0
+end
+
+-- One re-equip pass. Only the delta is sent, so an already-correct team costs
+-- zero network traffic and re-running the loop every few seconds is free.
+local function applyDaycare(quiet)
+    if Daycare.Busy then return false end
+    local save = saveData()
+    if not save or type(save.PetsEquipped) ~= "table" then return false end
+
+    local ranked, maxEquipped = rankPets()
+    if #ranked == 0 then
+        Daycare.LastResult = "no pets"
+        return false
+    end
+
+    local slots = Daycare.SlotOverride > 0 and Daycare.SlotOverride or maxEquipped
+    slots = math.max(0, math.min(slots, maxEquipped > 0 and maxEquipped or slots))
+    local protect = math.max(0, math.floor(Daycare.Protect))
+
+    Daycare.TopPets = {}
+    for i = 1, math.min(6, #ranked) do Daycare.TopPets[i] = ranked[i] end
+
+    -- Build the wanted team: skip the protected head of the list entirely, then
+    -- take the strongest of everything below it.
+    local wanted, wantedOrder = {}, {}
+    for i = protect + 1, #ranked do
+        local pet = ranked[i]
+        if slots <= 0 or #wantedOrder < slots then
+            if Daycare.MinSize <= 0 or pet.size >= Daycare.MinSize then
+                wanted[pet.uid] = pet
+                wantedOrder[#wantedOrder + 1] = pet
+            end
+        end
+    end
+
+    if #wantedOrder == 0 then
+        Daycare.LastResult = "nothing eligible"
+        return false
+    end
+
+    local current = equippedUidSet(save)
+    local toRemove, toAdd = {}, {}
+    for uid in pairs(current) do
+        if not wanted[uid] then toRemove[#toRemove + 1] = uid end
+    end
+    for _, pet in ipairs(wantedOrder) do
+        if not current[pet.uid] then toAdd[#toAdd + 1] = pet end
+    end
+
+    if #toRemove == 0 and #toAdd == 0 then
+        Daycare.LastResult = string.format("ok (%d equipped, top %d protected)", #wantedOrder, protect)
+        Daycare.LastRun = os.clock()
+        return true
+    end
+
+    Daycare.Busy = true
+    task.spawn(function()
+        local removed, added = 0, 0
+        -- Free slots first, then fill them. Throttling keeps the game's own
+        -- inventory replication from spiking on accounts with thousands of pets.
+        for _, uid in ipairs(toRemove) do
+            local ok, res = pcall(function() return Library.Network.Invoke("Unequip Pet", uid) end)
+            if ok and res ~= false then removed += 1 end
+            task.wait(0.04)
+        end
+        for _, pet in ipairs(toAdd) do
+            local ok, res = pcall(function() return Library.Network.Invoke("Equip Pet", pet.uid) end)
+            if ok and res ~= false then added += 1 end
+            task.wait(0.04)
+        end
+
+        Daycare.Busy = false
+        Daycare.LastRun = os.clock()
+        Daycare.LastResult = string.format("equipped %d, unequipped %d", added, removed)
+        CachedPetsRefreshAt = 0
+        if not quiet then print("[Daycare] " .. Daycare.LastResult) end
+    end)
+
+    return true
+end
+
+local function restoreDaycareTeam(quiet)
+    if not Daycare.Snapshot or #Daycare.Snapshot == 0 then
+        Daycare.LastResult = "no saved team"
+        return false
+    end
+    local save = saveData()
+    if not save then return false end
+
+    local current = equippedUidSet(save)
+    local wanted = {}
+    for _, uid in ipairs(Daycare.Snapshot) do wanted[uid] = true end
+
+    local toRemove, toAdd = {}, {}
+    for uid in pairs(current) do
+        if not wanted[uid] then toRemove[#toRemove + 1] = uid end
+    end
+    for _, uid in ipairs(Daycare.Snapshot) do
+        if not current[uid] then toAdd[#toAdd + 1] = uid end
+    end
+
+    if #toRemove == 0 and #toAdd == 0 then
+        Daycare.LastResult = "original team already active"
+        return true
+    end
+
+    Daycare.Busy = true
+    task.spawn(function()
+        local removed, added = 0, 0
+        for _, uid in ipairs(toRemove) do
+            local ok, res = pcall(function() return Library.Network.Invoke("Unequip Pet", uid) end)
+            if ok and res ~= false then removed += 1 end
+            task.wait(0.04)
+        end
+        for _, uid in ipairs(toAdd) do
+            local ok, res = pcall(function() return Library.Network.Invoke("Equip Pet", uid) end)
+            if ok and res ~= false then added += 1 end
+            task.wait(0.04)
+        end
+        Daycare.Busy = false
+        Daycare.LastResult = string.format("restored: +%d / -%d", added, removed)
+        CachedPetsRefreshAt = 0
+        if not quiet then print("[Daycare] " .. Daycare.LastResult) end
+    end)
+    return true
+end
 
 local function SetFastPetSpeed(enabled)
     FastPetSpeed = enabled
@@ -139,8 +415,27 @@ task.spawn(function()
     while true do
         if FastPetSpeed then
             SetFastPetSpeed(true)
+            task.wait(0.5)
+        else
+            task.wait(1)
         end
-        task.wait(0.5)
+    end
+end)
+
+-- Daycare keeps the hatch team at its optimum. Hatching grows every equipped
+-- pet, which reshuffles the size ranking, so the team is re-evaluated on a slow
+-- interval instead of once - the delta-only apply makes a no-op pass free.
+task.spawn(function()
+    while true do
+        if Daycare.Auto then
+            local now = os.clock()
+            if now - Daycare.LastRun >= math.max(2, Daycare.Interval) then
+                pcall(applyDaycare, true)
+            end
+            task.wait(2)
+        else
+            task.wait(0.5)
+        end
     end
 end)
 
@@ -195,6 +490,29 @@ local function GetAllEquippedPetUIDs()
         end
     end
     return myPets
+end
+
+-- Every attack loop used to rebuild this list from Library.PetCmds.GetEquipped()
+-- on each hit, which walks the equipped table at 20-50 Hz. It is cached and
+-- refreshed on a timer; a Daycare re-equip invalidates it immediately.
+local CachedEquippedPets = {}
+local CachedPetsRefreshAt = 0
+local CachedPetsInterval = 0.5
+
+local function RefreshCachedEquippedPets(force)
+    local now = os.clock()
+    if not force and now < CachedPetsRefreshAt then
+        return CachedEquippedPets
+    end
+
+    local pets = {}
+    pcall(function()
+        pets = GetAllEquippedPetUIDs()
+    end)
+
+    CachedEquippedPets = pets or {}
+    CachedPetsRefreshAt = now + CachedPetsInterval
+    return CachedEquippedPets
 end
 
 local function GetCoinRootFromInstance(instance)
@@ -664,8 +982,6 @@ end)
 -- is intentionally independent from the visible FX folder.
 task.spawn(function()
     while true do
-        task.wait(0.025)
-
         local now = os.clock()
         for i = #ExpeditionActiveAttacks, 1, -1 do
             local attack = ExpeditionActiveAttacks[i]
@@ -674,10 +990,13 @@ task.spawn(function()
             end
         end
 
-        if not AutoFarmExpedition or not ExpeditionDodgeEnabled or #ExpeditionActiveAttacks == 0 then
+        local engaged = AutoFarmExpedition and ExpeditionDodgeEnabled and #ExpeditionActiveAttacks > 0
+        if not engaged then
             if ExpeditionDodgeActive then
                 EndExpeditionDodge()
             end
+            -- Nothing to react to: 40 Hz buys nothing, so drop to a slow tick.
+            task.wait(0.4)
             continue
         end
 
@@ -685,6 +1004,7 @@ task.spawn(function()
         local hrp = character and character:FindFirstChild("HumanoidRootPart")
         if not hrp then
             EndExpeditionDodge()
+            task.wait(0.1)
             continue
         end
 
@@ -695,6 +1015,7 @@ task.spawn(function()
             if ExpeditionDodgeActive and now >= ExpeditionDodgeUntil then
                 EndExpeditionDodge()
             end
+            task.wait(0.025)
             continue
         end
 
@@ -708,6 +1029,8 @@ task.spawn(function()
                 hrp.CFrame = safe
             end
         end
+
+        task.wait(0.025)
     end
 end)
 
@@ -718,41 +1041,9 @@ localPlayer.CharacterAdded:Connect(function()
 end)
 local function FocusPetsContinuous(coinInstance)
     if not coinInstance or not coinInstance.Parent then return end
-
-    local coinId = coinInstance:GetAttribute("ID")
-    if not coinId then return end
-
-    -- Keep the original Select Coin behavior.
-    pcall(function()
-        Library.Signal.Fire("Select Coin", coinInstance)
-    end)
-
-    -- Send pets using the ORIGINAL sequence, but only once for this
-    -- individual robot/turkey.  Do not mark it as sent until the calls
-    -- below have actually been attempted.
-    if LastPetSendTarget ~= coinInstance then
-        local myPets = GetAllEquippedPetUIDs()
-        if #myPets == 0 then return end
-
-        pcall(function()
-            Library.Network.Invoke("Join Coin", coinId, myPets)
-        end)
-
-        for _, petUid in ipairs(myPets) do
-            pcall(function()
-                Library.Network.Fire("Change Pet Target", petUid, "Coin", coinId)
-            end)
-        end
-
-        LastPetSendTarget = coinInstance
-    end
-end
-
-
-local function FocusPetsContinuous(coinInstance)
-    if not coinInstance or not coinInstance.Parent then return end
     local coinId = coinInstance:GetAttribute("ID")
     local myPets = GetAllEquippedPetUIDs()
+
 
     pcall(function()
         Library.Signal.Fire("Select Coin", coinInstance)
@@ -862,15 +1153,15 @@ task.spawn(function()
         if AutoTokens and localPlayer.Character and localPlayer.Character:FindFirstChild("HumanoidRootPart") then
             local tokens = collectAbilityTokens()
             local hrp = localPlayer.Character:FindFirstChild("HumanoidRootPart")
-            
+
             if hrp and #tokens > 0 then
                 local savedPos = hrp.CFrame
                 local collectedAny = false
-                
+
                 for _, token in ipairs(tokens) do
                     if not AutoTokens then break end
                     if not token or not token.Parent or ignoreTokens[token] then continue end
-                    
+
                     local targetPart = nil
                     if token:IsA("BasePart") then
                         targetPart = token
@@ -879,19 +1170,19 @@ task.spawn(function()
                     elseif token:IsA("Folder") then
                         targetPart = token:FindFirstChildWhichIsA("BasePart", true)
                     end
-                    
+
                     if targetPart then
                         ignoreTokens[token] = true
                         task.delay(4, function() ignoreTokens[token] = nil end)
-                        
+
                         collectedAny = true
                         local tokenCFrame = targetPart.CFrame
                         local tokenPos = targetPart.Position
                         local tokenId = tonumber(token.Name) or token.Name
-                        
+
                         hrp.CFrame = tokenCFrame
                         task.wait(0.08)
-                        
+
                         if TokenRemote then
                             pcall(function()
                                 if TokenRemote:IsA("RemoteFunction") then
@@ -901,7 +1192,7 @@ task.spawn(function()
                                 end
                             end)
                         end
-                        
+
                         local waitCount = 0
                         while token.Parent and waitCount < 6 do
                             task.wait(0.04)
@@ -909,26 +1200,28 @@ task.spawn(function()
                         end
                     end
                 end
-                
+
                 if collectedAny and hrp and hrp.Parent then
                     hrp.CFrame = savedPos
                     task.wait(0.1)
                 end
             end
+            task.wait(0.2)
+        else
+            task.wait(1)
         end
-        task.wait(0.2)
     end
 end)
 
 -- AUTUMN BOSS FX DODGE DETECTION
 task.spawn(function()
     while true do
-        task.wait(0.1)
         if AutoFarmTurkey and TurkeyDodgeActive then
+            task.wait(0.1)
             local character = localPlayer.Character
             local hrp = character and character:FindFirstChild("HumanoidRootPart")
             local fxFolder = Workspace:FindFirstChild("__AUTUMNBOSS_FX")
-            
+
             if hrp then
                 if fxFolder and #fxFolder:GetChildren() > 0 then
                     IsEvading = true
@@ -940,6 +1233,16 @@ task.spawn(function()
                     end
                 end
             end
+        else
+            if IsEvading then
+                IsEvading = false
+                pcall(function()
+                    local character = localPlayer.Character
+                    local hrp = character and character:FindFirstChild("HumanoidRootPart")
+                    if hrp then hrp.CFrame = CFrame.new(147, 114, -1500) end
+                end)
+            end
+            task.wait(0.4)
         end
     end
 end)
@@ -962,16 +1265,17 @@ task.spawn(function()
                     CurrentCometId = tostring(comet:GetAttribute("ID"))
                 end
                 FocusCometFast(comet)
+                task.wait(0.05)
             else
                 CurrentComet = nil
                 CurrentCometId = nil
+                task.wait(0.25)
             end
         else
             CurrentComet = nil
             CurrentCometId = nil
+            task.wait(0.4)
         end
-
-        task.wait(0.05)
     end
 end)
 
@@ -984,14 +1288,16 @@ task.spawn(function()
                 end
             end)
 
-            local pets = GetAllEquippedPetUIDs()
+            local pets = RefreshCachedEquippedPets(false)
             for _, petUid in ipairs(pets) do
                 pcall(function()
                     Library.Network.Fire("Farm Coin", CurrentCometId, petUid)
                 end)
             end
+            task.wait(0.05)
+        else
+            task.wait(0.3)
         end
-        task.wait(0.05)
     end
 end)
 
@@ -1008,6 +1314,8 @@ task.spawn(function()
                 targetId = CurrentExpeditionTargetId
             elseif AutoFarmRobot or AutoFarmTurkey then
                 targetId = CurrentTargetId
+            elseif AutoTap or AutoTeleportClosestCoin then
+                targetId = CurrentCoinTargetId
             end
 
             if targetId then
@@ -1017,15 +1325,19 @@ task.spawn(function()
                     end)
                 end
 
-                local pets = GetAllEquippedPetUIDs()
+                local pets = RefreshCachedEquippedPets(false)
                 for _, petUid in ipairs(pets) do
                     pcall(function()
                         Library.Network.Fire("Farm Coin", targetId, petUid)
                     end)
                 end
+                task.wait(FastAttackInterval)
+            else
+                task.wait(0.2)
             end
+        else
+            task.wait(0.25)
         end
-        task.wait(FastAttackInterval)
     end
 end)
 
@@ -1087,7 +1399,6 @@ end)
 -- Expedition damage uses the same target as the normal mob farm.
 task.spawn(function()
     while true do
-        task.wait(0.05)
         if AutoFarmExpedition and CurrentExpeditionTargetId
             and localPlayer:GetAttribute("ExpeditionRun") then
             pcall(function()
@@ -1095,106 +1406,12 @@ task.spawn(function()
                     DamageRemote:FireServer(CurrentExpeditionTargetId)
                 end
             end)
+            task.wait(0.05)
+        else
+            task.wait(0.3)
         end
     end
 end)
-
--- EXPEDITION ATTACK DODGE
--- Keep the player close enough that expedition mobs can still target them.
--- The expedition source does not expose a numeric arena radius, so the dodge
--- uses a conservative target-relative radius instead of making large jumps.
-local function GetSafeExpeditionDodgeCFrame(hrp, targetPosition)
-    local offset = hrp.Position - targetPosition
-    local flatOffset = Vector3.new(offset.X, 0, offset.Z)
-
-    if flatOffset.Magnitude < 0.5 then
-        flatOffset = Vector3.new(hrp.CFrame.RightVector.X, 0, hrp.CFrame.RightVector.Z)
-    end
-
-    if flatOffset.Magnitude < 0.05 then
-        flatOffset = Vector3.new(1, 0, 0)
-    end
-
-    local radial = flatOffset.Unit
-    local perpendicular = Vector3.new(-radial.Z, 0, radial.X)
-
-    -- Alternate sides so repeated attacks do not send the player farther away.
-    if math.random(0, 1) == 0 then
-        perpendicular = -perpendicular
-    end
-
-    local candidate = targetPosition + perpendicular * ExpeditionDodgeRadius
-
-    -- Put the player on actual ground. This prevents the dodge from placing
-    -- the HumanoidRootPart in mid-air and falling through the expedition map.
-    local rayParams = RaycastParams.new()
-    rayParams.FilterType = Enum.RaycastFilterType.Exclude
-    rayParams.FilterDescendantsInstances = {localPlayer.Character, CurrentExpeditionTarget}
-    rayParams.IgnoreWater = true
-
-    local rayOrigin = candidate + Vector3.new(0, 60, 0)
-    local rayResult = Workspace:Raycast(rayOrigin, Vector3.new(0, -140, 0), rayParams)
-    if rayResult then
-        candidate = rayResult.Position + Vector3.new(0, 3, 0)
-    else
-        -- If no floor was found, do not perform the teleport at all.
-        return nil
-    end
-
-    -- Final safety check: never place the player farther than the combat radius.
-    local finalOffset = Vector3.new(candidate.X - targetPosition.X, 0, candidate.Z - targetPosition.Z)
-    if finalOffset.Magnitude > ExpeditionMaxCombatRadius then
-        candidate = targetPosition + finalOffset.Unit * ExpeditionMaxCombatRadius
-        local floorCheck = Workspace:Raycast(candidate + Vector3.new(0, 60, 0), Vector3.new(0, -140, 0), rayParams)
-        if not floorCheck then
-            return nil
-        end
-        candidate = floorCheck.Position + Vector3.new(0, 3, 0)
-    end
-
-    return CFrame.new(candidate, Vector3.new(targetPosition.X, candidate.Y, targetPosition.Z))
-end
-
-task.spawn(function()
-    while true do
-        task.wait(0.05)
-
-        if AutoFarmExpedition then
-            local character = localPlayer.Character
-            local hrp = character and character:FindFirstChild("HumanoidRootPart")
-            local fxFolder = Workspace:FindFirstChild("__AUTUMNBOSS_FX")
-
-            if hrp and CurrentExpeditionTarget and CurrentExpeditionTarget.Parent and fxFolder and #fxFolder:GetChildren() > 0 then
-                if not ExpeditionIsEvading then
-                    local targetPart = CurrentExpeditionTarget:FindFirstChild("Coin")
-                    local targetPosition = targetPart and targetPart.Position or CurrentExpeditionTarget:GetPivot().Position
-                    local safeDodge = GetSafeExpeditionDodgeCFrame(hrp, targetPosition)
-
-                    if safeDodge then
-                        ExpeditionIsEvading = true
-                        ExpeditionSavedCFrame = hrp.CFrame
-                        hrp.CFrame = safeDodge
-                    end
-                end
-            elseif ExpeditionIsEvading and hrp then
-                ExpeditionIsEvading = false
-                if ExpeditionSavedCFrame then
-                    hrp.CFrame = ExpeditionSavedCFrame
-                end
-                ExpeditionSavedCFrame = nil
-            end
-        elseif ExpeditionIsEvading then
-            local character = localPlayer.Character
-            local hrp = character and character:FindFirstChild("HumanoidRootPart")
-            if hrp and ExpeditionSavedCFrame then
-                hrp.CFrame = ExpeditionSavedCFrame
-            end
-            ExpeditionIsEvading = false
-            ExpeditionSavedCFrame = nil
-        end
-    end
-end)
-
 
 -- Hacker Boss Auto Farm Loop
 -- Uses the same coin selection / Join Coin / Change Pet Target sequence
@@ -1243,7 +1460,7 @@ task.spawn(function()
                 CurrentTargetId = nil
             end
         end
-        
+
         if AutoFarmTurkey then
             if not CurrentTarget or not CurrentTarget.Parent then
                 CurrentTarget = FindTurkey()
@@ -1266,11 +1483,13 @@ end)
 -- Damage Spam Loop
 task.spawn(function()
     while true do
-        task.wait(0.05)
         if CurrentTargetId and DamageRemote and (AutoFarmRobot or AutoFarmTurkey) then
             pcall(function()
                 DamageRemote:FireServer(CurrentTargetId)
             end)
+            task.wait(0.05)
+        else
+            task.wait(0.3)
         end
     end
 end)
@@ -1278,11 +1497,13 @@ end)
 -- Hacker Boss damage loop
 task.spawn(function()
     while true do
-        task.wait(0.05)
         if AutoFarmHackerBoss and CurrentHackerBossId and DamageRemote then
             pcall(function()
                 DamageRemote:FireServer(CurrentHackerBossId)
             end)
+            task.wait(0.05)
+        else
+            task.wait(0.3)
         end
     end
 end)
@@ -1292,26 +1513,8 @@ end)
 -- expensive Workspace scan from running at the same rate as the hit remotes.
 local ClosestCoinScanInterval = 0.10
 local ClosestCoinHitInterval = 0.05
-local CachedEquippedPets = {}
-local CachedPetsRefreshAt = 0
 local LastCoinInteractionTarget = nil
 local LastCoinTeleportTarget = nil
-
-local function RefreshCachedEquippedPets(force)
-    local now = os.clock()
-    if not force and now < CachedPetsRefreshAt then
-        return CachedEquippedPets
-    end
-
-    local pets = {}
-    pcall(function()
-        pets = GetAllEquippedPetUIDs()
-    end)
-
-    CachedEquippedPets = pets or {}
-    CachedPetsRefreshAt = now + 0.50
-    return CachedEquippedPets
-end
 
 -- Find and select the target at a lower rate than the actual attack loop.
 task.spawn(function()
@@ -1377,7 +1580,7 @@ task.spawn(function()
             LastCoinTeleportTarget = nil
         end
 
-        task.wait(ClosestCoinScanInterval)
+        task.wait(AutoTap or AutoTeleportClosestCoin and ClosestCoinScanInterval or 0.4)
     end
 end)
 
@@ -1401,9 +1604,10 @@ task.spawn(function()
                     Library.Network.Fire("Farm Coin", targetId, petUid)
                 end)
             end
+            task.wait(ClosestCoinHitInterval)
+        else
+            task.wait(0.25)
         end
-
-        task.wait(ClosestCoinHitInterval)
     end
 end)
 
@@ -1601,34 +1805,110 @@ Workspace:GetPropertyChangedSignal("CurrentCamera"):Connect(function()
     cleanupEggOpeningEffects()
 end)
 
--- Keep the known local trigger blocked. This prevents the animation from
--- starting in executors that support metamethod hooks.
+-- Keep the egg-open animation from ever starting.
+--
+-- The previous version hooked `game.__namecall` to swallow
+-- `EggOpenPort.PlayTrigger:Fire(...)`. That works, but __namecall is on the hot
+-- path of EVERY method call in the entire game - it is a permanent, global tax
+-- on the client and it was a large part of the frame drops while hatching.
+--
+-- The trigger is a plain RemoteEvent with exactly one listener: the Egg Opening
+-- Frontend. Detaching that one connection stops the animation before it is ever
+-- scheduled - no TweenService work, no DepthOfFieldEffect, no preloaded assets,
+-- no EggOpenAnim instances - and costs nothing per frame.
+local EggOpenEnv = (type(getgenv) == "function" and getgenv()) or _G
+
+-- How the game plays the animation (read from the live scripts):
+--   server -> Network "Eggs_PlayOpenAnimation" -> Game.EggOpenHook
+--          -> ReplicatedStorage.EggOpenPort.PlayTrigger:Fire(...)   (BindableEvent)
+--          -> ONE listener in "Egg Opening Frontend" that plays the animation,
+--             raises Variables.OpeningEgg (which blocks auto-hatch until it ends),
+--             then fires "Pets_ClearHidden" and the "CompletedHatching" signal.
+--
+-- We replace that single listener with a tiny one that skips the animation but
+-- still does the bookkeeping. Dropping it entirely would leave new pets flagged
+-- hidden. Since OpeningEgg is never raised, auto-hatch is no longer held back by
+-- the animation and runs at the server's own cooldown.
+local function eggOpenBookkeeping(eggId, pets)
+    local uids = {}
+    if type(pets) == "table" then
+        for uid in pairs(pets) do uids[#uids + 1] = uid end
+    end
+    task.defer(function()
+        pcall(function() Library.Network.Fire("Pets_ClearHidden", uids) end)
+        pcall(function() Library.Signal.Fire("CompletedHatching", eggId, uids) end)
+    end)
+end
+
+-- Undo a previous run of this script so reloads never stack listeners.
 pcall(function()
-    if type(hookmetamethod) == "function" and type(getnamecallmethod) == "function" and type(newcclosure) == "function" then
-        local oldNamecall
-        oldNamecall = hookmetamethod(game, "__namecall", newcclosure(function(self, ...)
-            local method = getnamecallmethod()
-            if method == "Fire" and self and self.Name == "PlayTrigger" then
-                local parent = self.Parent
-                if parent and parent.Name == "EggOpenPort" then
-                    return nil
-                end
+    local previous = EggOpenEnv.PD_EggOpenHook
+    if previous then
+        if previous.replacement then previous.replacement:Disconnect() end
+        if previous.trigger and previous.callback then
+            previous.trigger.Event:Connect(previous.callback)
+        end
+    end
+end)
+EggOpenEnv.PD_EggOpenHook = nil
+
+local eggOpenDetached = false
+task.spawn(function()
+    local port = ReplicatedStorage:WaitForChild("EggOpenPort", 15)
+    local trigger = port and port:WaitForChild("PlayTrigger", 15)
+    if not trigger then return end
+
+    pcall(function()
+        local signal = trigger:IsA("BindableEvent") and trigger.Event or trigger.OnClientEvent
+        local callback
+        for _, connection in ipairs(getconnections(signal)) do
+            if connection.Enabled and type(connection.Function) == "function" then
+                callback = callback or connection.Function
+                connection:Disconnect()
             end
-            return oldNamecall(self, ...)
-        end))
+        end
+        if callback then
+            EggOpenEnv.PD_EggOpenHook = {
+                trigger = trigger,
+                callback = callback,
+                replacement = signal:Connect(eggOpenBookkeeping),
+            }
+            eggOpenDetached = true
+        end
+    end)
+
+    -- Fallback only when the listener could not be detached: swallow the
+    -- :Fire() with a namecall hook (installed once per session).
+    if not eggOpenDetached and not EggOpenEnv.PD_EggOpenNamecallHooked then
+        pcall(function()
+            if type(hookmetamethod) == "function" and type(getnamecallmethod) == "function" and type(newcclosure) == "function" then
+                local oldNamecall
+                oldNamecall = hookmetamethod(game, "__namecall", newcclosure(function(self, ...)
+                    if getnamecallmethod() == "Fire" and typeof(self) == "Instance" and self.Name == "PlayTrigger" then
+                        local parent = self.Parent
+                        if parent and parent.Name == "EggOpenPort" then
+                            eggOpenBookkeeping(...)
+                            return nil
+                        end
+                    end
+                    return oldNamecall(self, ...)
+                end))
+                EggOpenEnv.PD_EggOpenNamecallHooked = true
+            end
+        end)
     end
 end)
 
--- Small fallback cleanup only while Auto-Hatch is active. This runs at 4 Hz
--- instead of every frame and avoids expensive GetDescendants scans.
+-- Small fallback cleanup only while Auto-Hatch is active, and only every 2s.
+-- With the listener detached nothing should ever be created, so this is a
+-- safety net for leftovers from an animation that was already in flight when
+-- the script loaded - not a per-frame tree scan.
 task.spawn(function()
     while true do
         if AutoBuying then
             cleanupEggOpeningEffects()
-            task.wait(0.25)
-        else
-            task.wait(0.5)
         end
+        task.wait(2)
     end
 end)
 
@@ -1985,7 +2265,7 @@ task.spawn(function()
             label.TextColor3 = color
             label.TextSize = 12
             label.TextWrapped = true
-            label.Text = "✓ " .. tostring(entryData.name)
+            label.Text = "- " .. tostring(entryData.name)
             label.TextXAlignment = Enum.TextXAlignment.Left
             label.LayoutOrder = i
             label.Parent = listFrame
@@ -2214,7 +2494,7 @@ task.spawn(function()
     local autoHatchCorner = Instance.new("UICorner")
     autoHatchCorner.CornerRadius = UDim.new(0, 12)
     autoHatchCorner.Parent = autoHatchMain
-    
+
     local autoHatchShadow = Instance.new("UIStroke")
     autoHatchShadow.Color = Color3.fromRGB(60, 140, 220)
     autoHatchShadow.Thickness = 1.8
@@ -2239,17 +2519,18 @@ task.spawn(function()
     tabBar.BackgroundTransparency = 1
     tabBar.Parent = autoHatchMain
 
-    local function createTabButton(text, position)
+    local TAB_TOTAL = 6
+    local function createTabButton(text, index)
         local btn = Instance.new("TextButton")
-        btn.Size = UDim2.new(0.192, 0, 1, 0)
-        btn.Position = UDim2.new(position, 0, 0, 0)
+        btn.Size = UDim2.new(1 / TAB_TOTAL - 0.004, 0, 1, 0)
+        btn.Position = UDim2.new((index - 1) / TAB_TOTAL, 0, 0, 0)
         btn.Text = text
         btn.BackgroundColor3 = Color3.fromRGB(32, 32, 42)
         btn.TextColor3 = Color3.fromRGB(180, 180, 190)
         btn.Font = Enum.Font.GothamBold
-        btn.TextSize = 12
+        btn.TextSize = 11
         btn.Parent = tabBar
-        
+
         local corner = Instance.new("UICorner")
         corner.CornerRadius = UDim.new(0, 6)
         corner.Parent = btn
@@ -2259,15 +2540,16 @@ task.spawn(function()
         stroke.Thickness = 1
         stroke.Transparency = 0.8
         stroke.Parent = btn
-        
+
         return btn
     end
 
-    local hatchTab = createTabButton("Hatch", 0)
-    local tpTab = createTabButton("Teleport", 0.202)
-    local settingsTab = createTabButton("Settings", 0.404)
-    local eggTab = createTabButton("Egg Chances", 0.606)
-    local farmTab = createTabButton("Farm", 0.808)
+    local hatchTab = createTabButton("Hatch", 1)
+    local tpTab = createTabButton("Teleport", 2)
+    local settingsTab = createTabButton("Settings", 3)
+    local eggTab = createTabButton("Egg Chances", 4)
+    local farmTab = createTabButton("Farm", 5)
+    local daycareTab = createTabButton("Daycare", 6)
 
     local hatchFrame = Instance.new("ScrollingFrame")
     hatchFrame.Size = UDim2.new(1, -24, 1, -96)
@@ -2307,6 +2589,14 @@ task.spawn(function()
     farmFrame.BackgroundTransparency = 1
     farmFrame.Visible = false
     farmFrame.Parent = autoHatchMain
+
+    local daycareFrame = Instance.new("Frame")
+    daycareFrame.Name = "DaycareFrame"
+    daycareFrame.Size = UDim2.new(1, -24, 1, -96)
+    daycareFrame.Position = UDim2.new(0, 12, 0, 90)
+    daycareFrame.BackgroundTransparency = 1
+    daycareFrame.Visible = false
+    daycareFrame.Parent = autoHatchMain
 
     -- =====================================================================
     -- FULL EXTENDED THEMES SYSTEM
@@ -2474,7 +2764,7 @@ task.spawn(function()
         autoHatchShadow.Color = activeTheme.accent
         autoTitle.TextColor3 = Color3.fromRGB(60, 140, 220)
 
-        for _, btn in ipairs({hatchTab, tpTab, settingsTab, eggTab, farmTab}) do
+        for _, btn in ipairs({hatchTab, tpTab, settingsTab, eggTab, farmTab, daycareTab}) do
             if btn == currentTabBtn then
                 btn.BackgroundColor3 = activeTheme.accent
                 btn.TextColor3 = Color3.fromRGB(255, 255, 255)
@@ -2502,8 +2792,9 @@ task.spawn(function()
         settingsFrame.Visible = false
         eggFrame.Visible = false
         farmFrame.Visible = false
-        
-        for _, btn in ipairs({hatchTab, tpTab, settingsTab, eggTab, farmTab}) do
+        daycareFrame.Visible = false
+
+        for _, btn in ipairs({hatchTab, tpTab, settingsTab, eggTab, farmTab, daycareTab}) do
             btn.BackgroundColor3 = activeTheme.surface
             btn.TextColor3 = Color3.fromRGB(180, 180, 190)
         end
@@ -2520,6 +2811,7 @@ task.spawn(function()
     settingsTab.MouseButton1Click:Connect(function() switchTab(settingsTab, settingsFrame) end)
     eggTab.MouseButton1Click:Connect(function() switchTab(eggTab, eggFrame) end)
     farmTab.MouseButton1Click:Connect(function() switchTab(farmTab, farmFrame) end)
+    daycareTab.MouseButton1Click:Connect(function() switchTab(daycareTab, daycareFrame) end)
 
     switchTab(hatchTab, hatchFrame)
 
@@ -2532,7 +2824,7 @@ task.spawn(function()
         btn.Size = UDim2.new(1, 0, 0, 34)
         btn.Position = UDim2.new(0, 0, 0, yPos)
         btn.BackgroundColor3 = defaultState and activeTheme.controlOn or activeTheme.surface
-        btn.Text = text .. (defaultState and ": ON ✓" or ": OFF")
+        btn.Text = text .. (defaultState and ": ON" or ": OFF")
         btn.TextColor3 = defaultState and Color3.fromRGB(255, 255, 255) or Color3.fromRGB(180, 180, 190)
         btn.Font = Enum.Font.GothamBold
         btn.TextSize = 13
@@ -2541,7 +2833,7 @@ task.spawn(function()
         local btnCorner = Instance.new("UICorner")
         btnCorner.CornerRadius = UDim.new(0, 6)
         btnCorner.Parent = btn
-        
+
         local btnStroke = Instance.new("UIStroke")
         btnStroke.Color = activeTheme.stroke
         btnStroke.Thickness = 1
@@ -2556,7 +2848,7 @@ task.spawn(function()
             state = newState
             btn:SetAttribute("ToggleState", state)
             btn.BackgroundColor3 = state and activeTheme.controlOn or activeTheme.surface
-            btn.Text = text .. (state and ": ON ✓" or ": OFF")
+            btn.Text = text .. (state and ": ON" or ": OFF")
             btn.TextColor3 = state and Color3.fromRGB(255, 255, 255) or Color3.fromRGB(180, 180, 190)
         end
 
@@ -2596,12 +2888,12 @@ task.spawn(function()
     farmTitle.TextXAlignment = Enum.TextXAlignment.Left
     farmTitle.Parent = farmFrame
 
-    createUnifiedToggle(farmFrame, 32, "🤖 Robot Farm", false, function(state) AutoFarmRobot = state end)
-    createUnifiedToggle(farmFrame, 74, "🦃 Turkey/Boss Farm", false, function(state) 
+    createUnifiedToggle(farmFrame, 32, "Robot Farm", false, function(state) AutoFarmRobot = state end)
+    createUnifiedToggle(farmFrame, 74, "Turkey/Boss Farm", false, function(state)
         AutoFarmTurkey = state
         TurkeyDodgeActive = state
     end)
-    createUnifiedToggle(farmFrame, 116, "☄️ Comet Farm", false, function(state)
+    createUnifiedToggle(farmFrame, 116, "Comet Farm", false, function(state)
         AutoFarmComet = state
         if state then
             CurrentTarget = nil
@@ -2611,11 +2903,11 @@ task.spawn(function()
             CurrentCometId = nil
         end
     end)
-    createUnifiedToggle(farmFrame, 158, "⭐ Auto Tokens", false, function(state) AutoTokens = state end)
-    createUnifiedToggle(farmFrame, 200, "⚡ Fast Pet Speed", false, function(state) SetFastPetSpeed(state) end)
-    createUnifiedToggle(farmFrame, 242, "⚔️ Fast Attack", false, function(state) FastAttackSpeed = state end)
+    createUnifiedToggle(farmFrame, 158, "Auto Tokens", false, function(state) AutoTokens = state end)
+    createUnifiedToggle(farmFrame, 200, "Fast Pet Speed", false, function(state) SetFastPetSpeed(state) end)
+    createUnifiedToggle(farmFrame, 242, "Fast Attack", false, function(state) FastAttackSpeed = state end)
 
-    createUnifiedToggle(farmFrame, 326, "💻 Hacker Boss Farm", false, function(state)
+    createUnifiedToggle(farmFrame, 326, "Hacker Boss Farm", false, function(state)
         AutoFarmHackerBoss = state
         if not state then
             CurrentHackerBoss = nil
@@ -2623,7 +2915,7 @@ task.spawn(function()
         end
     end)
 
-    createUnifiedToggle(farmFrame, 368, "🍂 Expedition Farm", false, function(state)
+    createUnifiedToggle(farmFrame, 368, "Expedition Farm", false, function(state)
         AutoFarmExpedition = state
         if not state then
             CurrentExpeditionTarget = nil
@@ -2635,25 +2927,25 @@ task.spawn(function()
         end
     end)
 
-    createUnifiedToggle(farmFrame, 410, "🎃 Auto Trick or Treating", false, function(state)
+    createUnifiedToggle(farmFrame, 410, "Auto Trick or Treating", false, function(state)
         AutoTrickOrTreat = state
     end)
 
-    createUnifiedToggle(farmFrame, 452, "👆 Auto Tap", false, function(state)
+    createUnifiedToggle(farmFrame, 452, "Auto Tap", false, function(state)
         AutoTap = state
         if not state then
             ResetCoinTarget()
         end
     end)
 
-    createUnifiedToggle(farmFrame, 452, "📍 Auto Teleport to Closest Coin", false, function(state)
+    createUnifiedToggle(farmFrame, 452, "Auto Teleport to Closest Coin", false, function(state)
         AutoTeleportClosestCoin = state
         if not state and not AutoTap then
             ResetCoinTarget()
         end
     end)
 
-    createUnifiedToggle(farmFrame, 494, "🛡️ Anti AFK", false, function(state)
+    createUnifiedToggle(farmFrame, 494, "Anti AFK", false, function(state)
         AntiAFK = state
     end)
 
@@ -2708,45 +3000,48 @@ task.spawn(function()
 
     task.spawn(function()
         while farmFrame.Parent do
-            if AutoFarmRobot and CurrentTargetId then
-                farmStatus.Text = "Status: 🤖 Farming Robot #" .. CurrentTargetId
+            if AutoBuying then
+                farmStatus.Text = "Status: " .. tostring(HatchWatchdogStatus)
+                farmStatus.TextColor3 = Color3.fromRGB(120, 255, 180)
+            elseif AutoFarmRobot and CurrentTargetId then
+                farmStatus.Text = "Status: Farming Robot #" .. CurrentTargetId
                 farmStatus.TextColor3 = Color3.fromRGB(100, 255, 100)
             elseif AutoFarmTurkey and CurrentTargetId then
                 if IsEvading then
-                    farmStatus.Text = "Status: 🦃 DODGING BOSS FX!"
+                    farmStatus.Text = "Status: DODGING BOSS FX!"
                     farmStatus.TextColor3 = Color3.fromRGB(255, 100, 100)
                 else
-                    farmStatus.Text = "Status: 🦃 Farming Target #" .. CurrentTargetId
+                    farmStatus.Text = "Status: Farming Target #" .. CurrentTargetId
                     farmStatus.TextColor3 = Color3.fromRGB(255, 200, 100)
                 end
             elseif AutoFarmHackerBoss and CurrentHackerBossId then
-                farmStatus.Text = "Status: 💻 Farming Hacker Prime #" .. CurrentHackerBossId
+                farmStatus.Text = "Status: Farming Hacker Prime #" .. CurrentHackerBossId
                 farmStatus.TextColor3 = Color3.fromRGB(120, 255, 200)
             elseif AutoFarmExpedition and CurrentExpeditionTargetId then
                 if ExpeditionDodgeActive then
-                    farmStatus.Text = "Status: 🍂 DODGING EXPEDITION ATTACK!"
+                    farmStatus.Text = "Status: DODGING EXPEDITION ATTACK!"
                     farmStatus.TextColor3 = Color3.fromRGB(255, 100, 100)
                 else
-                    farmStatus.Text = "Status: 🍂 Farming Expedition Mob #" .. CurrentExpeditionTargetId
+                    farmStatus.Text = "Status: Farming Expedition Mob #" .. CurrentExpeditionTargetId
                     farmStatus.TextColor3 = Color3.fromRGB(255, 170, 100)
                 end
             elseif AutoFarmComet and CurrentCometId then
-                farmStatus.Text = "Status: ☄️ Farming Comet #" .. CurrentCometId
+                farmStatus.Text = "Status: Farming Comet #" .. CurrentCometId
                 farmStatus.TextColor3 = Color3.fromRGB(180, 220, 255)
             elseif (AutoTap or AutoTeleportClosestCoin) and CurrentCoinTargetId then
                 if AutoTap and AutoTeleportClosestCoin then
-                    farmStatus.Text = "Status: 👆📍 Tapping + teleporting to coin #" .. CurrentCoinTargetId
+                    farmStatus.Text = "Status: Tapping + teleporting to coin #" .. CurrentCoinTargetId
                 elseif AutoTap then
-                    farmStatus.Text = "Status: 👆 Auto tapping coin #" .. CurrentCoinTargetId
+                    farmStatus.Text = "Status: Auto tapping coin #" .. CurrentCoinTargetId
                 else
-                    farmStatus.Text = "Status: 📍 Teleporting to closest coin #" .. CurrentCoinTargetId
+                    farmStatus.Text = "Status: Teleporting to closest coin #" .. CurrentCoinTargetId
                 end
                 farmStatus.TextColor3 = Color3.fromRGB(120, 220, 255)
             elseif AntiAFK then
-                farmStatus.Text = "Status: 🛡️ Anti AFK every " .. tostring(AntiAFKIntervalMinutes) .. " minute(s)"
+                farmStatus.Text = "Status: Anti AFK every " .. tostring(AntiAFKIntervalMinutes) .. " minute(s)"
                 farmStatus.TextColor3 = Color3.fromRGB(120, 255, 180)
             elseif AutoFarmTurkey or AutoFarmRobot then
-                farmStatus.Text = "Status: ⏳ Searching Target..."
+                farmStatus.Text = "Status: Searching Target..."
                 farmStatus.TextColor3 = Color3.fromRGB(255, 200, 80)
             else
                 farmStatus.Text = "Status: Idle"
@@ -2755,6 +3050,233 @@ task.spawn(function()
             task.wait(0.5)
         end
     end)
+
+    -- =====================================================================
+    -- DAYCARE TAB UI
+    -- =====================================================================
+    -- Built inside its own function: the main UI thread was already close to
+    -- Luau's 200-register-per-function limit, and hoisting this block's locals
+    -- into a nested scope is what keeps the whole script compiling.
+    local function buildDaycareUI()
+    local daycareTitle = Instance.new("TextLabel")
+    daycareTitle.Size = UDim2.new(1, 0, 0, 24)
+    daycareTitle.Position = UDim2.new(0, 0, 0, 0)
+    daycareTitle.BackgroundTransparency = 1
+    daycareTitle.Text = "AUTO PET TEAM MANAGER"
+    daycareTitle.TextColor3 = Color3.fromRGB(255, 255, 255)
+    daycareTitle.Font = Enum.Font.GothamBold
+    daycareTitle.TextSize = 14
+    daycareTitle.TextXAlignment = Enum.TextXAlignment.Left
+    daycareTitle.Parent = daycareFrame
+
+    local daycareHint = Instance.new("TextLabel")
+    daycareHint.Size = UDim2.new(1, 0, 0, 40)
+    daycareHint.Position = UDim2.new(0, 0, 0, 24)
+    daycareHint.BackgroundTransparency = 1
+    daycareHint.Text = "Fills every slot with your strongest pets while permanently keeping your very best one out of the hatch team."
+    daycareHint.TextColor3 = Color3.fromRGB(190, 190, 200)
+    daycareHint.Font = Enum.Font.Gotham
+    daycareHint.TextSize = 11
+    daycareHint.TextWrapped = true
+    daycareHint.TextXAlignment = Enum.TextXAlignment.Left
+    daycareHint.TextYAlignment = Enum.TextYAlignment.Top
+    daycareHint.Parent = daycareFrame
+
+    local daycareStats = Instance.new("TextLabel")
+    daycareStats.Size = UDim2.new(1, 0, 0, 54)
+    daycareStats.Position = UDim2.new(0, 0, 0, 68)
+    daycareStats.BackgroundColor3 = activeTheme.panel
+    daycareStats.BorderSizePixel = 0
+    daycareStats.TextColor3 = Color3.fromRGB(190, 210, 235)
+    daycareStats.Font = Enum.Font.GothamBold
+    daycareStats.TextSize = 11
+    daycareStats.TextWrapped = true
+    daycareStats.TextXAlignment = Enum.TextXAlignment.Left
+    daycareStats.TextYAlignment = Enum.TextYAlignment.Top
+    daycareStats.Text = "Loading pets..."
+    daycareStats.Parent = daycareFrame
+    do local _c = Instance.new("UICorner") _c.CornerRadius = UDim.new(0, 8) _c.Parent = daycareStats end
+
+    local function daycareInput(labelText, y, default, width)
+        local lbl = Instance.new("TextLabel")
+        lbl.Size = UDim2.new(0.44, 0, 0, 28)
+        lbl.Position = UDim2.new(0, 0, 0, y)
+        lbl.BackgroundTransparency = 1
+        lbl.Text = labelText
+        lbl.TextColor3 = Color3.fromRGB(190, 190, 200)
+        lbl.Font = Enum.Font.GothamBold
+        lbl.TextSize = 12
+        lbl.TextXAlignment = Enum.TextXAlignment.Left
+        lbl.Parent = daycareFrame
+
+        local box = Instance.new("TextBox")
+        box.Size = UDim2.new(0.26, 0, 0, 28)
+        box.Position = UDim2.new(0.46, 0, 0, y)
+        box.BackgroundColor3 = Color3.fromRGB(35, 35, 48)
+        box.BorderSizePixel = 0
+        box.ClearTextOnFocus = false
+        box.Text = tostring(default)
+        box.PlaceholderText = "0 = auto"
+        box.TextColor3 = Color3.fromRGB(255, 255, 255)
+        box.Font = Enum.Font.GothamBold
+        box.TextSize = 12
+        box.Parent = daycareFrame
+        do local _c = Instance.new("UICorner") _c.CornerRadius = UDim.new(0, 6) _c.Parent = box end
+
+        if width then box.Size = UDim2.new(width, 0, 0, 28) end
+        return box
+    end
+
+    local protectBox = daycareInput("Protect best N pets", 132, Daycare.Protect)
+    local slotsBox = daycareInput("Slots to fill (0 = max)", 164, Daycare.SlotOverride)
+    local minSizeBox = daycareInput("Minimum size (0 = any)", 196, Daycare.MinSize)
+    local intervalBox = daycareInput("Re-check interval (s)", 228, Daycare.Interval)
+
+    local function readNumber(box, fallback)
+        local value = tonumber(box.Text)
+        if not value then
+            box.Text = tostring(fallback)
+            return fallback
+        end
+        return value
+    end
+
+    protectBox.FocusLost:Connect(function()
+        Daycare.Protect = math.clamp(math.floor(readNumber(protectBox, Daycare.Protect)), 0, 200)
+        protectBox.Text = tostring(Daycare.Protect)
+    end)
+    slotsBox.FocusLost:Connect(function()
+        Daycare.SlotOverride = math.max(0, math.floor(readNumber(slotsBox, Daycare.SlotOverride)))
+        slotsBox.Text = tostring(Daycare.SlotOverride)
+    end)
+    minSizeBox.FocusLost:Connect(function()
+        Daycare.MinSize = math.max(0, readNumber(minSizeBox, Daycare.MinSize))
+        minSizeBox.Text = tostring(Daycare.MinSize)
+    end)
+    intervalBox.FocusLost:Connect(function()
+        Daycare.Interval = math.clamp(readNumber(intervalBox, Daycare.Interval), 2, 600)
+        intervalBox.Text = tostring(Daycare.Interval)
+    end)
+
+    createUnifiedToggle(daycareFrame, 264, "Daycare Auto", false, function(state)
+        Daycare.Auto = state
+        if state then
+            Daycare.LastRun = 0
+            pcall(applyDaycare, true)
+        end
+    end)
+
+    local daycareStatus = Instance.new("TextLabel")
+    daycareStatus.Size = UDim2.new(1, 0, 0, 34)
+    daycareStatus.Position = UDim2.new(0, 0, 0, 384)
+    daycareStatus.BackgroundTransparency = 1
+    daycareStatus.Text = "Ready"
+    daycareStatus.TextColor3 = Color3.fromRGB(180, 180, 190)
+    daycareStatus.Font = Enum.Font.GothamBold
+    daycareStatus.TextSize = 12
+    daycareStatus.TextWrapped = true
+    daycareStatus.TextXAlignment = Enum.TextXAlignment.Left
+    daycareStatus.Parent = daycareFrame
+
+    local function daycareActionButton(text, y, x, color, callback)
+        local btn = Instance.new("TextButton")
+        btn.Size = UDim2.new(0.31, -4, 0, 34)
+        btn.Position = UDim2.new(x, 0, 0, y)
+        btn.BackgroundColor3 = color
+        btn.Text = text
+        btn.TextColor3 = Color3.fromRGB(255, 255, 255)
+        btn.Font = Enum.Font.GothamBold
+        btn.TextSize = 11
+        btn.TextWrapped = true
+        btn.BorderSizePixel = 0
+        btn.Parent = daycareFrame
+        do local _c = Instance.new("UICorner") _c.CornerRadius = UDim.new(0, 6) _c.Parent = btn end
+        btn.MouseButton1Click:Connect(callback)
+        return btn
+    end
+
+    daycareActionButton("SAVE CURRENT TEAM", 304, 0, Color3.fromRGB(55, 55, 78), function()
+        if saveTeam() then
+            daycareStatus.Text = "Team snapshot saved."
+            daycareStatus.TextColor3 = Color3.fromRGB(120, 255, 180)
+        else
+            daycareStatus.Text = "Could not read equipped pets."
+            daycareStatus.TextColor3 = Color3.fromRGB(255, 120, 120)
+        end
+    end)
+
+    daycareActionButton("APPLY NOW", 304, 0.345, Color3.fromRGB(45, 105, 65), function()
+        if applyDaycare() then
+            daycareStatus.Text = "Applying best-pets team..."
+            daycareStatus.TextColor3 = Color3.fromRGB(120, 255, 180)
+        else
+            daycareStatus.Text = "Apply failed: " .. tostring(Daycare.LastResult)
+            daycareStatus.TextColor3 = Color3.fromRGB(255, 120, 120)
+        end
+    end)
+
+    daycareActionButton("RESTORE TEAM", 304, 0.69, Color3.fromRGB(120, 70, 45), function()
+        if restoreDaycareTeam() then
+            daycareStatus.Text = "Restoring saved team..."
+            daycareStatus.TextColor3 = Color3.fromRGB(255, 200, 120)
+        else
+            daycareStatus.Text = "Nothing saved to restore."
+            daycareStatus.TextColor3 = Color3.fromRGB(255, 200, 120)
+        end
+    end)
+
+    local protectedList = Instance.new("TextLabel")
+    protectedList.Size = UDim2.new(1, 0, 1, -428)
+    protectedList.Position = UDim2.new(0, 0, 0, 420)
+    protectedList.BackgroundColor3 = activeTheme.panel
+    protectedList.BorderSizePixel = 0
+    protectedList.TextColor3 = Color3.fromRGB(200, 200, 215)
+    protectedList.Font = Enum.Font.Gotham
+    protectedList.TextSize = 11
+    protectedList.TextWrapped = true
+    protectedList.TextXAlignment = Enum.TextXAlignment.Left
+    protectedList.TextYAlignment = Enum.TextYAlignment.Top
+    protectedList.Text = ""
+    protectedList.Parent = daycareFrame
+    do local _c = Instance.new("UICorner") _c.CornerRadius = UDim.new(0, 8) _c.Parent = protectedList end
+
+    -- Ranking readout. Runs at 3 Hz and only rebuilds when the numbers move.
+    task.spawn(function()
+        local lastSignature
+        while daycareFrame and daycareFrame.Parent do
+            local ok, ranked, maxEquipped = pcall(rankPets)
+            if ok and type(ranked) == "table" then
+                local save = saveData()
+                local equipped = 0
+                if save then for _ in pairs(equippedUidSet(save)) do equipped += 1 end end
+
+                local top = {}
+                for i = 1, math.min(6, #ranked) do
+                    local pet = ranked[i]
+                    local tag = (i <= Daycare.Protect) and " [PROTECTED]" or ""
+                    top[#top + 1] = ("%d. %s%s - %s"):format(i, pet.id, tag, shortNumber(pet.size))
+                end
+
+                local signature = table.concat({
+                    tostring(#ranked), tostring(equipped), tostring(maxEquipped),
+                    tostring(Daycare.Protect), tostring(Daycare.Auto), tostring(Daycare.LastResult),
+                    top[1] or "", top[2] or ""
+                }, "|")
+
+                if signature ~= lastSignature then
+                    lastSignature = signature
+                    daycareStats.Text = ("Pets: %d  |  Equipped: %d / %s  |  Auto: %s")
+                        :format(#ranked, equipped, tostring(maxEquipped), Daycare.Auto and "ON" or "OFF")
+                    protectedList.Text = "STRONGEST PETS (highest first)\n" .. table.concat(top, "\n")
+                        .. "\n\n" .. tostring(Daycare.LastResult)
+                end
+            end
+            task.wait(0.33)
+        end
+    end)
+    end
+
+    buildDaycareUI()
 
     -- =====================================================================
     -- EGG CHANCES TAB
@@ -2992,7 +3514,7 @@ task.spawn(function()
     eggSelect.TextColor3 = Color3.fromRGB(255, 255, 255)
     eggSelect.Font = Enum.Font.GothamBold
     eggSelect.TextSize = 13
-    eggSelect.Text = "Select Egg Dropdown ▼"
+    eggSelect.Text = "Select Egg Dropdown"
     eggSelect.Parent = eggFrame
 
     local eggSelectCorner = Instance.new("UICorner")
@@ -3222,7 +3744,7 @@ task.spawn(function()
             bestOption.Font = Enum.Font.GothamBold
             bestOption.TextSize = 13
             bestOption.TextWrapped = true
-            bestOption.Text = string.format("★ Best chance: %s (%.4g%%)", bestEgg.Name, getEggBestChance(bestEgg))
+            bestOption.Text = string.format("Best chance: %s (%.4g%%)", bestEgg.Name, getEggBestChance(bestEgg))
             bestOption.Parent = eggOptions
 
             local bestCorner = Instance.new("UICorner")
@@ -3261,7 +3783,7 @@ task.spawn(function()
                     eggSelect.Text = "Egg: " .. egg.Name
                     eggOptions.Visible = true
                     chanceMode = "Eggs"
-                    
+
                     for modeKey, btnObj in pairs(subTabButtons) do
                         if modeKey == "Eggs" then
                             btnObj.BackgroundColor3 = activeTheme.accent
@@ -3341,17 +3863,17 @@ task.spawn(function()
     addEggModeButton("Secrets", 0.606, "Secret")
     addEggModeButton("Gargantuans", 0.808, "Gargantuan")
 
-    eggSelect.MouseButton1Click:Connect(function() 
+    eggSelect.MouseButton1Click:Connect(function()
         if chanceMode == "Eggs" then
-            eggOptions.Visible = not eggOptions.Visible 
+            eggOptions.Visible = not eggOptions.Visible
         end
     end)
-    
+
     eggSearch:GetPropertyChangedSignal("Text"):Connect(function()
         rebuildEggOptions()
         eggOptions.Visible = (chanceMode == "Eggs")
     end)
-    
+
     rebuildEggOptions()
     eggSelect.Text = bestChanceEgg and ("Selected: " .. bestChanceEgg.Name) or "Select an egg"
     selectEggSubTab("Eggs", subTabButtons["Eggs"])
@@ -3565,7 +4087,6 @@ task.spawn(function()
         end
     end)
 
-    local AutoBuying = false
     local ToggleKey = Enum.KeyCode[CurrentKeyName] or Enum.KeyCode.LeftControl
 
     updateAfkSessionLabels = function()
@@ -3620,6 +4141,18 @@ task.spawn(function()
     end
 
     createUnifiedToggle(hatchFrame, 326, "AFK CPU Reducer", false, function(value) setAfkMode(value) end)
+
+    -- Wrapped in a block purely to keep its locals out of the UI thread's
+    -- register budget (Luau caps a function at 200 registers).
+    -- `recentCategories` is declared here, at thread scope, because the hatch
+    -- panel, the AFK panel and the webhook module all read it.
+    local recentCategories = {
+        { name = "Huge", entries = recentHuges, color = Color3.fromRGB(100, 255, 100) },
+        { name = "Secret", entries = recentSecrets, color = Color3.fromRGB(215, 150, 255) },
+        { name = "Titanic", entries = recentTitanics, color = Color3.fromRGB(160, 220, 255) },
+        { name = "Gargantuan", entries = recentGargantuans, color = Color3.fromRGB(255, 180, 200) },
+    }
+    do
     local recentPanel = Instance.new("Frame")
     recentPanel.Name = "RecentHatchesPanel"
     recentPanel.Size = UDim2.new(1, -6, 0, 150)
@@ -3647,13 +4180,6 @@ task.spawn(function()
     recentTitle.TextSize = 13
     recentTitle.TextXAlignment = Enum.TextXAlignment.Left
     recentTitle.Parent = recentPanel
-
-    local recentCategories = {
-        { name = "Huge", entries = recentHuges, color = Color3.fromRGB(100, 255, 100) },
-        { name = "Secret", entries = recentSecrets, color = Color3.fromRGB(215, 150, 255) },
-        { name = "Titanic", entries = recentTitanics, color = Color3.fromRGB(160, 220, 255) },
-        { name = "Gargantuan", entries = recentGargantuans, color = Color3.fromRGB(255, 180, 200) },
-    }
 
     for index, category in ipairs(recentCategories) do
         local column = Instance.new("Frame")
@@ -3712,7 +4238,7 @@ task.spawn(function()
                     local label = Instance.new("TextLabel")
                     label.Size = UDim2.new(1, -2, 0, 20)
                     label.BackgroundTransparency = 1
-                    label.Text = "✓ " .. tostring(entryData.name)
+                    label.Text = "- " .. tostring(entryData.name)
                     label.TextColor3 = listData.color
                     label.Font = Enum.Font.GothamMedium
                     label.TextSize = 12
@@ -3726,6 +4252,7 @@ task.spawn(function()
         end
     end
     renderHatchRecent()
+    end
 
     -- =====================================================================
     -- ISOLATED WEBHOOK MODULE
@@ -3949,19 +4476,19 @@ task.spawn(function()
 
         local function makePayload(testMessage, category, petName, totals)
             local fields = {
-                {name="🐯 Huges", value="**"..numberText(totals.Huge).."**", inline=true},
-                {name="🌌 Secrets", value="**"..numberText(totals.Secret).."**", inline=true},
-                {name="🚢 Titanics", value="**"..numberText(totals.Titanic).."**", inline=true},
-                {name="👑 Gargantuans", value="**"..numberText(totals.Gargantuan).."**", inline=true}
+                {name="Huges", value="**"..numberText(totals.Huge).."**", inline=true},
+                {name="Secrets", value="**"..numberText(totals.Secret).."**", inline=true},
+                {name="Titanics", value="**"..numberText(totals.Titanic).."**", inline=true},
+                {name="Gargantuans", value="**"..numberText(totals.Gargantuan).."**", inline=true}
             }
             return {
                 username="Pet Dimensions Hub",
                 embeds={{
-                    title=testMessage and "🧪 Webhook Test" or ("✨ New "..tostring(category).."!"),
+                    title=testMessage and "Webhook Test" or ("New "..tostring(category).."!"),
                     description=testMessage and "Your rare-pet webhook is connected." or ("## "..tostring(petName or "Unknown Pet")),
                     color=5793266,
                     fields=fields,
-                    footer={text="Pet Dimensions Hub • Rare Hatch Tracker"},
+                    footer={text="Pet Dimensions Hub - Rare Hatch Tracker"},
                     timestamp=os.date("!%Y-%m-%dT%H:%M:%SZ")
                 }}
             }
@@ -4085,6 +4612,7 @@ task.spawn(function()
     end)
 
     -- AFK RARE PETS PANEL
+    do
     local afkRarePanel = Instance.new("Frame")
     afkRarePanel.Name = "AfkRarePanel"
     afkRarePanel.Size = UDim2.new(1, 0, 0, 440)
@@ -4186,7 +4714,7 @@ task.spawn(function()
                     label.Size = UDim2.new(1, 0, 0, 32)
                     label.Position = UDim2.new(0, 0, 0, (entryIndex - 1) * 34)
                     label.BackgroundTransparency = 1
-                    label.Text = "✓ " .. tostring(entryData.name)
+                    label.Text = "- " .. tostring(entryData.name)
                     label.TextColor3 = listData.color
                     label.Font = Enum.Font.Gotham
                     label.TextSize = 19
@@ -4196,6 +4724,7 @@ task.spawn(function()
                 end
             end
         end
+    end
     end
 
     local childNodes = ReplicatedStorage:GetChildren()
@@ -4251,105 +4780,137 @@ task.spawn(function()
     end
     task.spawn(hookLeaderstats)
 
-    -- AUTO-HATCH
-    -- Match the game's own Eggs controller: it uses the Library network
-    -- endpoint "Buy Egg" and passes the multi/triple flags as the final
-    -- arguments. The custom toggle below drives this directly so it does not
-    -- depend on a ReplicatedStorage child index or on the visual auto-hatch UI.
-    local HatchBusy = false
+-- AUTO-HATCH
+-- The game already ships a complete auto-hatch driver in
+-- `Scripts.Game.Auto Hatch`: it runs on a 0.1s tick, gates on
+-- `Library.Variables.OpeningEgg <= 0`, keeps its own 0.8s cooldown and calls
+-- `Library.Network.Invoke("BuyX Egg", eggId)` (NOT "Buy Egg"). The old version
+-- of this script fired "Buy Egg" every 0.2s *and* set the same variables, so it
+-- raced the game's own loop - two concurrent buy requests, "too quickly"
+-- rejections, doubled egg-open FX and a frame-rate hit every hatch.
+--
+-- Now we drive the engine instead of duplicating it:
+--   * primary path  - set AutoHatchEnabled / AutoHatchEggId and let the game buy
+--   * fallback path - only when the account has no Auto Hatch gamepass, run a
+--                     "BuyX Egg" loop with the game's own 0.8s cadence and the
+--                     same OpeningEgg gate
+--   * watchdog      - re-asserts the variables if anything clears them, and
+--                     backs off instead of hammering on hard failures
+local function ownsAutoHatchGamepass()
+    local ok, pass = pcall(function()
+        local entry = Library.Directory.Gamepasses["Auto Hatch"]
+        return entry and Library.Gamepasses.Owns(entry.ID)
+    end)
+    return ok and pass == true
+end
 
-    local function getHatchMode()
-        local triple = false
-        local multi = false
+local function hatchViaBuyX()
+    if os.clock() < HatchCooldownUntil then return end
+    if (tonumber(Library.Variables.OpeningEgg) or 0) > 0 then return end
+    local ok, canAct = pcall(function() return Library.WorldCmds.CanDoAction() end)
+    if ok and canAct == false then return end
 
-        pcall(function()
-            local save = Library.Save.Get()
-            if not save then return end
+    HatchCooldownUntil = os.clock() + 0.8
+    local invoked, result, err = pcall(function()
+        return Library.Network.Invoke("BuyX Egg", SelectedEggId)
+    end)
 
-            local multiHatch = tonumber(save.MultiHatch) or 1
-            local ownsOctuple = save.OwnsOctupleEggs == true
-
-            -- Mirror the game's available hatch-slot calculation. If the
-            -- account has multi/extra hatch capacity, request multi-hatch;
-            -- otherwise request one egg, which the server always accepts
-            -- when the selected egg itself is valid/affordable.
-            if multiHatch > 1 or ownsOctuple then
-                multi = true
-            end
-        end)
-
-        return triple, multi
+    if not invoked then
+        HatchFailures += 1
+    elseif result == true then
+        HatchFailures = 0
+        HatchLastEgg = os.clock()
+        HatchWatchdogStatus = "hatching via BuyX Egg"
+    elseif type(err) == "string" and err:find("too quickly") then
+        -- Expected back-pressure from the server. Silent, but back off a little
+        -- harder so a rejected request cannot snowball into a retry storm.
+        HatchCooldownUntil = os.clock() + 1.0
+    else
+        HatchFailures += 1
+        HatchWatchdogStatus = "buy failed: " .. tostring(err)
     end
 
-    local function hatchSelectedEgg()
-        if HatchBusy or not AutoBuying or not SelectedEggId then
-            return false
+    if HatchFailures >= 5 then
+        HatchCooldownUntil = os.clock() + 10
+        HatchFailures = 0
+    end
+end
+
+local function pushHatchState()
+    pcall(function()
+        Library.Variables.AutoHatchEggId = SelectedEggId
+        Library.Variables.AutoHatchEnabled = true
+    end)
+end
+
+local function clearHatchState()
+    pcall(function()
+        Library.Variables.AutoHatchEggId = nil
+        Library.Variables.AutoHatchEnabled = false
+    end)
+end
+
+local ownsPassCached, ownsPassRefreshAt = false, 0
+task.spawn(function()
+    local wasOn = false
+    while true do
+        if AutoBuying and SelectedEggId then
+            wasOn = true
+            pushHatchState()
+            if os.clock() >= ownsPassRefreshAt then
+                ownsPassCached = ownsAutoHatchGamepass()
+                ownsPassRefreshAt = os.clock() + 10
+            end
+            if ownsPassCached then
+                HatchWatchdogStatus = "auto hatch running (engine)"
+                task.wait(1)
+            else
+                -- No gamepass: we are the driver. hatchViaBuyX enforces the
+                -- game's 0.8s server cooldown itself, so poll quickly instead
+                -- of sleeping a full second between attempts.
+                hatchViaBuyX()
+                task.wait(0.1)
+            end
+        else
+            -- Only touch the engine state on the transition, so a hatch the
+            -- player started from the game's own UI is not fought over.
+            if wasOn then
+                clearHatchState()
+                wasOn = false
+            end
+            HatchWatchdogStatus = "Idle"
+            task.wait(0.5)
         end
-
-        HatchBusy = true
-        local success = false
-
-        pcall(function()
-            local triple, multi = getHatchMode()
-
-            -- This is the exact network endpoint used by the game's Eggs
-            -- controller (Eggs source: Library.Network.Invoke("Buy Egg", ...)).
-            local result, err = Library.Network.Invoke(
-                "Buy Egg",
-                SelectedEggId,
-                triple,
-                false,
-                multi
-            )
-
-            if result == true then
-                success = true
-            end
-
-            -- If multi-hatch was rejected/unavailable, retry exactly once as
-            -- a normal single egg. This keeps auto-hatch working regardless of
-            -- the account's current hatch entitlement.
-            if not success and multi and AutoBuying and SelectedEggId then
-                local singleResult = Library.Network.Invoke(
-                    "Buy Egg",
-                    SelectedEggId,
-                    false,
-                    false,
-                    false
-                )
-                success = singleResult == true
-            end
-        end)
-
-        HatchBusy = false
-        return success
     end
+end)
 
-    -- Keep the game's auto-hatch variables synchronized as well. The actual
-    -- purchase is still performed through the same Buy Egg endpoint above.
-    local function setAutoHatchState(enabled)
-        AutoBuying = enabled
-        pcall(function()
-            Library.Variables.AutoHatchEggId = enabled and SelectedEggId or nil
-            Library.Variables.AutoHatchEnabled = enabled
-        end)
+-- Keep the toggle in sync with the real engine state so the UI never lies.
+task.spawn(function()
+    while true do
+        if AutoBuying then
+            if Library.Variables.AutoHatchEggId ~= SelectedEggId
+                or Library.Variables.AutoHatchEnabled ~= true then
+                pushHatchState()
+            end
+        end
+        task.wait(3)
     end
+end)
+
+local function setAutoHatchState(enabled)
+    AutoBuying = enabled
+    if enabled then
+        pushHatchState()
+    else
+        clearHatchState()
+    end
+end
+
 
     -- Rebind the toggle to the real hatch state instead of only changing the
     -- custom AutoBuying flag.
-    createUnifiedToggle(hatchFrame, 368, "⚡ Auto-Hatch Egg", false, function(value)
+    createUnifiedToggle(hatchFrame, 368, "Auto-Hatch Egg", false, function(value)
         setAutoHatchState(value)
-    end)
-
-    task.spawn(function()
-        while true do
-            if AutoBuying and SelectedEggId then
-                hatchSelectedEgg()
-                task.wait(0.20)
-            else
-                task.wait(0.10)
-            end
-        end
     end)
 
     -- =====================================================================
@@ -4370,7 +4931,7 @@ task.spawn(function()
     tpTip.Size = UDim2.new(1, 0, 0, 42)
     tpTip.Position = UDim2.new(0, 0, 0, 24)
     tpTip.BackgroundTransparency = 1
-    tpTip.Text = "⚠ Only teleport to the spots in the same world as you are currently in. It will glitch if you teleport to a different world."
+    tpTip.Text = "Only teleport to the spots in the same world as you are currently in. It will glitch if you teleport to a different world."
     tpTip.TextColor3 = Color3.fromRGB(255, 190, 80)
     tpTip.Font = Enum.Font.GothamSemibold
     tpTip.TextSize = 11
@@ -4426,7 +4987,7 @@ task.spawn(function()
         local button = Instance.new("TextButton")
         button.Size = UDim2.new(1, -8, 0, 34)
         button.BackgroundColor3 = activeTheme.surface
-        button.Text = "📍 Teleport to " .. name
+        button.Text = "Teleport to " .. name
         button.TextColor3 = Color3.fromRGB(255, 255, 255)
         button.Font = Enum.Font.GothamBold
         button.TextSize = 13
@@ -4640,14 +5201,14 @@ task.spawn(function()
     end
 	end)
 
-	-- ═════════════════════════════════════════════════════════════════════════════
--- 🎃 HALLOWEEN MAZE v4  (self-contained; docks into the Pet Dimensions Hub as a "Maze" tab)
+	--
+--  HALLOWEEN MAZE v4  (self-contained; docks into the Pet Dimensions Hub as a "Maze" tab)
 --   * time-aware scarecrow planner: it treats the scarecrow as a 1-cell hitbox and only enters a cell
 --     if it can be in AND out of it before the scarecrow could get within one cell of it
 --   * hatching is part of the same walk loop, so fleeing / waiting / re-entering the egg is one state machine
 --   * PIN MAP is polled (not event driven) so it can't desync from the hub's minimise button
 -- Embedded in the combined hub script; this section runs after the hub UI is built.
--- ═════════════════════════════════════════════════════════════════════════════
+--
 task.spawn(function()
 local env = _G
 if type(getgenv) == "function" then
@@ -4860,8 +5421,27 @@ local function pathTo(prev, src, dst)
 	while c ~= nil do table.insert(r, 1, c); if c == src then return r end; c = prev[c] end
 	return nil
 end
+-- CellXZ is called thousands of times per plan (every neighbour lookup, every
+-- sight ray, every aim point). It is pure for a given grid size, so it is
+-- memoised here instead of recomputed on each BFS expansion.
+local xzCache = {}
+local function cellXZ(n, cell)
+	local key = n
+	local row = xzCache[key]
+	if not row then
+		row = table.create(1024)
+		xzCache[key] = row
+	end
+	local pair = row[cell]
+	if not pair then
+		local x, z = Common.CellXZ(n, cell)
+		pair = {x, z}
+		row[cell] = pair
+	end
+	return pair[1], pair[2]
+end
 local function cellPos(st, i)
-	local x, z = Common.CellXZ(st.n, i)
+	local x, z = cellXZ(st.n, i)
 	return st.origin + Vector3.new(x * st.cs, 0, z * st.cs)
 end
 local function posCell(st, p)
@@ -4894,16 +5474,16 @@ local function sightCells(st, g, cell)
 	local cached = g.sight[cell]
 	if cached then return cached[1], cached[2] end
 	local vis, order = {[cell] = 0}, {cell}
-	local x0, z0 = Common.CellXZ(st.n, cell)
+	local x0, z0 = cellXZ(st.n, cell)
 	for _, first in ipairs(nbrs(g, cell)) do
-		local fx, fz = Common.CellXZ(st.n, first)
+		local fx, fz = cellXZ(st.n, first)
 		local dx, dz = fx - x0, fz - z0
 		local cur, cx, cz, k = first, fx, fz, 1
 		while cur do
 			if vis[cur] == nil then vis[cur] = k; order[#order + 1] = cur end
 			local nxt, nxx, nxz
 			for _, nb in ipairs(nbrs(g, cur)) do
-				local nx, nz = Common.CellXZ(st.n, nb)
+				local nx, nz = cellXZ(st.n, nb)
 				if math.abs(nx - cx - dx) < 1e-3 and math.abs(nz - cz - dz) < 1e-3 then nxt, nxx, nxz = nb, nx, nz; break end
 			end
 			cur, cx, cz, k = nxt, nxx, nxz, k + 1
@@ -4952,7 +5532,7 @@ local function scareCps(st, hunting)
 	return math.max(v * 1.08, 0.3)
 end
 
--- ── v5 scarecrow avoidance ────────────────────────────────────────────────────────────────────
+--  v5 scarecrow avoidance
 local MARGIN_BASE, MARGIN_FACING = 1.0, 1.2 -- cells we keep from the scarecrow; larger if it faces / heads for us
 local FACE_SIGN = 1                          -- verified: the client pivots the model with lookAt(pos, pos+heading), so LookVector = facing
 local BLOCK_HIDE = 25                     -- seconds we hide out of sight before creeping back to slip past
@@ -5032,6 +5612,27 @@ local function safeSearch(g, me, ctx, maxSteps)
 	end
 	return steps, prev
 end
+
+-- How many moves from `cell` to the nearest cell with 3+ exits. Standing deep
+-- in a corridor is what gets you cornered, so refuge scoring now uses the
+-- actual junction distance instead of a boolean "is this a dead end".
+local function junctionDepth(g, cell)
+	g.jd = g.jd or {}
+	local d = g.jd[cell]
+	if d then return d end
+	local seen, q, h = {[cell] = 0}, {cell}, 1
+	local best = 99
+	while q[h] do
+		local c = q[h]; h += 1
+		local step = seen[c]
+		if step > 0 and #nbrs(g, c) >= 3 then best = step; break end
+		for _, nb in ipairs(nbrs(g, c)) do
+			if seen[nb] == nil then seen[nb] = step + 1; q[#q + 1] = nb end
+		end
+	end
+	g.jd[cell] = best
+	return best
+end
 -- dead-end branch info: returns mouth cell (first junction outside the branch) and depth, or nil if `cell` is not in a dead end
 local function branchInfo(g, cell)
 	g.trap = g.trap or {}
@@ -5057,9 +5658,9 @@ local function dodgeShape(g, c)
 	if dangling(g)[c] then return 0 end
 	local n = nbrs(g, c)
 	if #n ~= 2 then return 0 end
-	local x0, z0 = Common.CellXZ(g.n, c)
-	local x1, z1 = Common.CellXZ(g.n, n[1])
-	local x2, z2 = Common.CellXZ(g.n, n[2])
+	local x0, z0 = cellXZ(g.n, c)
+	local x1, z1 = cellXZ(g.n, n[1])
+	local x2, z2 = cellXZ(g.n, n[2])
 	if math.abs(x1 + x2 - 2 * x0) > 1e-3 or math.abs(z1 + z2 - 2 * z0) > 1e-3 then return 2 end
 	if #nbrs(g, n[1]) == 2 or #nbrs(g, n[2]) == 2 then return 1.5 end
 	return 0
@@ -5072,6 +5673,8 @@ local function pickRefuge(g, me, ctx, steps, prevTarget, gd)
 			local sc = math.min(slack(ctx, c, s * ctx.ct), 8) + math.min(ctx.dist[c] or 20, 14) * 0.5 - s * 0.2 + dodgeShape(g, c) * 1.5
 			if dang[c] then sc -= 12 end
 			if #nbrs(g, c) >= 3 then sc += 1.5 end
+			local jd = junctionDepth(g, c)
+			if jd >= 99 then sc -= 8 elseif jd <= 1 then sc += 2 end
 			if gd and gd[c] then sc -= gd[c] * 0.15 end
 			if c == prevTarget then sc += 2.5 end
 			if not bs or sc > bs then best, bs = c, sc end
@@ -5155,14 +5758,45 @@ local function decide(st, g, me, goal, ps, opts)
 		return pathTo(p, me, goal), "clear", nil, nil
 	end
 	local now = os.clock()
-	local R = ctx.hunting and 3 or (ctx.face and 2.2 or 2)  -- bubble radius in cells (path distance)
-	if ps.blocked and now - ps.blocked > 5 then R = math.min(R, 1.2) end -- never wait long
+
+	-- PANIC: our own cell is already unsafe (or about to be). No objective
+	-- matters right now, so drop everything and run. This check comes before
+	-- every other branch because it is the only one that is time-critical.
+	if slack(ctx, me, 0) < 0.25 then
+		local ep = O.escape and escapePath(g, me, ctx) or nil
+		if ep and #ep > 1 then return ep, "ESCAPING", nil, ctx end
+		if not O.escape then
+			local bd = d[me]
+			return {me}, "trapped", nil, ctx
+		end
+		return {me}, "trapped", nil, ctx
+	end
+
 	local d = ctx.dist
+
+	-- Preferred route: a time-aware search. Unlike the bubble below it only
+	-- rejects a cell when the scarecrow could actually reach us by the time we
+	-- would be standing there, which lets it use long safe corridors the bubble
+	-- would refuse, and refuses cells the bubble would happily walk into.
+	local safeSteps, safePrev = safeSearch(g, me, ctx, math.min(g.n * g.n, 900))
+	if safeSteps[goal] then
+		ps.blocked = nil
+		local route = pathTo(safePrev, me, goal)
+		if route and #route > 1 and not routeBlocked(g, route, ctx, me) then
+			return route, "go", slack(ctx, goal, (#route - 1) * ctx.ct), ctx
+		end
+	end
+
+	-- Fallback: hard bubble around the scarecrow, shrunk once we have been
+	-- stuck for a while so we never sit and wait indefinitely.
+	local R = ctx.hunting and 3 or (ctx.face and 2.2 or 2)
+	if ps.blocked and now - ps.blocked > 5 then R = math.min(R, 1.2) end
 	local function bad(c) return (d[c] or 99) <= R end
-	if bad(me) then
+	if O.escape and bad(me) then
 		local ep = escapePath(g, me, ctx)
 		if ep and #ep > 1 then return ep, "ESCAPING", nil, ctx end
 	end
+
 	local mouth, depth = branchInfo(g, goal)
 	local trapBad = mouth and ctx.hunting and goal ~= me and (d[mouth] or 99) <= depth + 4
 	local prev, dep = bfsAvoid(g, me, bad)
@@ -5170,14 +5804,25 @@ local function decide(st, g, me, goal, ps, opts)
 		ps.blocked = nil
 		return pathTo(prev, me, goal), "go", nil, ctx
 	end
+
+	-- No route to the goal at all: retreat to the best reachable refuge,
+	-- scored with the same time-aware slack the main search uses.
 	ps.blocked = ps.blocked or now
-	local dang, best, bs = dangling(g), nil, nil
+	local refugeSteps, refugePrev = safeSearch(g, me, ctx, 24)
+	local best = pickRefuge(g, me, ctx, refugeSteps, ps.retreat, nil)
+	if best and best ~= me then
+		ps.retreat = best
+		local rp = pathTo(refugePrev, me, best)
+		if rp and #rp > 1 then return rp, "BACKING OFF", nil, ctx end
+	end
+
+	local dang, best2, bs = dangling(g), nil, nil
 	for c, n in pairs(dep) do
 		local sc = math.min(d[c] or 20, 8) - n * 0.3 + dodgeShape(g, c) - (dang[c] and 8 or 0) + (c == me and 2 or 0) + (c == ps.retreat and 3 or 0)
-		if not bs or sc > bs then best, bs = c, sc end
+		if not bs or sc > bs then best2, bs = c, sc end
 	end
-	ps.retreat = best
-	if best and best ~= me then return pathTo(prev, me, best), "BACKING OFF", nil, ctx end
+	ps.retreat = best2
+	if best2 and best2 ~= me then return pathTo(prev, me, best2), "BACKING OFF", nil, ctx end
 	return {me}, "waiting", nil, ctx
 end
 -- cells we can walk to (plain BFS; the scarecrow bubble only matters for the main route)
@@ -5216,13 +5861,14 @@ local function drawRoute(st, route, tp, y, firstIndex)
 	local lastPx, lastPz
 	for i = startAt, #route do
 		local p = cellPos(st, route[i])
-		local px, pz = Common.CellXZ(st.n, route[i])
-		local isTurn = i == startAt or i == #route
-		if not isTurn and lastPx then
-			local prev = route[i - 1]
-			local ppx, ppz = Common.CellXZ(st.n, prev)
-			local nextC = route[i + 1]
-			local npx, npz = Common.CellXZ(st.n, nextC)
+		local px, pz = cellXZ(st.n, route[i])
+    local isTurn = i == startAt or i == #route
+        if not isTurn and lastPx then
+            local prev = route[i - 1]
+            local ppx, ppz = cellXZ(st.n, prev)
+            local nextC = route[i + 1]
+            local npx, npz = cellXZ(st.n, nextC)
+
 			if (npx - px) ~= (px - ppx) or (npz - pz) ~= (pz - ppz) then isTurn = true end
 		end
 		if isTurn then
@@ -5281,15 +5927,15 @@ local function refreshESP()
 	if not (st and mz) then espSweep(); return end
 	for _, egg in ipairs(getEggs()) do
 		local mult, left, name = eggLuck(st, egg)
-		espSet(egg, anyPart(egg), "🥚 " .. tostring(name or egg:GetAttribute("ID") or "Egg") .. luckText(mult, left),
+		espSet(egg, anyPart(egg), "Egg: " .. tostring(name or egg:GetAttribute("ID") or "Egg") .. luckText(mult, left),
 			mult >= 100 and COL.luck or COL.egg, 200, 36)
 	end
 	local fl = mz:FindFirstChild("MazeFloor"); local ex = fl and fl:FindFirstChild("Exit")
-	if ex then espSet(ex, anyPart(ex), "🚪 EXIT", COL.exit, 120, 30) end
+	if ex then espSet(ex, anyPart(ex), "EXIT", COL.exit, 120, 30) end
 	local sc = mz:FindFirstChild("Scarecrow")
-	if sc then espSet(sc, anyPart(sc), "🎃 SCARECROW" .. scareText, COL.scare, 200, 34) end
+	if sc then espSet(sc, anyPart(sc), "SCARECROW" .. scareText, COL.scare, 200, 34) end
 	if O.candyEsp then
-		for _, c in ipairs(candyModels()) do espSet(c, anyPart(c), "🍬", COL.candy, 26, 26) end
+		for _, c in ipairs(candyModels()) do espSet(c, anyPart(c), " ", COL.candy, 26, 26) end
 	end
 	espSweep()
 end
@@ -5300,13 +5946,13 @@ local function aimPoint(st, route, root, tp, routeIndex)
     local first = routeIndex or 1
     if #route - first < 1 then return Vector3.new(tp.X, root.Position.Y, tp.Z) end
     local nextIndex = first + 1
-    local x0, z0 = Common.CellXZ(st.n, route[first])
-    local x1, z1 = Common.CellXZ(st.n, route[nextIndex])
+    local x0, z0 = cellXZ(st.n, route[first])
+    local x1, z1 = cellXZ(st.n, route[nextIndex])
 	local dx, dz = x1 - x0, z1 - z0
     local last = nextIndex
     for i = nextIndex + 1, #route do
-		local px, pz = Common.CellXZ(st.n, route[i - 1])
-		local cx, cz = Common.CellXZ(st.n, route[i])
+		local px, pz = cellXZ(st.n, route[i - 1])
+		local cx, cz = cellXZ(st.n, route[i])
 		if math.abs(cx - px - dx) > 1e-3 or math.abs(cz - pz - dz) > 1e-3 then break end
 		last = i
 	end
@@ -5349,8 +5995,8 @@ local function walk(token, getTarget, stop, label, opts)
 		local g = grid(st)
 		local me, goal = posCell(st, root.Position), posCell(st, tp)
 		if not (me and goal) then task.wait(0.1); continue end
-		local now = os.clock()
-		if opts.interrupt and now - lastInt >= 0.3 then
+        local now = os.clock()
+        if opts.interrupt and now - lastInt >= 0.3 then
 			lastInt = now
 			if opts.interrupt(st, root) then hum:MoveTo(root.Position); return "reconsider" end
 		end
@@ -5362,7 +6008,10 @@ local function walk(token, getTarget, stop, label, opts)
             routeIndex = routeIndexFor(route, me, 1)
         end
         if routeIndex then routeCursor = routeIndex end
-        local replanInterval = 0.35
+        -- Holding a position is a stable state: there is no point burning a
+        -- planning pass and a MoveTo every 80ms while we stand on an egg.
+        local holding = atGoal and opts.onHold and (goal == me or not route or #route - routeCursor <= 0)
+        local replanInterval = holding and 0.5 or 0.35
         local needsPlan = not plannedAt or now - plannedAt >= replanInterval or goal ~= plannedGoal
             or (route and not routeIndex)
         if needsPlan then
@@ -5372,15 +6021,14 @@ local function walk(token, getTarget, stop, label, opts)
         end
 		if not route then
             if activeAim then hum:MoveTo(root.Position); activeAim = nil end
-            setStatus("⏳ no route"); task.wait(0.15); continue
+            setStatus("no route"); task.wait(0.25); continue
         end
         if not routeIndex then
             if activeAim then hum:MoveTo(root.Position); activeAim = nil end
-            setStatus("⏳ replanning route"); task.wait(0.1); continue
+            setStatus("replanning route"); task.wait(0.15); continue
 		end
 		if hum.WalkSpeed ~= O.speed then hum.WalkSpeed = O.speed end
         local mode, s0v = routeMode, routeSpare
-        local holding = atGoal and opts.onHold and (goal == me or (#route - (routeCursor or 1) <= 0))
 		if holding then
 			waitStart = now
 			hum:MoveTo(root.Position)
@@ -5412,16 +6060,17 @@ local function walk(token, getTarget, stop, label, opts)
         if needsPlan and now - lastDraw >= 0.2 then
 			lastDraw = now
             drawRoute(st, route, movementTarget, root.Position.Y, routeCursor)
-			setStatus(("→ %s  [%s%s]"):format(label, mode, s0v and (" · spare %.1fs"):format(s0v) or ""))
+			setStatus(("-> %s  [%s%s]"):format(label, mode, s0v and (" spare %.1fs"):format(s0v) or ""))
 		end
 		if aim and now - lastT > 1.2 then
             if lastPos and hdist(root.Position, lastPos) < 1 and activeAim then hum:MoveTo(activeAim) end
 			lastPos, lastT = root.Position, now
 		end
-		task.wait(0.08)
+		task.wait((not aim or mode == "waiting" or mode == "trapped") and 0.15 or 0.08)
 	end
 	return "cancelled"
 end
+
 
 local eggWork
 local candyIgnore = setmetatable({}, {__mode = "k"})
@@ -5448,7 +6097,7 @@ local function collectCandy(token)
 			if #candyModels() == 0 then return "done" end
 			idleSince = idleSince or os.clock()
 			if os.clock() - idleSince > 6 then return "skipped" end
-			setStatus("⏳ candy near scarecrow..."); task.wait(0.3); continue
+			setStatus("candy near scarecrow..."); task.wait(0.3); continue
 		end
 		idleSince = nil
 		local r = walk(token, function() if c.Parent then return posOf(c) end end, CANDY_STOP, "Candy", {timeout = 25, interrupt = function(s) return autoOn and eggWork(s) end})
@@ -5506,7 +6155,7 @@ local function hatchAt(token, egg, force)
 			setAutoHatch(true, name)
 		end
 		tHatch += dt
-		setStatus(("🥚 hatching %s%s  [%ds%s]"):format(name, luckText(mult, left), tHatch, cfg.hatchSeconds > 0 and ("/" .. cfg.hatchSeconds) or ""))
+		setStatus(("hatching %s%s  [%ds%s]"):format(name, luckText(mult, left), tHatch, cfg.hatchSeconds > 0 and ("/" .. cfg.hatchSeconds) or ""))
 		if cfg.hatchSeconds > 0 and tHatch >= cfg.hatchSeconds then rejected[egg] = "done"; return "done" end
 	end
 	local r = walk(token, function() if egg.Parent then return posOf(egg) end end,
@@ -5695,8 +6344,8 @@ local function autoLoop(token)
 				break
 			end
 			if os.clock() - t > 8 then break end
-			
-			setStatus("✅ at exit, waiting for next floor..."); task.wait(0.2)
+
+			setStatus("at exit, waiting for next floor..."); task.wait(0.2)
 		end
 		if eggsAppeared then continue end
 		task.wait(0.5)
@@ -5718,7 +6367,7 @@ end
 local function stopAll(msg)
 	moveToken += 1; autoOn = false; jobRunning = false; preview = nil
 	setAutoHatch(false)
-	refreshAutoBtn(); stopMotion(); clearPath(); setStatus(msg or "🛑 Stopped")
+	refreshAutoBtn(); stopMotion(); clearPath(); setStatus(msg or "Stopped")
 end
 local function startJob(fn)
 	moveToken += 1
@@ -5737,9 +6386,9 @@ local function moveExit() startJob(function(t) walk(t, exitTarget, EXIT_STOP, "E
 local function pathEgg(egg) preview = {get = function() if egg.Parent then return posOf(egg) end end} end
 local function pathExit() preview = {get = function(st) return exitTarget(st) end} end
 
--- ═════════════════════════════════════════════════════════════════════════════
+--
 -- UI
--- ═════════════════════════════════════════════════════════════════════════════
+--
 local old = PlayerGui:FindFirstChild("HalloweenMazeUI"); if old then old:Destroy() end
 local oldPin = PlayerGui:FindFirstChild("HMV2_Pin"); if oldPin then oldPin:Destroy() end
 
@@ -5835,7 +6484,7 @@ local function dropdown(parent, size, getText, getItems, onPick)
 		for _, c in ipairs(list:GetChildren()) do if c:IsA("TextButton") then c:Destroy() end end
 		for i, it in ipairs(getItems()) do
 			local b = new("TextButton", {Size = UDim2.new(1, 0, 0, 26), BackgroundColor3 = Color3.fromRGB(42, 42, 50),
-				Text = (it.checked and "● " or "   ") .. it.text, TextColor3 = COL.white, Font = Enum.Font.GothamBold, TextSize = 12,
+				Text = (it.checked and "[*] " or "[ ] ") .. it.text, TextColor3 = COL.white, Font = Enum.Font.GothamBold, TextSize = 12,
 				BorderSizePixel = 0, ZIndex = 61, LayoutOrder = i, TextXAlignment = Enum.TextXAlignment.Left}, list)
 			b:SetAttribute("ThemeLocked", true)
 			bind(b.MouseButton1Click, function() onPick(it.key); btn.Text = getText(); closeDD() end)
@@ -5859,14 +6508,14 @@ end
 local tabBtn, hubBtns, origTab = nil, {}, {}
 local selColor, unselColor = Color3.fromRGB(60, 140, 220), Color3.fromRGB(32, 32, 42)
 if ownGui then
-	label(titleBar, "🎃 HALLOWEEN MAZE v4", UDim2.new(1, -80, 1, 0), COL.white, 17).Position = UDim2.fromOffset(10, 0)
+	label(titleBar, "HALLOWEEN MAZE v4", UDim2.new(1, -80, 1, 0), COL.white, 17).Position = UDim2.fromOffset(10, 0)
 	local minimized = false
-	button(titleBar, "–", UDim2.fromOffset(26, 24), Color3.fromRGB(60, 60, 70), function()
+	button(titleBar, " ", UDim2.fromOffset(26, 24), Color3.fromRGB(60, 60, 70), function()
 		closeDD(); minimized = not minimized
 		Root.Visible = not minimized
 		Win.Size = minimized and UDim2.fromOffset(W + 24, 36) or UDim2.fromOffset(W + 24, H + 50)
 	end).Position = UDim2.new(1, -62, 0, 6)
-	button(titleBar, "✕", UDim2.fromOffset(26, 24), Color3.fromRGB(120, 45, 45), function() env.HMV2.Destroy() end).Position = UDim2.new(1, -32, 0, 6)
+	button(titleBar, " ", UDim2.fromOffset(26, 24), Color3.fromRGB(120, 45, 45), function() env.HMV2.Destroy() end).Position = UDim2.new(1, -32, 0, 6)
 	local dragging, dragStart, startPos
 	bind(titleBar.InputBegan, function(i)
 		if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then
@@ -5892,7 +6541,7 @@ else
 		b.Position = UDim2.new((i - 1) / n, 0, 0, 0)
 	end
 	tabBtn = new("TextButton", {Name = "MazeTabButton", Size = UDim2.new(1 / n - 0.006, 0, 1, 0),
-		Position = UDim2.new((n - 1) / n, 0, 0, 0), Text = "🎃 Maze", BackgroundColor3 = unselColor,
+		Position = UDim2.new((n - 1) / n, 0, 0, 0), Text = "Maze", BackgroundColor3 = unselColor,
 		TextColor3 = Color3.fromRGB(180, 180, 190), Font = Enum.Font.GothamBold, TextSize = 12}, hubTabs)
 	corner(tabBtn, 6)
 	new("UIStroke", {Color = Color3.fromRGB(80, 80, 100), Thickness = 1, Transparency = 0.8}, tabBtn)
@@ -5931,8 +6580,8 @@ do
 	new("UIListLayout", {SortOrder = Enum.SortOrder.LayoutOrder}, info)
 	new("UIPadding", {PaddingLeft = UDim.new(0, 8), PaddingTop = UDim.new(0, 2)}, info)
 	floorLbl = label(info, "Floor: -", UDim2.new(1, -8, 0, 22), COL.white, 14)
-	luckLbl = label(info, "🍀 Luck: -", UDim2.new(1, -8, 0, 28), COL.luck, 13)
-	scareLbl = label(info, "🎃 Scarecrow: -", UDim2.new(1, -8, 0, 22), COL.scare, 14)
+	luckLbl = label(info, "Luck: -", UDim2.new(1, -8, 0, 28), COL.luck, 13)
+	scareLbl = label(info, "Scarecrow: -", UDim2.new(1, -8, 0, 22), COL.scare, 14)
 	statusLbl = label(row(22), "Idle", UDim2.fromScale(1, 1), Color3.fromRGB(150, 210, 255), 13)
 	setStatus = function(t)
 		if statusLbl and statusLbl.Parent then statusLbl.Text = t end
@@ -5974,7 +6623,7 @@ do
 	local tg = row(28, true)
 	toggle(tg, "AVOID", "avoid", nil, quarter)
 	toggle(tg, "CANDY1ST", "candyFirst", nil, quarter)
-	toggle(tg, "🍬ESP", "candyEsp", nil, quarter)
+	toggle(tg, "ESP", "candyEsp", nil, quarter)
 	toggle(tg, "ZOOM", "zoom", setZoom, quarter)
 	if O.zoom then setZoom(true) end
 	local tg2 = row(28, true)
@@ -5986,16 +6635,16 @@ do
 	toggle(tg3, "MAP WHEN HIDDEN", "pin", nil, half)
 
 	local ac = row(32, true)
-	button(ac, "🍬 CANDY", third, Color3.fromRGB(110, 90, 30), function() startJob(collectCandy) end)
-	button(ac, "🚪 EXIT", third, Color3.fromRGB(110, 55, 40), moveExit)
+	button(ac, "CANDY", third, Color3.fromRGB(110, 90, 30), function() startJob(collectCandy) end)
+	button(ac, " EXIT", third, Color3.fromRGB(110, 55, 40), moveExit)
 	button(ac, "PATH EXIT", third, Color3.fromRGB(30, 80, 130), pathExit)
 	local ac2 = row(32, true)
 	autoBtn = button(ac2, "AUTO: OFF", third, Color3.fromRGB(70, 60, 90), function()
 		if autoOn then stopAll("Auto stopped"); return end
 		startJob(function(t) autoOn = true; refreshAutoBtn(); autoLoop(t) end)
 	end)
-	button(ac2, "🔍 SCOUT", third, Color3.fromRGB(60, 80, 110), function() startJob(scoutEggs) end)
-	button(ac2, "🛑 STOP (X)", third, Color3.fromRGB(120, 45, 45), function() stopAll() end)
+	button(ac2, "SCOUT", third, Color3.fromRGB(60, 80, 110), function() startJob(scoutEggs) end)
+	button(ac2, "STOP (X)", third, Color3.fromRGB(120, 45, 45), function() stopAll() end)
 end
 
 -- egg settings page
@@ -6011,7 +6660,7 @@ do
 		{600, "10 minutes"}, {0, "Until lucky eggs run out"}}
 	local function timeLabel(seconds)
 		for _, o in ipairs(timeOptions) do
-			if o[1] == seconds then return seconds == 0 and "∞" or (o[2]:gsub(" seconds", "s"):gsub(" minutes?", "m")) end
+			if o[1] == seconds then return seconds == 0 and "forever" or (o[2]:gsub(" seconds", "s"):gsub(" minutes?", "m")) end
 		end
 		return tostring(seconds) .. "s"
 	end
@@ -6030,7 +6679,7 @@ do
 		enabledButton.Position = UDim2.fromOffset(6, 28)
 		paintEnabled()
 		dropdown(frame, UDim2.fromOffset(100, 26),
-			function() return ("LUCK x%d+ ▼"):format(cfg.minLuck) end,
+			function() return ("LUCK x%d+"):format(cfg.minLuck) end,
 			function()
 				local items = {}
 				for _, v in ipairs(luckOptions) do items[#items + 1] = {key = v, text = "x" .. v .. " or better", checked = cfg.minLuck == v} end
@@ -6038,7 +6687,7 @@ do
 			end,
 			function(v) cfg.minLuck = v; saveSettings() end).Position = UDim2.fromOffset(62, 28)
 		dropdown(frame, UDim2.fromOffset(162, 26),
-			function() return "TIME " .. timeLabel(cfg.hatchSeconds) .. " ▼" end,
+			function() return "TIME " .. timeLabel(cfg.hatchSeconds) .. ") " end,
 			function()
 				local items = {}
 				for _, o in ipairs(timeOptions) do items[#items + 1] = {key = o[1], text = o[2], checked = cfg.hatchSeconds == o[1]} end
@@ -6051,7 +6700,7 @@ end
 -- eggs list
 local refreshEggList
 do
-	label(row(22), "🥚 EGGS  (MOVE = walk + hatch)", UDim2.fromScale(1, 1), COL.egg, 14)
+	label(row(22), "EGGS  (MOVE = walk + hatch)", UDim2.fromScale(1, 1), COL.egg, 14)
 	local eggScroll = new("ScrollingFrame", {Name = "EggList", Size = UDim2.new(1, 0, 0, 200), BackgroundColor3 = Color3.fromRGB(25, 25, 30),
 		BorderSizePixel = 0, ScrollBarThickness = 5, CanvasSize = UDim2.new(), AutomaticCanvasSize = Enum.AutomaticSize.Y, LayoutOrder = 100}, Content)
 	corner(eggScroll, 8)
@@ -6064,7 +6713,7 @@ do
 			seen[egg] = true
 			local mult, left, name = eggLuck(st, egg)
 			local text = ("%s%s"):format(tostring(name or egg:GetAttribute("ID") or "Egg"), luckText(mult, left))
-			if rejected[egg] then text ..= "  ✖ " .. rejected[egg] end
+			if rejected[egg] then text ..= "  [x] " .. rejected[egg] end
 			local r = eggRows[egg]
 			if not r then
 				local f = new("Frame", {Size = UDim2.new(1, -8, 0, 34), BackgroundColor3 = COL.card, BorderSizePixel = 0, LayoutOrder = idx}, eggScroll)
@@ -6087,14 +6736,14 @@ local MM, speedCard, speedLbl, mapOverlayGui, mapOverlayRoot, canvas, wallLayer,
 do
 	MM = new("Frame", {Name = "Minimap", Position = UDim2.fromOffset(346, 0), Size = UDim2.fromOffset(250, 292), BackgroundColor3 = COL.bg, BorderSizePixel = 0}, Root)
 	corner(MM, 12)
-	label(MM, "🗺 MINIMAP   ⚪you 🔴scarecrow 🟠exit 🟡candy 🟢egg", UDim2.new(1, -10, 0, 40), COL.white, 11).Position = UDim2.fromOffset(8, 0)
+	label(MM, "MINIMAP   you / scarecrow / exit / candy / egg", UDim2.new(1, -10, 0, 40), COL.white, 11).Position = UDim2.fromOffset(8, 0)
 	canvas = new("Frame", {Position = UDim2.fromOffset(5, 44), Size = UDim2.fromOffset(240, 240), BackgroundColor3 = Color3.fromRGB(12, 12, 16),
 		BorderSizePixel = 0, ClipsDescendants = true}, MM)
 	wallLayer = new("Frame", {Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1}, canvas)
 	dotLayer = new("Frame", {Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1, ZIndex = 5}, canvas)
 	speedCard = new("Frame", {Position = UDim2.fromOffset(346, 300), Size = UDim2.fromOffset(250, 122), BackgroundColor3 = COL.card, BorderSizePixel = 0}, Root)
 	corner(speedCard, 10)
-	speedLbl = label(speedCard, "⚙ Speeds: -", UDim2.new(1, -16, 1, -12), Color3.fromRGB(190, 200, 215), 12)
+	speedLbl = label(speedCard, "Speeds: -", UDim2.new(1, -16, 1, -12), Color3.fromRGB(190, 200, 215), 12)
 	speedLbl.Position = UDim2.fromOffset(8, 6); speedLbl.TextYAlignment = Enum.TextYAlignment.Top
 
 	mapOverlayGui = new("ScreenGui", {Name = "HMV2_Pin", ResetOnSpawn = false, IgnoreGuiInset = true, DisplayOrder = 1000,
@@ -6215,16 +6864,16 @@ end
 local function onUpdateInfo()
 	local st = getState()
 	if not st then
-		floorLbl.Text = "Floor: - (enter the Halloween maze)"; luckLbl.Text = "🍀 Luck: -"; scareLbl.Text = "🎃 Scarecrow: -"; scareText = ""
-		speedLbl.Text = "⚙ Speeds: -"
+		floorLbl.Text = "Floor: - (enter the Halloween maze)"; luckLbl.Text = "Luck: -"; scareLbl.Text = "Scarecrow: -"; scareText = ""
+		speedLbl.Text = "Speeds: -"
 		return
 	end
-	floorLbl.Text = ("Floor %d  ·  Best %d  ·  %dx%d  ·  🍬 %d left"):format(st.floor or 0, st.best or 0, st.n, st.n, #candyModels())
+	floorLbl.Text = ("Floor %d  |  Best %d  |  %dx%d  |  %d left"):format(st.floor or 0, st.best or 0, st.n, st.n, #candyModels())
 	local parts = {}
 	for _, e in ipairs(st.eggs or {}) do
 		parts[#parts + 1] = ("%s%s"):format((tostring(e.egg or "?")):gsub(" Egg", ""), luckText(tonumber(e.mult) or 0, e.left))
 	end
-	luckLbl.Text = "🍀 " .. (#parts > 0 and table.concat(parts, "  |  ") or "no eggs")
+	luckLbl.Text = "" .. (#parts > 0 and table.concat(parts, "  |  ") or "no eggs")
 	local g = grid(st)
 	local root = getRoot()
 	local me = root and posCell(st, root.Position)
@@ -6232,18 +6881,18 @@ local function onUpdateInfo()
 	if m and me then
 		local b = m.b or posCell(st, m.pos)
 		local d = b and (bfsCached(g, me)[b] or 99) or 99
-		scareText = (" %d%s"):format(d, m.hunting and " HUNT" or "")
-		scareLbl.Text = ("🎃 Scarecrow: %d cells away%s"):format(d, m.hunting and "  ⚠ HUNTING" or "")
+		scareText = ("  %d%s"):format(d, m.hunting and " HUNT" or "")
+		scareLbl.Text = ("Scarecrow: %d cells away%s"):format(d, m.hunting and " | HUNTING" or "")
 		scareLbl.TextColor3 = d <= 3 and Color3.fromRGB(255, 80, 80) or COL.scare
 		local unknown = 0
 		for _, e in ipairs(getEggs()) do if eggLuck(st, e) == 0 then unknown += 1 end end
-		speedLbl.Text = ("⚙ You: %.2f cells/s\n🎃 Scarecrow (worst case): %.2f cells/s\n   seen walk %s · hunt %s\n🔍 Unknown-luck eggs: %d\n🍀 %s"):format(
+		speedLbl.Text = ("You: %.2f cells/s\nScarecrow (worst case): %.2f cells/s\n  seen walk %s  hunt %s\nUnknown-luck eggs: %d\nLuck: %s"):format(
 			O.speed / st.cs, scareCps(st, m.hunting), scareSeen.walk and ("%.2f"):format(scareSeen.walk) or "?",
 			scareSeen.hunt and ("%.2f"):format(scareSeen.hunt) or "?", unknown,
 			#parts > 0 and table.concat(parts, " | ") or "no eggs")
 	else
-		scareText = ""; scareLbl.Text = "🎃 Scarecrow: not found"; scareLbl.TextColor3 = COL.scare
-		speedLbl.Text = "⚙ Speeds: scarecrow not found"
+		scareText = ""; scareLbl.Text = "Scarecrow: not found"; scareLbl.TextColor3 = COL.scare
+		speedLbl.Text = "Speeds: scarecrow not found"
 	end
 end
 local function loop(dt, fn)
@@ -6340,7 +6989,6 @@ pcall(function()
     -- Lootbags: use the same network request as the game's Lootbags module.
     task.spawn(function()
         while true do
-            task.wait(0.10)
             if AutoPickupLootbags then
                 for _, lootbag in ipairs(AutoPickupLootbags:GetChildren()) do
                     pcall(function()
@@ -6362,30 +7010,40 @@ pcall(function()
                         AutoPickupLootbagSent[lootbag] = nil
                     end
                 end
+                task.wait(0.2)
+            else
+                task.wait(1)
             end
         end
     end)
 
-    -- Orbs: send the visible orb IDs in the same batched request used by the game.
+    -- Orbs: send the visible orb IDs in the same batched request used by the
+    -- game. Orbs only change on world events, so a 1 Hz poll is plenty and the
+    -- old 0.25 s poll was pure overhead.
     task.spawn(function()
+        local lastBatch = ""
         while true do
-            task.wait(0.25)
             if AutoPickupOrbs then
-                local ids = {}
+                local ids, batch = {}, ""
                 for _, orb in ipairs(AutoPickupOrbs:GetChildren()) do
                     if orb and orb.Parent and orb.Name ~= "" then
                         table.insert(ids, orb.Name)
+                        batch ..= orb.Name .. ","
                     end
                 end
-                if #ids > 0 then
+                if #ids > 0 and batch ~= lastBatch then
+                    lastBatch = batch
                     pcall(function()
                         Library.Network.Fire("Claim Orbs", ids)
                     end)
                 end
+                task.wait(1)
+            else
+                task.wait(1)
             end
         end
     end)
 end)
 
-print("🎃 Halloween Maze v4 loaded" .. (hubMain and " (docked into the hub)" or ""))	
+print("Halloween Maze v4 loaded" .. (hubMain and " (docked into the hub)" or ""))
 end)
