@@ -24,8 +24,43 @@ local PersistedSettings = {
         url = "",
         enabled = false,
         notify = { Huge = true, Secret = true, Titanic = true, Gargantuan = true }
-    }
+    },
+    -- Free-form bag for every other setting (Daycare fields, Anti-AFK
+    -- interval, ...). Anything registered through SetSetting below is written
+    -- to disk on every change and read back on load, so new settings persist
+    -- without touching this table or the loader.
+    extra = {},
 }
+
+-- ------------------------------------------------------------------
+-- Generic auto-saved settings
+--
+-- Registering a setting makes it load and save for free. `apply` is optional
+-- and is used to push the restored value into whatever runtime variable backs
+-- it (Daycare.Protect, AntiAFKIntervalMinutes, ...).
+-- ------------------------------------------------------------------
+local SettingSinks = {}
+
+local function SetSetting(key, value, apply)
+    PersistedSettings.extra[key] = value
+    if type(apply) == "function" then
+        SettingSinks[key] = apply
+        pcall(apply, value)
+    end
+end
+
+local function GetSetting(key, default)
+    local v = PersistedSettings.extra[key]
+    if v == nil then return default end
+    return v
+end
+
+local function ApplyAllSinks()
+    for key, apply in pairs(SettingSinks) do
+        local v = PersistedSettings.extra[key]
+        if v ~= nil then pcall(apply, v) end
+    end
+end
 
 local function loadSettings()
     if type(readfile) ~= "function" or type(isfile) ~= "function" or not isfile(SettingsFile) then
@@ -46,6 +81,11 @@ end
 if SavedSettings.selectedEgg ~= nil then
     PersistedSettings.selectedEgg = tostring(SavedSettings.selectedEgg)
 end
+if type(SavedSettings.extra) == "table" then
+    for k, v in pairs(SavedSettings.extra) do
+        PersistedSettings.extra[k] = v
+    end
+end
 if type(SavedSettings.webhook) == "table" then
     PersistedSettings.webhook.url = tostring(SavedSettings.webhook.url or "")
     PersistedSettings.webhook.enabled = SavedSettings.webhook.enabled == true
@@ -58,17 +98,26 @@ if type(SavedSettings.webhook) == "table" then
     end
 end
 
+-- Coalesce writes: several settings often change in the same frame (a toggle
+-- plus its value box), and every change used to hit the disk immediately.
+local savePending = false
 local function saveSettings()
     if type(writefile) ~= "function" then return end
-    pcall(function()
-        writefile(SettingsFile, HttpService:JSONEncode({
-            version = 2,
-            theme = CurrentThemeName,
-            key = CurrentKeyName,
-            toggles = CurrentToggleStates,
-            selectedEgg = PersistedSettings.selectedEgg,
-            webhook = PersistedSettings.webhook,
-        }))
+    if savePending then return end
+    savePending = true
+    task.defer(function()
+        savePending = false
+        pcall(function()
+            writefile(SettingsFile, HttpService:JSONEncode({
+                version = 3,
+                theme = CurrentThemeName,
+                key = CurrentKeyName,
+                toggles = CurrentToggleStates,
+                selectedEgg = PersistedSettings.selectedEgg,
+                webhook = PersistedSettings.webhook,
+                extra = PersistedSettings.extra,
+            }))
+        end)
     end)
 end
 
@@ -89,7 +138,7 @@ local AutoFarmHackerBoss = false
 local AutoTokens = false
 local PotatoMode = false
 local AutoFarmComet = false
-local AutoTrickOrTreat = false
+-- REMOVED: AutoTrickOrTreat (feature deleted, see the note where its engine was).
 local FastPetSpeed = false
 local FastAttackSpeed = false
 local FastPetSpeedApplied = false
@@ -134,16 +183,31 @@ end)
 -- so the number one pet never gets dragged into a hatch team.
 -- =====================================================================
 local Daycare = {
+    -- ---- team management (equips the strongest pets, protects the best) ----
     Auto = false,
     Protect = 1,          -- how many top-ranked pets must NEVER be equipped
     SlotOverride = 0,     -- 0 = use save.MaxEquipped
-    MinSize = 0,          -- skip pets below this size
+    MinSize = 0,          -- skip pets below this power
     Interval = 10,
+    -- ---- daycare queue (enroll / claim) ----
+    AutoClaim = false,    -- claim every finished slot. Safe: it never enrolls.
+    AutoEnroll = false,   -- permanently trash eligible pets. Irreversible!
+    DryRun = true,        -- enroll does NOTHING while this is true
+    ExcludeText = "",     -- comma-separated substrings to KEEP, never trash
+    KeepPower = 0,        -- never auto-enroll a pet at or above this power
+    EnrollBatch = 5,      -- max pets enrolled per pass
+    QueueInterval = 10,
+    -- ---- shared ----
     Busy = false,
     Snapshot = nil,
     LastRun = 0,
+    LastQueueRun = 0,
     LastResult = "Idle",
     TopPets = {},
+    EligibleCount = 0,
+    EligibleSample = {},
+    FreeSlots = 0,
+    Queued = 0,
 }
 
 local function saveData()
@@ -158,17 +222,17 @@ local function shortNumber(value)
     if value >= 1e9 then return string.format("%.2fB", value / 1e9) end
     if value >= 1e6 then return string.format("%.2fM", value / 1e6) end
     if value >= 1e3 then return string.format("%.2fK", value / 1e3) end
-    return tostring(math.floor(value))
+    return string.format("%.0f", value)
 end
 
--- Declared ahead of rankPets because the ranking marks which pets are already
--- equipped; a local defined further down would resolve to a global here.
 local function equippedUidSet(save)
     local set = {}
     if not save or type(save.PetsEquipped) ~= "table" then return set end
     for _, entry in pairs(save.PetsEquipped) do
-        if type(entry) == "table" and entry.uid then
-            set[entry.uid] = true
+        if type(entry) == "table" then
+            if entry.uid then set[tostring(entry.uid)] = true end
+            if entry.targetUID then set[tostring(entry.targetUID)] = true end
+            if entry.euid then set[tostring(entry.euid)] = true end
         elseif type(entry) == "string" then
             set[entry] = true
         end
@@ -176,34 +240,113 @@ local function equippedUidSet(save)
     return set
 end
 
-local function petDefinition(id)
-    local directory = Library.Directory and Library.Directory.Pets
-    return directory and directory[tostring(id)] or nil
+-- =====================================================================
+-- PET DIRECTORY
+-- Rarity and the size-class flags are NOT in the save. They are only
+-- published by requiring the game's own definition modules under
+-- ReplicatedStorage.__DIRECTORY.Pets, each of which exposes .rarity,
+-- .huge, .titanic, .gargantuan, .secret and .strengthMax.
+-- Verified: 1104 definitions load on this account.
+-- =====================================================================
+local defCache = setmetatable({}, { __mode = "k" })
+
+local function indexDefs()
+    local petsDir = ReplicatedStorage:FindFirstChild("__DIRECTORY")
+        and ReplicatedStorage.__DIRECTORY:FindFirstChild("Pets")
+    if not petsDir then return 0 end
+    local function walk(folder)
+        for _, child in ipairs(folder:GetChildren()) do
+            if child:IsA("ModuleScript") then
+                if defCache[child] == nil then
+                    local ok, def = pcall(require, child)
+                    defCache[child] = (ok and type(def) == "table") and def or false
+                end
+            elseif child:IsA("Folder") then
+                walk(child)
+            end
+        end
+    end
+    walk(petsDir)
+    local n = 0
+    for _, def in pairs(defCache) do if def then n += 1 end end
+    return n
+end
+
+local defCacheNames = setmetatable({}, { __mode = "k" })
+local function defForName(id)
+    local name = tostring(id or "")
+    local cached = defCacheNames[name]
+    if cached ~= nil then
+        return cached ~= false and cached or nil
+    end
+    local petsDir = ReplicatedStorage:FindFirstChild("__DIRECTORY")
+        and ReplicatedStorage.__DIRECTORY:FindFirstChild("Pets")
+    local found = nil
+    if petsDir then
+        local stack = { petsDir }
+        while #stack > 0 and not found do
+            local folder = table.remove(stack)
+            for _, child in ipairs(folder:GetChildren()) do
+                if child:IsA("Folder") then
+                    stack[#stack + 1] = child
+                elseif child:IsA("ModuleScript") and child.Name == name then
+                    local ok, def = pcall(require, child)
+                    if ok and type(def) == "table" then found = def end
+                    break
+                end
+            end
+        end
+    end
+    defCacheNames[name] = found or false
+    return found
+end
+
+-- Higher = more valuable. Size flags always outrank a plain rarity band.
+local RARITY_RANK = {
+    Basic = 1, Common = 2, Uncommon = 3, Rare = 4, Epic = 5, Legendary = 6,
+    Mythical = 7, Eternal = 8, Divine = 9, Secret = 10, Mysterious = 11,
+    Exclusive = 12, Supreme = 13, Ultimate = 14,
+}
+
+local function rarityRank(pet)
+    local def = defForName(pet.id)
+    local base = 1
+    if def then
+        base = RARITY_RANK[tostring(def.rarity or "")] or 1
+        if def.gargantuan then base = math.max(base, 15) end
+        if def.titanic then base = math.max(base, 14) end
+        if def.huge then base = math.max(base, 13) end
+        if def.secret then base = math.max(base, 12) end
+    else
+        local id = string.lower(tostring(pet.id or ""))
+        if id:find("gargantuan") then base = 15
+        elseif id:find("titanic") then base = 14
+        elseif id:find("huge") then base = 13
+        elseif id:find("secret") then base = 12 end
+    end
+    return base
 end
 
 -- A "power pet" is a base-rarity pet that actually carries abilities. Huge,
 -- Secret, Titanic and Gargantuan pets are excluded: they cannot be equipped
 -- through the normal team flow, so including them just starved the real team.
--- `powers` is the save's own list of abilities, so this stays correct even if
--- the directory's flags ever change.
 local function isPowerPet(pet)
     if type(pet) ~= "table" or not pet.uid then return false end
-
-    local definition = petDefinition(pet.id)
-    if definition and (definition.huge or definition.secret
-        or definition.titanic or definition.gargantuan) then
+    local def = defForName(pet.id)
+    if def and (def.huge or def.secret or def.titanic or def.gargantuan) then
         return false
     end
-
     local powers = pet.powers
     if type(powers) ~= "table" or next(powers) == nil then return false end
     return true
 end
 
--- Ranking of every equipable power pet the player owns, strongest first.
+-- Ranking of every equipable power pet, strongest first.
+-- `s` is the growth/power score; `idt` breaks ties so the order is stable.
 local function rankPets()
     local save = saveData()
     if not save or type(save.Pets) ~= "table" then return {}, 0 end
+    local eq = equippedUidSet(save)
 
     local ranked = {}
     for index, pet in pairs(save.Pets) do
@@ -215,14 +358,11 @@ local function rankPets()
                 nick = tostring(pet.nk or ""),
                 size = tonumber(pet.s) or 0,
                 template = tonumber(pet.idt) or 0,
-                equipped = equippedUidSet(save)[pet.uid] == true,
+                equipped = eq[pet.uid] == true,
             }
         end
     end
 
-    -- `s` is the growth/size score. `idt` (the item template id) breaks ties
-    -- between identically sized pets so the ranking is deterministic between
-    -- runs instead of shuffling every pass.
     table.sort(ranked, function(a, b)
         if a.size ~= b.size then return a.size > b.size end
         if a.template ~= b.template then return a.template > b.template end
@@ -230,19 +370,6 @@ local function rankPets()
     end)
 
     return ranked, tonumber(save.MaxEquipped) or 0
-end
-
-local function equippedUidSet(save)
-    local set = {}
-    if not save or type(save.PetsEquipped) ~= "table" then return set end
-    for _, entry in pairs(save.PetsEquipped) do
-        if type(entry) == "table" and entry.uid then
-            set[entry.uid] = true
-        elseif type(entry) == "string" then
-            set[entry] = true
-        end
-    end
-    return set
 end
 
 local function saveTeam()
@@ -275,8 +402,8 @@ local function applyDaycare(quiet)
     Daycare.TopPets = {}
     for i = 1, math.min(6, #ranked) do Daycare.TopPets[i] = ranked[i] end
 
-    -- Build the wanted team: skip the protected head of the list entirely, then
-    -- take the strongest of everything below it.
+    -- Skip the protected head of the list entirely, then take the strongest
+    -- of everything below it.
     local wanted, wantedOrder = {}, {}
     for i = protect + 1, #ranked do
         local pet = ranked[i]
@@ -380,6 +507,277 @@ local function restoreDaycareTeam(quiet)
     return true
 end
 
+-- =====================================================================
+-- DAYCARE QUEUE: auto-claim and auto-enroll
+--
+-- Server routes, read out of Scripts.GUIs.Daycare:
+--   Library.Network.Invoke("Daycare: Claim", indexOrNil)   nil = claim all
+--   Library.Network.Invoke("Daycare: Compute Loot", queue)
+--   Library.Network.Invoke("Daycare: Enroll", arrayOfPetUIDs)
+--
+-- State the server owns:
+--   save.DaycareQueue / save.DaycareHardcoreQueue
+--   Library.Shared.IsHardcore                  picks which queue is live
+--   Library.Shared.DaycareComputeSlotsForTier(save)  -> slot budget
+--
+-- Enrolling is NOT reversible from this side: the game itself warns
+-- "Put these pets in daycare? They cannot be taken out early!". So the
+-- filter is deny-by-default and conservative. Claiming is safe, so it is a
+-- separate toggle.
+-- =====================================================================
+local function activeQueue()
+    local save = saveData()
+    if type(save) ~= "table" then return nil, 0 end
+    local hardcore = false
+    pcall(function() hardcore = Library.Shared.IsHardcore == true end)
+    local q = (hardcore and save.DaycareHardcoreQueue or save.DaycareQueue)
+    if type(q) ~= "table" then return nil, 0 end
+    return q, #q
+end
+
+local function freeSlots()
+    local save = saveData()
+    if type(save) ~= "table" then return 0 end
+    local slots = 0
+    pcall(function() slots = Library.Shared.DaycareComputeSlotsForTier(save) or 0 end)
+    local _, used = activeQueue()
+    return math.max(0, slots - used)
+end
+
+-- The exclusion bar. Comma or newline separated substrings, matched against
+-- pet id, nickname AND rarity, so "wolf", "rainbow" and "legendary" all work.
+local function excludedTerms()
+    local terms = {}
+    for piece in string.gmatch(tostring(Daycare.ExcludeText or ""), "[^,\n]+") do
+        local t = string.lower(piece:match("^%s*(.-)%s*$"))
+        if t ~= "" then terms[#terms + 1] = t end
+    end
+    return terms
+end
+
+local function isExcluded(pet, terms)
+    if #terms == 0 then return false end
+    local def = defForName(pet.id)
+    local haystack = string.lower(
+        tostring(pet.id or "") .. " " .. tostring(pet.nk or "") .. " "
+        .. tostring(def and def.rarity or "")
+    )
+    for _, t in ipairs(terms) do
+        if string.find(haystack, t, 1, true) then return true end
+    end
+    return false
+end
+
+-- Pets that may be permanently trashed. Everything else is kept.
+--
+-- This is deny-by-default and has FOUR hard guards, because enrollment cannot
+-- be undone ("They cannot be taken out early!"):
+--   1. equipped pets          - never touched
+--   2. locked pets           - the server refuses them anyway
+--   3. non-power pets         - a pet with no `powers` carries no stats, so
+--                                trashing it loses nothing
+--   4. non-basic-rarity pets  - this is the important one. Huge, Titanic,
+--                                Gargantuan and Secret CANNOT be used in Daycare
+--                                at all (the game will not accept them), and
+--                                every Exclusive/Supreme/Ultimate pet is also
+--                                unusable there. An earlier version only blocked
+--                                rank >= 13, which let 821 Exclusive pets
+--                                through and would have permanently destroyed
+--                                them. Anything above Basic rarity is now
+--                                refused outright.
+local BASIC_RARITIES = {
+    Basic = true, Common = true, Uncommon = true, Rare = true,
+    Epic = true, Legendary = true, Mythical = true, Eternal = true,
+}
+
+local function petIsBasicRarity(pet)
+    local def = defForName(pet.id)
+    if not def then
+        -- Unknown definition: refuse. Better to keep a pet than destroy one.
+        return false, "unknown definition"
+    end
+    -- A size-class flag always means it is not a normal team pet.
+    if def.huge or def.titanic or def.gargantuan or def.secret then
+        return false, "size class"
+    end
+    local rarity = tostring(def.rarity or "")
+    if rarity == "" then
+        return false, "no rarity"
+    end
+    if not BASIC_RARITIES[rarity] then
+        return false, "rarity " .. rarity
+    end
+    return true
+end
+
+local function petHasPowers(pet)
+    local powers = pet.powers
+    return type(powers) == "table" and next(powers) ~= nil
+end
+
+local function buildCandidates()
+    local save = saveData()
+    if type(save) ~= "table" or type(save.Pets) ~= "table" then
+        return {}, "Save not ready"
+    end
+
+    local keepPower = tonumber(Daycare.KeepPower) or 0
+    local terms = excludedTerms()
+    local eq = equippedUidSet(save)
+
+    local out = {}
+    for _, pet in pairs(save.Pets) do
+        if type(pet) == "table" and pet.uid and not eq[tostring(pet.uid)] then
+            local power = tonumber(pet.s) or 0
+            local rank = rarityRank(pet)
+            local keep = nil
+
+            local basic, why = petIsBasicRarity(pet)
+
+            if pet.l then
+                keep = "locked"
+            elseif not basic then
+                keep = "not a daycare-able rarity (" .. tostring(why) .. ")"
+            elseif not petHasPowers(pet) then
+                keep = "no stat powers"
+            elseif #terms > 0 and isExcluded(pet, terms) then
+                keep = "excluded"
+            elseif keepPower > 0 and power >= keepPower then
+                keep = "power >= floor"
+            end
+
+            if not keep then
+                out[#out + 1] = {
+                    uid = pet.uid,
+                    id = tostring(pet.id or "?"),
+                    nk = tostring(pet.nk or ""),
+                    power = power,
+                    rank = rank,
+                    rainbow = pet.r == true,
+                    golden = pet.g == true,
+                    shiny = pet.sh == true,
+                }
+            end
+        end
+    end
+
+    -- STRONGEST first. Enrollment is permanent, so the batch should always
+    -- spend its slots on the best pets that pass the filter: if the exclude
+    -- bar or the power floor is what saved your good pets, this ordering means
+    -- the ones that get trashed are the weakest survivors, never the top of
+    -- the list. Rarity band outranks raw power, because a Mythical is worth
+    -- more than a high-power Common.
+    table.sort(out, function(a, b)
+        if a.rank ~= b.rank then return a.rank > b.rank end
+        if a.power ~= b.power then return a.power > b.power end
+        return tostring(a.uid) > tostring(b.uid)
+    end)
+    return out, nil
+end
+
+local function daycareClaim()
+    local q, count = activeQueue()
+    if count == 0 then
+        Daycare.LastResult = "Queue empty"
+        return false
+    end
+    local ok, res, err = pcall(function()
+        return Library.Network.Invoke("Daycare: Claim", nil)
+    end)
+    if ok and res == true then
+        Daycare.LastResult = string.format("Claimed %d finished slot(s)", count)
+        return true
+    end
+    Daycare.LastResult = "Claim failed: " .. tostring(err or res or "unknown")
+    return false
+end
+
+local function daycareEnroll()
+    local cands, err = buildCandidates()
+    if err then
+        Daycare.LastResult = err
+        return false
+    end
+    Daycare.EligibleCount = #cands
+
+    -- Preview the TAIL of the list, because that is what a capped batch would
+    -- actually consume. Matches daycareEnroll's backwards walk exactly.
+    local sample = {}
+    for i = 0, math.min(#cands, 8) - 1 do
+        local c = cands[#cands - i]
+        sample[#sample + 1] = ("%s%s  %s  %s"):format(
+            c.rainbow and "[R] " or (c.golden and "[G] " or (c.shiny and "[S] " or "")),
+            c.id, c.nk, shortNumber(c.power))
+    end
+    Daycare.EligibleSample = sample
+
+    if #cands == 0 then
+        Daycare.LastResult = "Nothing eligible to enroll"
+        return false
+    end
+
+    local free = freeSlots()
+    Daycare.FreeSlots = free
+    if free <= 0 then
+        Daycare.LastResult = "Daycare is full"
+        return false
+    end
+
+    if Daycare.DryRun then
+        Daycare.LastResult = string.format(
+            "Dry run: %d eligible, %d free, enrolling %d (DRY RUN ON)",
+            #cands, free, math.min(free, Daycare.EnrollBatch))
+        return false
+    end
+
+    local n = math.min(free, math.max(1, math.floor(Daycare.EnrollBatch)), #cands)
+    local uids = {}
+    local names = {}
+    -- `cands` is sorted STRONGEST first, so the pets we actually want to
+    -- trash are at the TAIL. Walk backwards from the end of the list, or this
+    -- would enroll the very best pets the filter let through.
+    for i = 0, n - 1 do
+        local c = cands[#cands - i]
+        uids[i + 1] = c.uid
+        names[i + 1] = c.id
+    end
+
+    local ok, res, err2 = pcall(function()
+        return Library.Network.Invoke("Daycare: Enroll", uids)
+    end)
+    if ok and res == true then
+        Daycare.LastResult = string.format("Enrolled %d: %s", n, table.concat(names, ", ", 1, 3))
+        return true
+    end
+    Daycare.LastResult = "Enroll failed: " .. tostring(err2 or res or "unknown")
+    return false
+end
+
+-- One combined pass used by both the manual button and the auto loop.
+local function daycareQueuePass()
+    local _, queued = activeQueue()
+    Daycare.Queued = queued
+    Daycare.FreeSlots = freeSlots()
+
+    if Daycare.AutoClaim and queued > 0 then
+        daycareClaim()
+        task.wait(1.5) -- let the server settle the save before re-checking
+        Daycare.Queued = select(2, activeQueue())
+        Daycare.FreeSlots = freeSlots()
+    end
+
+    if Daycare.AutoEnroll and Daycare.FreeSlots > 0 then
+        daycareEnroll()
+    end
+
+    Daycare.LastQueueRun = os.clock()
+end
+
+-- REMOVED: the Giant Pumpkin / Magic Wand block (auto feed, auto open, auto
+-- upgrades). It was built against routes that return no values through this
+-- executor, so nothing it did could be confirmed. Removed rather than left as
+-- three toggles that appear to work and do nothing.
+
 local function SetFastPetSpeed(enabled)
     FastPetSpeed = enabled
     if not SaveModule or not SaveModule.Get then
@@ -435,6 +833,28 @@ task.spawn(function()
             task.wait(2)
         else
             task.wait(0.5)
+        end
+    end
+end)
+
+-- Daycare QUEUE loop: auto-claim finished slots and auto-enroll eligible pets.
+-- Kept separate from the team loop because the two use different intervals and
+-- the claim/enroll pass makes network calls. Claiming is safe; enrolling is
+-- gated behind Daycare.DryRun, which defaults to true.
+task.spawn(function()
+    while true do
+        if Daycare.AutoClaim or Daycare.AutoEnroll then
+            local now = os.clock()
+            if now - Daycare.LastQueueRun >= math.max(3, Daycare.QueueInterval) then
+                pcall(daycareQueuePass)
+            end
+            task.wait(2)
+        else
+            -- Keep the readouts (queued / free slots) fresh even when idle.
+            local _, queued = activeQueue()
+            Daycare.Queued = queued
+            Daycare.FreeSlots = freeSlots()
+            task.wait(1)
         end
     end
 end)
@@ -1612,101 +2032,12 @@ task.spawn(function()
 end)
 
 -- AUTO TRICK OR TREAT
--- Visits every current child under workspace.__TrickOrTreat, presses E once
--- at each location, waits 5 seconds between locations, then waits for the
--- remainder of the 60-second cycle before starting over. The 60-second timer
--- starts when the first teleport/E action of a cycle occurs.
-local TrickOrTreatDelay = 5
-local TrickOrTreatCycle = 65
-
-local function GetTrickOrTreatPosition(instance)
-    if not instance or not instance.Parent then
-        return nil
-    end
-
-    if instance:IsA("BasePart") then
-        return instance.Position
-    end
-
-    local ok, pivot = pcall(function()
-        return instance:GetPivot()
-    end)
-    if ok and pivot then
-        return pivot.Position
-    end
-
-    local part = instance:FindFirstChildWhichIsA("BasePart", true)
-    return part and part.Position or nil
-end
-
-local function TeleportAndPressE(position)
-    local character = localPlayer.Character
-    local hrp = character and character:FindFirstChild("HumanoidRootPart")
-    if not hrp or not position then
-        return false
-    end
-
-    hrp.CFrame = CFrame.new(position + Vector3.new(0, 3, 0))
-    task.wait(1)
-
-    pcall(function()
-        VirtualInputManager:SendKeyEvent(true, Enum.KeyCode.E, false, game)
-        task.wait(0.1)
-        VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.E, false, game)
-    end)
-
-    return true
-end
-
-task.spawn(function()
-    while true do
-        if not AutoTrickOrTreat then
-            task.wait(0.25)
-        else
-            local cycleStart = nil
-            local folder = Workspace:FindFirstChild("__TrickOrTreat")
-
-            if folder then
-                local children = folder:GetChildren()
-
-                for index, child in ipairs(children) do
-                    if not AutoTrickOrTreat then
-                        break
-                    end
-
-                    local position = GetTrickOrTreatPosition(child)
-                    if position then
-                        if not cycleStart then
-                            cycleStart = os.clock()
-                        end
-
-                        TeleportAndPressE(position)
-
-                        if index < #children and AutoTrickOrTreat then
-                            local waited = 0
-                            while AutoTrickOrTreat and waited < TrickOrTreatDelay do
-                                local step = math.min(0.25, TrickOrTreatDelay - waited)
-                                task.wait(step)
-                                waited = waited + step
-                            end
-                        end
-                    end
-                end
-
-                if cycleStart and AutoTrickOrTreat then
-                    local remaining = TrickOrTreatCycle - (os.clock() - cycleStart)
-                    while AutoTrickOrTreat and remaining > 0 do
-                        local step = math.min(0.25, remaining)
-                        task.wait(step)
-                        remaining = TrickOrTreatCycle - (os.clock() - cycleStart)
-                    end
-                end
-            else
-                task.wait(0.5)
-            end
-        end
-    end
-end)
+-- REMOVED: the Trick-or-Treat engine (config reader, house walker, the KnockHouse
+-- routine and its polling loop). The route itself was real and worked - a walk to a
+-- house then Invoke("TrickOrTreat: Knock", houseId) paid out candy - but the server
+-- enforces MaxTravelStudsPerSecond, so any teleport to a house trips "Trick or Treat
+-- paused for you" and every later knock is refused. It only ever worked at walking
+-- pace, which is no faster than playing it by hand.
 
 -- ANTI-AFK
 -- Sends a real Space key press at the user-selected interval (minutes).
@@ -2235,6 +2566,11 @@ task.spawn(function()
         Titanics = 0,
         Gargantuans = 0,
     }
+    -- Rainbow/Golden/Shiny subtotals, keyed "<Tier>s" (e.g. "Huges") or
+    -- "<Tier>sGolden"/"<Tier>sShiny". Kept per tier so the UI can report which
+    -- tier your rainbows actually came from.
+    local variantCounts = {}
+    local variantLabels = {}
     local recentHuges = {}
     local recentSecrets = {}
     local recentTitanics = {}
@@ -2265,7 +2601,28 @@ task.spawn(function()
             label.TextColor3 = color
             label.TextSize = 12
             label.TextWrapped = true
-            label.Text = "- " .. tostring(entryData.name)
+
+            -- Variant prefix. Rainbow beats Golden beats Shiny, matching the
+            -- game's own naming order (Trading Booths checks rainbow first,
+            -- then golden). A pet can carry more than one flag.
+            local prefix, suffix = "", ""
+            if entryData.rainbow then
+                prefix = "[Rainbow] "
+                label.TextColor3 = Color3.fromRGB(255, 120, 220)
+                if entryData.golden then suffix = " +G" elseif entryData.shiny then suffix = " +S" end
+            elseif entryData.golden then
+                prefix = "[Golden] "
+                label.TextColor3 = Color3.fromRGB(255, 200, 70)
+                if entryData.shiny then suffix = " +S" end
+            elseif entryData.shiny then
+                prefix = "[Shiny] "
+                label.TextColor3 = Color3.fromRGB(120, 240, 255)
+            end
+            local nick = ""
+            if entryData.nickname and entryData.nickname ~= "" then
+                nick = " (" .. tostring(entryData.nickname) .. ")"
+            end
+            label.Text = "- " .. prefix .. tostring(entryData.name) .. nick .. suffix
             label.TextXAlignment = Enum.TextXAlignment.Left
             label.LayoutOrder = i
             label.Parent = listFrame
@@ -2299,7 +2656,32 @@ task.spawn(function()
                     if not knownPets[uid] then
                         if trackerInitialized then
                             local displayName = getPetDisplayName(pet)
-                            local entry = { name = displayName, uid = uid }
+                            -- Rarity flags live directly on the pet record:
+                            --   r = Rainbow, g = Golden, sh = Shiny, snk = signed nickname.
+                            -- Verified against Save.Get().Pets: r/g/sh are the only
+                            -- variant flags the game ever sets on a pet entry.
+                            local entry = {
+                                name = displayName,
+                                uid = uid,
+                                rainbow = pet.r == true,
+                                golden = pet.g == true,
+                                shiny = pet.sh == true,
+                                signed = pet.snk == true,
+                                nickname = pet.nk,
+                            }
+
+                            -- Variant subtotals, tracked separately from the tier
+                            -- totals so the UI can show "20 of your Huges are Rainbow".
+                            local vKey = category .. "s"
+                            if entry.rainbow then
+                                variantCounts[vKey] = (variantCounts[vKey] or 0) + 1
+                            end
+                            if entry.golden then
+                                variantCounts[vKey .. "Golden"] = (variantCounts[vKey .. "Golden"] or 0) + 1
+                            end
+                            if entry.shiny then
+                                variantCounts[vKey .. "Shiny"] = (variantCounts[vKey .. "Shiny"] or 0) + 1
+                            end
 
                             -- Only count newly discovered rare pets while AFK mode is active.
                             startupCounts[category .. "s"] = (startupCounts[category .. "s"] or 0) + 1
@@ -2354,6 +2736,48 @@ task.spawn(function()
         end
         if afkRareLabels.Huges then afkRareLabels.Huges.Text = hugeLabel.Text end
         if afkRareLabels.Secrets then afkRareLabels.Secrets.Text = secretLabel.Text end
+
+        -- Variant totals: one line per tier that actually owns a variant pet.
+        -- Rendered dynamically so a tier with zero rainbows costs no label.
+        do
+            local order = { "Huges", "Titanics", "Gargantuans", "Secrets" }
+            local used = 0
+            for _, base in ipairs(order) do
+                local rb = variantCounts[base] or 0
+                local gd = variantCounts[base .. "Golden"] or 0
+                local sh = variantCounts[base .. "Shiny"] or 0
+                if rb > 0 or gd > 0 or sh > 0 then
+                    local key = base
+                    local label = variantLabels[key]
+                    local text = ("%s  R:%d  G:%d  S:%d"):format(base, rb, gd, sh)
+                    if not label then
+                        used += 1
+                        label = Instance.new("TextLabel")
+                        label.Size = UDim2.new(1, -20, 0, 20)
+                        label.Position = UDim2.new(0, 10, 0, 142 + (used - 1) * 22)
+                        label.BackgroundTransparency = 1
+                        label.TextColor3 = Color3.fromRGB(255, 120, 220)
+                        label.Font = Enum.Font.GothamBold
+                        label.TextSize = 12
+                        label.TextXAlignment = Enum.TextXAlignment.Left
+                        label:SetAttribute(THEME_LOCKED, true)
+                        label.Parent = statsContainer
+                        variantLabels[key] = label
+                    end
+                    label.Text = text
+                end
+            end
+            for key, label in pairs(variantLabels) do
+                local base = key
+                local rb = variantCounts[base] or 0
+                local gd = variantCounts[base .. "Golden"] or 0
+                local sh = variantCounts[base .. "Shiny"] or 0
+                if rb == 0 and gd == 0 and sh == 0 then
+                    label:Destroy()
+                    variantLabels[key] = nil
+                end
+            end
+        end
         if afkRareLabels.Titanics then afkRareLabels.Titanics.Text = titanicLabel.Text end
         if afkSessionActive then
             updateAfkSessionLabels()
@@ -2559,7 +2983,7 @@ task.spawn(function()
     hatchFrame.ClipsDescendants = true
     hatchFrame.ScrollBarThickness = 5
     hatchFrame.ScrollingDirection = Enum.ScrollingDirection.Y
-    hatchFrame.CanvasSize = UDim2.new(0, 0, 0, 875)
+    hatchFrame.CanvasSize = UDim2.new(0, 0, 0, 965)
     hatchFrame.Parent = autoHatchMain
 
     local tpFrame = Instance.new("Frame")
@@ -2583,12 +3007,17 @@ task.spawn(function()
     eggFrame.Visible = false
     eggFrame.Parent = autoHatchMain
 
-    local farmFrame = Instance.new("Frame")
+    local farmFrame = Instance.new("ScrollingFrame")
+    farmFrame.Name = "FarmScroll"
     farmFrame.Size = UDim2.new(1, -24, 1, -96)
     farmFrame.Position = UDim2.new(0, 12, 0, 90)
     farmFrame.BackgroundTransparency = 1
+    farmFrame.BorderSizePixel = 0
+    farmFrame.ScrollBarThickness = 5
+    farmFrame.AutomaticCanvasSize = Enum.AutomaticSize.Y
     farmFrame.Visible = false
     farmFrame.Parent = autoHatchMain
+    do local _fp = Instance.new("UIPadding") _fp.PaddingBottom = UDim.new(0, 24) _fp.Parent = farmFrame end
 
     local daycareFrame = Instance.new("Frame")
     daycareFrame.Name = "DaycareFrame"
@@ -2602,18 +3031,39 @@ task.spawn(function()
     -- FULL EXTENDED THEMES SYSTEM
     -- =====================================================================
     local function makeTheme(name, background, panel, surface, accent, controlOn, danger, text, muted, stroke)
+        -- `input` used to alias `surface`, which made every textbox the same
+        -- shade as the button next to it - the field read as part of the
+        -- button and looked flat. It is now derived so it is always a step
+        -- darker than the surface it sits on, and themes can override it.
+        local surface = surface or Color3.fromRGB(32, 32, 42)
         return {
             name = name,
             background = background or Color3.fromRGB(20, 21, 26),
             panel = panel or Color3.fromRGB(28, 29, 38),
-            surface = surface or Color3.fromRGB(32, 32, 42),
-            input = surface or Color3.fromRGB(30, 30, 40),
+            surface = surface,
+            input = Color3.fromRGB(
+                math.floor(surface.R * 255 * 0.82),
+                math.floor(surface.G * 255 * 0.82),
+                math.floor(surface.B * 255 * 0.82)
+            ),
             accent = accent or Color3.fromRGB(60, 140, 220),
             controlOn = controlOn or Color3.fromRGB(45, 140, 75),
             danger = danger or Color3.fromRGB(200, 50, 50),
-            text = text or Color3.fromRGB(245, 245, 250),
-            muted = muted or Color3.fromRGB(180, 180, 190),
-            stroke = stroke or Color3.fromRGB(80, 80, 100),
+            -- Text and muted were accepted but every theme below passed them
+            -- positionally after `danger`, and most themes did not pass them
+            -- at all - so nearly all of them fell back to the same off-white.
+            -- Deriving from `background` keeps contrast correct on light-ish
+            -- themes (Solarized, Platinum, Pure Gold) where pure white on a
+            -- mid-tone panel was the worst offender.
+            text = text or (background and background.R > 0.32
+                and Color3.fromRGB(28, 28, 34)
+                or Color3.fromRGB(245, 245, 250)),
+            muted = muted or (background and background.R > 0.32
+                and Color3.fromRGB(70, 70, 80)
+                or Color3.fromRGB(168, 168, 180)),
+            stroke = stroke or (background and background.R > 0.32
+                and Color3.fromRGB(120, 116, 100)
+                or Color3.fromRGB(80, 80, 100)),
         }
     end
 
@@ -2653,6 +3103,60 @@ task.spawn(function()
         makeTheme("Matrix Green",     Color3.fromRGB(5, 20, 10),   Color3.fromRGB(8, 35, 17),   Color3.fromRGB(12, 52, 24),  Color3.fromRGB(45, 255, 95), Color3.fromRGB(80, 220, 110), Color3.fromRGB(255, 70, 70)),
         makeTheme("Arctic Aurora",    Color3.fromRGB(15, 30, 42),  Color3.fromRGB(24, 48, 62),  Color3.fromRGB(34, 68, 82),  Color3.fromRGB(90, 230, 210), Color3.fromRGB(120, 220, 150),Color3.fromRGB(240, 90, 110)),
         makeTheme("Deep Space",       Color3.fromRGB(8, 9, 20),    Color3.fromRGB(16, 17, 35),  Color3.fromRGB(25, 27, 52),  Color3.fromRGB(90, 125, 255), Color3.fromRGB(60, 210, 170), Color3.fromRGB(255, 70, 130)),
+-- ---- newer additions ----
+        -- Every one of these passes the full 10-argument set (text, muted and
+        -- stroke included), which the older entries above did not - that is what
+        -- makes each one read as a distinct theme instead of the same grey
+        -- window with a different button colour.
+        makeTheme("Obsidian",      Color3.fromRGB(10, 10, 12),  Color3.fromRGB(18, 18, 22),  Color3.fromRGB(26, 26, 32),  Color3.fromRGB(255, 255, 255), Color3.fromRGB(52, 199, 89), Color3.fromRGB(255, 69, 58),  Color3.fromRGB(245, 245, 247), Color3.fromRGB(140, 140, 150), Color3.fromRGB(70, 70, 80)),
+        makeTheme("Carbon Rose",   Color3.fromRGB(22, 14, 18),  Color3.fromRGB(34, 21, 27),  Color3.fromRGB(48, 30, 38),  Color3.fromRGB(244, 114, 182), Color3.fromRGB(52, 168, 120), Color3.fromRGB(232, 62, 90), Color3.fromRGB(250, 240, 244), Color3.fromRGB(186, 150, 166), Color3.fromRGB(96, 66, 82)),
+        makeTheme("Deep Teal",     Color3.fromRGB(8, 24, 26),   Color3.fromRGB(13, 38, 41),  Color3.fromRGB(19, 54, 58),  Color3.fromRGB(94, 234, 212), Color3.fromRGB(45, 170, 120), Color3.fromRGB(240, 80, 100), Color3.fromRGB(240, 250, 250), Color3.fromRGB(146, 180, 180), Color3.fromRGB(64, 100, 104)),
+        makeTheme("Plum Velvet",   Color3.fromRGB(26, 14, 30),  Color3.fromRGB(39, 22, 45),  Color3.fromRGB(54, 31, 63),  Color3.fromRGB(216, 130, 240), Color3.fromRGB(70, 170, 130), Color3.fromRGB(235, 70, 110), Color3.fromRGB(248, 240, 252), Color3.fromRGB(180, 158, 192), Color3.fromRGB(92, 68, 104)),
+        makeTheme("Sandstorm",     Color3.fromRGB(44, 36, 24),  Color3.fromRGB(60, 50, 33),  Color3.fromRGB(78, 66, 44),  Color3.fromRGB(230, 176, 90), Color3.fromRGB(120, 160, 80), Color3.fromRGB(200, 80, 60),  Color3.fromRGB(250, 244, 232), Color3.fromRGB(196, 180, 150), Color3.fromRGB(130, 112, 78)),
+        makeTheme("Steel Blue",    Color3.fromRGB(18, 22, 28),  Color3.fromRGB(27, 33, 41),  Color3.fromRGB(37, 45, 56),  Color3.fromRGB(126, 176, 214), Color3.fromRGB(60, 150, 110), Color3.fromRGB(214, 82, 88),  Color3.fromRGB(238, 244, 250), Color3.fromRGB(154, 168, 184), Color3.fromRGB(74, 88, 104)),
+        makeTheme("Royal Purple",  Color3.fromRGB(20, 12, 34),  Color3.fromRGB(31, 19, 52),  Color3.fromRGB(43, 27, 72),  Color3.fromRGB(170, 120, 255), Color3.fromRGB(60, 175, 120), Color3.fromRGB(230, 65, 100), Color3.fromRGB(246, 240, 255), Color3.fromRGB(172, 156, 200), Color3.fromRGB(88, 70, 130)),
+        makeTheme("Blood Moon",    Color3.fromRGB(24, 10, 12),  Color3.fromRGB(36, 15, 18),  Color3.fromRGB(50, 21, 25),  Color3.fromRGB(228, 58, 58), Color3.fromRGB(70, 150, 90),  Color3.fromRGB(255, 60, 60),  Color3.fromRGB(250, 232, 232), Color3.fromRGB(188, 148, 148), Color3.fromRGB(98, 54, 56)),
+        makeTheme("Sea Foam",      Color3.fromRGB(12, 30, 34),  Color3.fromRGB(18, 44, 50),  Color3.fromRGB(25, 60, 68),  Color3.fromRGB(120, 220, 200), Color3.fromRGB(60, 170, 130), Color3.fromRGB(230, 80, 100), Color3.fromRGB(238, 248, 250), Color3.fromRGB(148, 178, 186), Color3.fromRGB(66, 104, 112)),
+        makeTheme("Gold Leaf",     Color3.fromRGB(30, 26, 14),  Color3.fromRGB(43, 37, 20),  Color3.fromRGB(57, 49, 27),  Color3.fromRGB(233, 196, 106), Color3.fromRGB(150, 165, 80), Color3.fromRGB(210, 90, 70), Color3.fromRGB(252, 246, 230), Color3.fromRGB(198, 184, 148), Color3.fromRGB(120, 104, 62)),
+        makeTheme("Orchid",        Color3.fromRGB(28, 16, 34),  Color3.fromRGB(41, 24, 50),  Color3.fromRGB(56, 33, 68),  Color3.fromRGB(198, 120, 235), Color3.fromRGB(70, 175, 135), Color3.fromRGB(232, 68, 118), Color3.fromRGB(248, 240, 252), Color3.fromRGB(180, 156, 194), Color3.fromRGB(94, 68, 110)),
+        makeTheme("Slate Blue",    Color3.fromRGB(16, 18, 24),  Color3.fromRGB(24, 27, 35),  Color3.fromRGB(33, 38, 49),  Color3.fromRGB(150, 165, 190), Color3.fromRGB(70, 155, 115), Color3.fromRGB(210, 80, 90),  Color3.fromRGB(236, 240, 248), Color3.fromRGB(158, 168, 186), Color3.fromRGB(72, 80, 96)),
+        makeTheme("Sunset Ember",  Color3.fromRGB(34, 14, 18),  Color3.fromRGB(50, 21, 25),  Color3.fromRGB(67, 29, 32),  Color3.fromRGB(255, 130, 70), Color3.fromRGB(80, 170, 120), Color3.fromRGB(235, 70, 70),  Color3.fromRGB(252, 238, 232), Color3.fromRGB(196, 158, 148), Color3.fromRGB(108, 68, 62)),
+        makeTheme("Arctic White",  Color3.fromRGB(228, 232, 240),Color3.fromRGB(242, 245, 250),Color3.fromRGB(252, 253, 255),Color3.fromRGB(40, 90, 190), Color3.fromRGB(30, 140, 80),  Color3.fromRGB(210, 40, 50),  Color3.fromRGB(20, 22, 28),   Color3.fromRGB(96, 102, 118),  Color3.fromRGB(196, 202, 216)),
+        makeTheme("Paper Light",   Color3.fromRGB(238, 234, 224),Color3.fromRGB(248, 246, 240),Color3.fromRGB(255, 254, 250),Color3.fromRGB(190, 90, 40), Color3.fromRGB(40, 130, 75),  Color3.fromRGB(200, 45, 45),  Color3.fromRGB(28, 26, 24),   Color3.fromRGB(110, 104, 94),  Color3.fromRGB(200, 194, 182)),
+        makeTheme("Mono Frost",    Color3.fromRGB(20, 22, 24),  Color3.fromRGB(30, 32, 35),  Color3.fromRGB(41, 44, 48),  Color3.fromRGB(225, 228, 232), Color3.fromRGB(90, 92, 96),   Color3.fromRGB(190, 70, 70),  Color3.fromRGB(242, 244, 247), Color3.fromRGB(160, 164, 172), Color3.fromRGB(88, 92, 100)),
+        makeTheme("Deep Forest",   Color3.fromRGB(10, 20, 14),  Color3.fromRGB(16, 32, 22),  Color3.fromRGB(22, 45, 30),  Color3.fromRGB(120, 200, 130), Color3.fromRGB(90, 170, 90),  Color3.fromRGB(215, 85, 75),  Color3.fromRGB(236, 246, 238), Color3.fromRGB(148, 176, 156), Color3.fromRGB(58, 88, 66)),
+        makeTheme("Lavender Haze", Color3.fromRGB(24, 20, 36),  Color3.fromRGB(36, 30, 54),  Color3.fromRGB(49, 42, 74),  Color3.fromRGB(180, 168, 240), Color3.fromRGB(80, 165, 140), Color3.fromRGB(225, 90, 130), Color3.fromRGB(242, 240, 252), Color3.fromRGB(168, 164, 196), Color3.fromRGB(82, 76, 112)),
+        makeTheme("Sunset Candy",  Color3.fromRGB(40, 16, 30),  Color3.fromRGB(56, 23, 42),  Color3.fromRGB(75, 31, 56),  Color3.fromRGB(255, 140, 190), Color3.fromRGB(70, 180, 140), Color3.fromRGB(240, 70, 100), Color3.fromRGB(252, 238, 246), Color3.fromRGB(196, 158, 182), Color3.fromRGB(112, 64, 90)),
+        makeTheme("Mossy Stone",   Color3.fromRGB(26, 26, 22),  Color3.fromRGB(38, 38, 32),  Color3.fromRGB(52, 52, 43),  Color3.fromRGB(178, 186, 120), Color3.fromRGB(90, 160, 95),  Color3.fromRGB(205, 90, 70),  Color3.fromRGB(242, 244, 234), Color3.fromRGB(170, 174, 152), Color3.fromRGB(96, 96, 82)),
+        makeTheme("Abyss",         Color3.fromRGB(6, 10, 14),   Color3.fromRGB(11, 17, 23),  Color3.fromRGB(16, 24, 32),  Color3.fromRGB(80, 190, 230), Color3.fromRGB(50, 160, 120), Color3.fromRGB(220, 70, 90),  Color3.fromRGB(234, 244, 250), Color3.fromRGB(140, 164, 180), Color3.fromRGB(48, 68, 82)),
+-- ---- Halloween set ----
+        -- Kept as its own group so the list reads as a collection rather than 77
+        -- unrelated rows. Each one passes the full 10-argument set.
+        makeTheme("Jack O'Lantern", Color3.fromRGB(26, 14, 8),   Color3.fromRGB(40, 22, 10),  Color3.fromRGB(55, 31, 14),  Color3.fromRGB(255, 150, 40), Color3.fromRGB(120, 180, 70), Color3.fromRGB(220, 60, 50),  Color3.fromRGB(255, 244, 230), Color3.fromRGB(214, 178, 138), Color3.fromRGB(140, 86, 36)),
+        makeTheme("Ghostly",Color3.fromRGB(20, 20, 26),  Color3.fromRGB(30, 30, 38),  Color3.fromRGB(42, 42, 54),  Color3.fromRGB(235, 238, 255), Color3.fromRGB(150, 120, 200), Color3.fromRGB(200, 80, 100), Color3.fromRGB(248, 248, 255), Color3.fromRGB(178, 178, 198), Color3.fromRGB(96, 96, 120)),
+        makeTheme("Witch's Brew",   Color3.fromRGB(16, 22, 14),  Color3.fromRGB(24, 34, 20),  Color3.fromRGB(33, 47, 27),  Color3.fromRGB(140, 230, 90), Color3.fromRGB(110, 170, 80), Color3.fromRGB(190, 70, 120), Color3.fromRGB(238, 248, 232), Color3.fromRGB(160, 186, 152), Color3.fromRGB(70, 96, 60)),
+        makeTheme("Vampire Blood", Color3.fromRGB(20, 6, 8),    Color3.fromRGB(31, 9, 12),   Color3.fromRGB(43, 13, 16),  Color3.fromRGB(200, 30, 45), Color3.fromRGB(120, 40, 60),  Color3.fromRGB(240, 50, 60),  Color3.fromRGB(250, 232, 234), Color3.fromRGB(196, 150, 156), Color3.fromRGB(96, 34, 40)),
+        makeTheme("Cauldron",      Color3.fromRGB(18, 20, 14),  Color3.fromRGB(28, 30, 21),  Color3.fromRGB(39, 42, 29),  Color3.fromRGB(180, 255, 90), Color3.fromRGB(120, 200, 90), Color3.fromRGB(210, 70, 80),  Color3.fromRGB(244, 250, 232), Color3.fromRGB(172, 182, 150), Color3.fromRGB(84, 92, 62)),
+        makeTheme("Candy Corn",    Color3.fromRGB(30, 26, 18),  Color3.fromRGB(44, 38, 26),  Color3.fromRGB(60, 52, 34),  Color3.fromRGB(255, 210, 110), Color3.fromRGB(200, 170, 80), Color3.fromRGB(220, 70, 70),  Color3.fromRGB(255, 250, 238), Color3.fromRGB(212, 196, 164), Color3.fromRGB(126, 110, 76)),
+        makeTheme("Cobweb",Color3.fromRGB(14, 14, 18),  Color3.fromRGB(22, 22, 28),  Color3.fromRGB(31, 31, 40),  Color3.fromRGB(190, 190, 205), Color3.fromRGB(120, 130, 170), Color3.fromRGB(190, 70, 90),  Color3.fromRGB(238, 238, 246), Color3.fromRGB(164, 164, 180), Color3.fromRGB(74, 74, 92)),
+        makeTheme("Bone & Dust",   Color3.fromRGB(24, 22, 18),  Color3.fromRGB(37, 34, 28),  Color3.fromRGB(51, 47, 38),  Color3.fromRGB(226, 216, 190), Color3.fromRGB(150, 120, 80),  Color3.fromRGB(200, 80, 70),  Color3.fromRGB(248, 244, 234), Color3.fromRGB(190, 182, 164), Color3.fromRGB(98, 92, 76)),
+        makeTheme("Fog Cemetery",  Color3.fromRGB(12, 16, 16),  Color3.fromRGB(20, 26, 26),  Color3.fromRGB(28, 36, 36),  Color3.fromRGB(150, 190, 180), Color3.fromRGB(90, 160, 120), Color3.fromRGB(200, 80, 90),  Color3.fromRGB(234, 242, 240), Color3.fromRGB(152, 174, 172), Color3.fromRGB(62, 80, 80)),
+        makeTheme("Black Cat",     Color3.fromRGB(12, 10, 16),  Color3.fromRGB(20, 17, 26),  Color3.fromRGB(28, 24, 36),  Color3.fromRGB(190, 90, 240), Color3.fromRGB(120, 170, 110), Color3.fromRGB(225, 60, 100), Color3.fromRGB(244, 238, 252), Color3.fromRGB(176, 166, 194), Color3.fromRGB(74, 66, 92)),
+        makeTheme("Pumpkin Spice", Color3.fromRGB(28, 18, 12),  Color3.fromRGB(42, 27, 17),  Color3.fromRGB(58, 38, 23),  Color3.fromRGB(240, 140, 60), Color3.fromRGB(140, 170, 90), Color3.fromRGB(210, 70, 60),  Color3.fromRGB(252, 240, 228), Color3.fromRGB(206, 180, 156), Color3.fromRGB(112, 84, 60)),
+        makeTheme("Midnight Harvest", Color3.fromRGB(10, 12, 10),Color3.fromRGB(17, 20, 16),  Color3.fromRGB(25, 30, 23),  Color3.fromRGB(160, 230, 110), Color3.fromRGB(110, 180, 80),  Color3.fromRGB(215, 75, 85),  Color3.fromRGB(238, 246, 234), Color3.fromRGB(160, 180, 152), Color3.fromRGB(64, 78, 58)),
+        makeTheme("Haunted Manor", Color3.fromRGB(16, 14, 20),  Color3.fromRGB(25, 22, 32),  Color3.fromRGB(35, 30, 45),  Color3.fromRGB(215, 90, 240), Color3.fromRGB(100, 160, 120), Color3.fromRGB(225, 70, 110), Color3.fromRGB(246, 240, 252), Color3.fromRGB(178, 170, 196), Color3.fromRGB(80, 72, 100)),
+        makeTheme("Sour Candy",    Color3.fromRGB(20, 26, 16),  Color3.fromRGB(30, 39, 22),  Color3.fromRGB(42, 54, 30),  Color3.fromRGB(190, 255, 70), Color3.fromRGB(255, 90, 190), Color3.fromRGB(90, 190, 255), Color3.fromRGB(244, 252, 236), Color3.fromRGB(174, 196, 160), Color3.fromRGB(78, 98, 66)),
+        makeTheme("Graveyard",     Color3.fromRGB(12, 14, 18),  Color3.fromRGB(20, 23, 29),  Color3.fromRGB(28, 33, 41),  Color3.fromRGB(130, 200, 210), Color3.fromRGB(100, 165, 115), Color3.fromRGB(200, 75, 90),  Color3.fromRGB(234, 242, 246), Color3.fromRGB(154, 172, 184), Color3.fromRGB(64, 76, 92)),
+        makeTheme("Moonlit",       Color3.fromRGB(12, 14, 26),  Color3.fromRGB(20, 23, 40),  Color3.fromRGB(28, 33, 56),  Color3.fromRGB(190, 200, 255), Color3.fromRGB(120, 160, 210), Color3.fromRGB(210, 80, 100), Color3.fromRGB(242, 244, 255), Color3.fromRGB(166, 174, 202), Color3.fromRGB(70, 78, 110)),
+        makeTheme("Scarecrow",     Color3.fromRGB(28, 22, 12),  Color3.fromRGB(42, 34, 19),  Color3.fromRGB(58, 47, 26),  Color3.fromRGB(235, 190, 80), Color3.fromRGB(130, 170, 80),  Color3.fromRGB(205, 75, 70),  Color3.fromRGB(252, 244, 226), Color3.fromRGB(206, 186, 150), Color3.fromRGB(116, 98, 60)),
+        makeTheme("Torchlight",    Color3.fromRGB(20, 14, 10),  Color3.fromRGB(31, 22, 14),  Color3.fromRGB(43, 31, 19),  Color3.fromRGB(255, 140, 50), Color3.fromRGB(120, 165, 80),  Color3.fromRGB(215, 70, 60),  Color3.fromRGB(252, 238, 222), Color3.fromRGB(204, 172, 140), Color3.fromRGB(100, 74, 48)),
+        makeTheme("Full Moon",     Color3.fromRGB(10, 12, 20),  Color3.fromRGB(17, 20, 32),  Color3.fromRGB(24, 28, 44),  Color3.fromRGB(215, 225, 245), Color3.fromRGB(120, 150, 190), Color3.fromRGB(205, 75, 95),  Color3.fromRGB(244, 246, 255), Color3.fromRGB(162, 170, 196), Color3.fromRGB(66, 74, 100)),
+        makeTheme("Hex & Potions", Color3.fromRGB(16, 14, 24),  Color3.fromRGB(25, 22, 37),  Color3.fromRGB(35, 31, 52),  Color3.fromRGB(160, 120, 255), Color3.fromRGB(90, 175, 130), Color3.fromRGB(220, 70, 120), Color3.fromRGB(244, 240, 255), Color3.fromRGB(174, 166, 198), Color3.fromRGB(76, 68, 104)),
+        makeTheme("Necromancer",   Color3.fromRGB(14, 10, 18),  Color3.fromRGB(22, 16, 29),  Color3.fromRGB(31, 23, 41),  Color3.fromRGB(150, 90, 255), Color3.fromRGB(100, 170, 120), Color3.fromRGB(215, 65, 105), Color3.fromRGB(242, 236, 250), Color3.fromRGB(170, 162, 194), Color3.fromRGB(70, 62, 96)),
+        makeTheme("Pumpkin King",  Color3.fromRGB(22, 12, 8),   Color3.fromRGB(34, 19, 11),  Color3.fromRGB(47, 27, 15),  Color3.fromRGB(255, 130, 30), Color3.fromRGB(200, 90, 40),  Color3.fromRGB(230, 60, 50),  Color3.fromRGB(255, 238, 220), Color3.fromRGB(210, 176, 148), Color3.fromRGB(112, 72, 42)),
+        makeTheme("Poison Brew",   Color3.fromRGB(14, 20, 12),  Color3.fromRGB(21, 31, 17),  Color3.fromRGB(30, 44, 24),  Color3.fromRGB(150, 255, 60), Color3.fromRGB(190, 210, 70),  Color3.fromRGB(210, 60, 90),  Color3.fromRGB(240, 252, 230), Color3.fromRGB(168, 190, 146), Color3.fromRGB(70, 92, 54)),
+        makeTheme("Bat's Nest",    Color3.fromRGB(14, 12, 14),  Color3.fromRGB(23, 20, 23),  Color3.fromRGB(32, 28, 32),  Color3.fromRGB(175, 130, 200), Color3.fromRGB(110, 155, 110), Color3.fromRGB(205, 70, 90),  Color3.fromRGB(240, 236, 244), Color3.fromRGB(172, 168, 180), Color3.fromRGB(70, 66, 78)),
+        makeTheme("Spooky Candy Apple", Color3.fromRGB(26, 12, 16), Color3.fromRGB(40, 18, 24), Color3.fromRGB(55, 25, 33),  Color3.fromRGB(235, 70, 90),  Color3.fromRGB(90, 175, 130),  Color3.fromRGB(240, 60, 80),  Color3.fromRGB(252, 232, 238), Color3.fromRGB(204, 158, 170), Color3.fromRGB(104, 54, 66)),
     }
 
     -- Always build the UI from the original Default Dark colors first.
@@ -2762,7 +3266,9 @@ task.spawn(function()
 
         autoHatchMain.BackgroundColor3 = activeTheme.background
         autoHatchShadow.Color = activeTheme.accent
-        autoTitle.TextColor3 = Color3.fromRGB(60, 140, 220)
+        -- The title used to be hard-coded blue, so it ignored the theme
+        -- entirely and sat oddly against every palette except the default.
+        autoTitle.TextColor3 = activeTheme.accent
 
         for _, btn in ipairs({hatchTab, tpTab, settingsTab, eggTab, farmTab, daycareTab}) do
             if btn == currentTabBtn then
@@ -2770,9 +3276,23 @@ task.spawn(function()
                 btn.TextColor3 = Color3.fromRGB(255, 255, 255)
             else
                 btn.BackgroundColor3 = activeTheme.surface
-                btn.TextColor3 = Color3.fromRGB(180, 180, 190)
+                btn.TextColor3 = activeTheme.muted
             end
         end
+
+        -- Move the tick and the highlight ring onto the active theme row.
+        if themeRows then
+            for name, entry in pairs(themeRows) do
+                local isActive = (name == themeObj.name)
+                if entry.check then entry.check.Visible = isActive end
+                if entry.stroke then
+                    entry.stroke.Thickness = isActive and 2 or 1
+                    entry.stroke.Transparency = isActive and 0 or 0.55
+                    entry.stroke.Color = themeObj.accent
+                end
+            end
+        end
+        if themeScroll then themeScroll.BackgroundColor3 = activeTheme.panel end
     end
 
     -- Instantly theme newly-created UI too. This fixes controls that previously
@@ -2840,7 +3360,20 @@ task.spawn(function()
         btnStroke.Transparency = 0.7
         btnStroke.Parent = btn
 
-        local state = CurrentToggleStates[text] == true and true or defaultState
+        -- Toggles that must never come back ON from the saved config. AFK opens the
+        -- full-screen overlay and hides the hub, so restoring it made every
+        -- execute look broken. Kept in a set so more toggles can be added
+        -- later without touching the restore loop.
+        local NEVER_RESTORE = {
+            ["AFK CPU Reducer"] = true,
+        }
+
+        local state = (not NEVER_RESTORE[text]) and CurrentToggleStates[text] == true or defaultState
+        if NEVER_RESTORE[text] then
+            -- also drop the stale saved value so the button does not light up
+            -- green while the feature is actually off
+            CurrentToggleStates[text] = false
+        end
         btn:SetAttribute("ToggleState", state)
         toggleCallbacks[text] = callback
 
@@ -2889,10 +3422,12 @@ task.spawn(function()
     farmTitle.Parent = farmFrame
 
     createUnifiedToggle(farmFrame, 32, "Robot Farm", false, function(state) AutoFarmRobot = state end)
-    createUnifiedToggle(farmFrame, 74, "Turkey/Boss Farm", false, function(state)
-        AutoFarmTurkey = state
-        TurkeyDodgeActive = state
-    end)
+    -- REMOVED: "Turkey/Boss Farm". The Pilgrim Turkey is Autumn-only boss
+    -- content (Mobs.Autumn.Boss). Verified live: the Coins container holds only
+    -- Halloween content (Giant Pumpkin, Large/Small Coins, Safe, Vault), so
+    -- FindTurkey() matched 0 of 5 distinct coin names and the toggle could never
+    -- acquire a target. AutoFarmTurkey stays declared-but-false because the
+    -- shared status-bar and damage branches still read it.
     createUnifiedToggle(farmFrame, 116, "Comet Farm", false, function(state)
         AutoFarmComet = state
         if state then
@@ -2915,22 +3450,23 @@ task.spawn(function()
         end
     end)
 
-    createUnifiedToggle(farmFrame, 368, "Expedition Farm", false, function(state)
-        AutoFarmExpedition = state
-        if not state then
-            CurrentExpeditionTarget = nil
-            CurrentExpeditionTargetId = nil
-            LastExpeditionPetSendTarget = nil
-            ExpeditionActiveAttacks = {}
-            ExpeditionDodgeActive = false
-            ExpeditionDodgeSavedCFrame = nil
-        end
-    end)
+    -- REMOVED: "Expedition Farm". The seven Expedition mobs
+    -- (Mobs.Autumn.Expedition) only spawn during an expedition run, gated on
+    -- localPlayer:GetAttribute("ExpeditionRun"). Verified live: that attribute
+    -- is nil and the Autumn mobs are absent, so FindRandomExpeditionMob
+    -- returned nil every tick and the dodge/attack scheduler never had a
+    -- target. AutoFarmExpedition stays declared-but-false because the
+    -- status-bar and damage branches still read it.
 
-    createUnifiedToggle(farmFrame, 410, "Auto Trick or Treating", false, function(state)
-        AutoTrickOrTreat = state
-    end)
 
+    -- REMOVED: "Auto Giant Pumpkin", "Auto Open Pumpkin" and "Auto Wand Upgrades".
+    -- Their routes (HalloweenPumpkin: Feed/Open/Upgrade) return no values through
+    -- this executor, so none of them could be confirmed working. Removed instead
+    -- of shipping toggles that look live and do nothing.
+
+    -- REMOVED: "Auto Trick or Treating". It reached the pumpkin houses but the
+    -- server answered "Trick or Treat paused for you", which is a movement check
+    -- on travel speed - it only worked when walked at under the published cap.
     createUnifiedToggle(farmFrame, 452, "Auto Tap", false, function(state)
         AutoTap = state
         if not state then
@@ -2966,6 +3502,8 @@ task.spawn(function()
     antiAfkBox.BackgroundColor3 = Color3.fromRGB(35, 35, 48)
     antiAfkBox.BorderSizePixel = 0
     antiAfkBox.ClearTextOnFocus = false
+    -- Restore the saved interval so it survives a rejoin
+    AntiAFKIntervalMinutes = tonumber(GetSetting("antiAfkMinutes", 1)) or 1
     antiAfkBox.Text = tostring(AntiAFKIntervalMinutes)
     antiAfkBox.PlaceholderText = "Minutes"
     antiAfkBox.TextColor3 = Color3.fromRGB(255, 255, 255)
@@ -2985,8 +3523,12 @@ task.spawn(function()
         value = math.clamp(value, 0.1, 1440)
         AntiAFKIntervalMinutes = value
         antiAfkBox.Text = tostring(value)
+        SetSetting("antiAfkMinutes", value)
     end)
 
+
+    -- REMOVED: the pumpkin control panel (protect-N box, wand-reserve box and the
+    -- pumpkin status readout). Gone with the feature.
     local farmStatus = Instance.new("TextLabel")
     farmStatus.Size = UDim2.new(1, 0, 0, 28)
     farmStatus.Position = UDim2.new(0, 0, 0, 616)
@@ -3056,8 +3598,7 @@ task.spawn(function()
     -- =====================================================================
     -- Built inside its own function: the main UI thread was already close to
     -- Luau's 200-register-per-function limit, and hoisting this block's locals
-    -- into a nested scope is what keeps the whole script compiling.
-    local function buildDaycareUI()
+local function buildDaycareUI()
     local daycareTitle = Instance.new("TextLabel")
     daycareTitle.Size = UDim2.new(1, 0, 0, 24)
     daycareTitle.Position = UDim2.new(0, 0, 0, 0)
@@ -3070,10 +3611,10 @@ task.spawn(function()
     daycareTitle.Parent = daycareFrame
 
     local daycareHint = Instance.new("TextLabel")
-    daycareHint.Size = UDim2.new(1, 0, 0, 40)
+    daycareHint.Size = UDim2.new(1, 0, 0, 52)
     daycareHint.Position = UDim2.new(0, 0, 0, 24)
     daycareHint.BackgroundTransparency = 1
-    daycareHint.Text = "Fills every slot with your strongest pets while permanently keeping your very best one out of the hatch team."
+    daycareHint.Text = "TEAM: fills every slot with your strongest pets. QUEUE: claims finished slots and enrolls spare pets - only Basic-Common-Uncommon-Rare-Epic-Legendary-Mythical-Eternal pets that actually carry powers. Huge, Titanic, Gargantuan, Secret and ALL Exclusive pets can never be used in Daycare and are never touched."
     daycareHint.TextColor3 = Color3.fromRGB(190, 190, 200)
     daycareHint.Font = Enum.Font.Gotham
     daycareHint.TextSize = 11
@@ -3083,8 +3624,8 @@ task.spawn(function()
     daycareHint.Parent = daycareFrame
 
     local daycareStats = Instance.new("TextLabel")
-    daycareStats.Size = UDim2.new(1, 0, 0, 54)
-    daycareStats.Position = UDim2.new(0, 0, 0, 68)
+    daycareStats.Size = UDim2.new(1, 0, 0, 62)
+    daycareStats.Position = UDim2.new(0, 0, 0, 78)
     daycareStats.BackgroundColor3 = activeTheme.panel
     daycareStats.BorderSizePixel = 0
     daycareStats.TextColor3 = Color3.fromRGB(190, 210, 235)
@@ -3097,40 +3638,81 @@ task.spawn(function()
     daycareStats.Parent = daycareFrame
     do local _c = Instance.new("UICorner") _c.CornerRadius = UDim.new(0, 8) _c.Parent = daycareStats end
 
-    local function daycareInput(labelText, y, default, width)
+    local function daycareInput(labelText, y, default, boxWidth)
         local lbl = Instance.new("TextLabel")
-        lbl.Size = UDim2.new(0.44, 0, 0, 28)
+        lbl.Size = UDim2.new(0.46, 0, 0, 28)
         lbl.Position = UDim2.new(0, 0, 0, y)
         lbl.BackgroundTransparency = 1
         lbl.Text = labelText
         lbl.TextColor3 = Color3.fromRGB(190, 190, 200)
         lbl.Font = Enum.Font.GothamBold
-        lbl.TextSize = 12
+        lbl.TextSize = 11
         lbl.TextXAlignment = Enum.TextXAlignment.Left
         lbl.Parent = daycareFrame
 
         local box = Instance.new("TextBox")
-        box.Size = UDim2.new(0.26, 0, 0, 28)
+        box.Size = UDim2.new(boxWidth or 0.26, 0, 0, 28)
         box.Position = UDim2.new(0.46, 0, 0, y)
         box.BackgroundColor3 = Color3.fromRGB(35, 35, 48)
         box.BorderSizePixel = 0
         box.ClearTextOnFocus = false
         box.Text = tostring(default)
-        box.PlaceholderText = "0 = auto"
+        box.PlaceholderText = "0 = off"
         box.TextColor3 = Color3.fromRGB(255, 255, 255)
         box.Font = Enum.Font.GothamBold
         box.TextSize = 12
         box.Parent = daycareFrame
         do local _c = Instance.new("UICorner") _c.CornerRadius = UDim.new(0, 6) _c.Parent = box end
-
-        if width then box.Size = UDim2.new(width, 0, 0, 28) end
         return box
     end
 
-    local protectBox = daycareInput("Protect best N pets", 132, Daycare.Protect)
-    local slotsBox = daycareInput("Slots to fill (0 = max)", 164, Daycare.SlotOverride)
-    local minSizeBox = daycareInput("Minimum size (0 = any)", 196, Daycare.MinSize)
-    local intervalBox = daycareInput("Re-check interval (s)", 228, Daycare.Interval)
+    -- ---- team row ----
+    local protectBox = daycareInput("Protect best N pets", 148, Daycare.Protect)
+    local slotsBox = daycareInput("Slots to fill (0 = max)", 180, Daycare.SlotOverride)
+    local minSizeBox = daycareInput("Min power for team", 212, Daycare.MinSize)
+    local intervalBox = daycareInput("Team re-check (s)", 244, Daycare.Interval)
+
+    -- ---- exclusion bar ----
+    local excludeLbl = Instance.new("TextLabel")
+    excludeLbl.Size = UDim2.new(1, 0, 0, 16)
+    excludeLbl.Position = UDim2.new(0, 0, 0, 280)
+    excludeLbl.BackgroundTransparency = 1
+    excludeLbl.Text = "EXCLUDE PETS (comma separated - these are NEVER trashed)"
+    excludeLbl.TextColor3 = Color3.fromRGB(255, 150, 150)
+    excludeLbl.Font = Enum.Font.GothamBold
+    excludeLbl.TextSize = 10
+    excludeLbl.TextXAlignment = Enum.TextXAlignment.Left
+    excludeLbl.Parent = daycareFrame
+
+    local excludeBox = Instance.new("TextBox")
+    excludeBox.Size = UDim2.new(1, 0, 0, 30)
+    excludeBox.Position = UDim2.new(0, 0, 0, 298)
+    excludeBox.BackgroundColor3 = Color3.fromRGB(35, 35, 48)
+    excludeBox.BorderSizePixel = 0
+    excludeBox.ClearTextOnFocus = false
+    excludeBox.Text = Daycare.ExcludeText
+    excludeBox.PlaceholderText = "wolf, rainbow, legendary, my best pet name..."
+    excludeBox.TextColor3 = Color3.fromRGB(255, 255, 255)
+    excludeBox.Font = Enum.Font.Gotham
+    excludeBox.TextSize = 11
+    excludeBox.Parent = daycareFrame
+    do local _c = Instance.new("UICorner") _c.CornerRadius = UDim.new(0, 6) _c.Parent = excludeBox end
+
+    local excludeCount = Instance.new("TextLabel")
+    excludeCount.Size = UDim2.new(1, 0, 0, 16)
+    excludeCount.Position = UDim2.new(0, 0, 0, 330)
+    excludeCount.BackgroundTransparency = 1
+    excludeCount.Text = ""
+    excludeCount.TextColor3 = Color3.fromRGB(150, 200, 255)
+    excludeCount.Font = Enum.Font.Gotham
+    excludeCount.TextSize = 10
+    excludeCount.TextXAlignment = Enum.TextXAlignment.Left
+    excludeCount.Parent = daycareFrame
+
+    -- ---- queue inputs ----
+    local keepPowerBox = daycareInput("Keep power >= (0 = any)", 352, Daycare.KeepPower)
+    local batchBox = daycareInput("Enroll batch size", 384, Daycare.EnrollBatch)
+    local qIntervalBox = daycareInput("Queue check (s)", 416, Daycare.QueueInterval)
 
     local function readNumber(box, fallback)
         local value = tonumber(box.Text)
@@ -3144,21 +3726,69 @@ task.spawn(function()
     protectBox.FocusLost:Connect(function()
         Daycare.Protect = math.clamp(math.floor(readNumber(protectBox, Daycare.Protect)), 0, 200)
         protectBox.Text = tostring(Daycare.Protect)
+        SetSetting("daycareProtect", Daycare.Protect)
     end)
     slotsBox.FocusLost:Connect(function()
         Daycare.SlotOverride = math.max(0, math.floor(readNumber(slotsBox, Daycare.SlotOverride)))
         slotsBox.Text = tostring(Daycare.SlotOverride)
+        SetSetting("daycareSlots", Daycare.SlotOverride)
     end)
     minSizeBox.FocusLost:Connect(function()
         Daycare.MinSize = math.max(0, readNumber(minSizeBox, Daycare.MinSize))
         minSizeBox.Text = tostring(Daycare.MinSize)
+        SetSetting("daycareMinPower", Daycare.MinSize)
     end)
     intervalBox.FocusLost:Connect(function()
         Daycare.Interval = math.clamp(readNumber(intervalBox, Daycare.Interval), 2, 600)
         intervalBox.Text = tostring(Daycare.Interval)
+        SetSetting("daycareInterval", Daycare.Interval)
+    end)
+    excludeBox:GetPropertyChangedSignal("Text"):Connect(function()
+        Daycare.ExcludeText = tostring(excludeBox.Text or "")
+        SetSetting("daycareExclude", Daycare.ExcludeText)
+    end)
+    keepPowerBox.FocusLost:Connect(function()
+        Daycare.KeepPower = math.max(0, readNumber(keepPowerBox, Daycare.KeepPower))
+        keepPowerBox.Text = tostring(Daycare.KeepPower)
+        SetSetting("daycareKeepPower", Daycare.KeepPower)
+    end)
+    batchBox.FocusLost:Connect(function()
+        Daycare.EnrollBatch = math.clamp(math.floor(readNumber(batchBox, Daycare.EnrollBatch)), 1, 50)
+        batchBox.Text = tostring(Daycare.EnrollBatch)
+        SetSetting("daycareBatch", Daycare.EnrollBatch)
+    end)
+    qIntervalBox.FocusLost:Connect(function()
+        Daycare.QueueInterval = math.clamp(readNumber(qIntervalBox, Daycare.QueueInterval), 3, 600)
+        qIntervalBox.Text = tostring(Daycare.QueueInterval)
+        SetSetting("daycareQueueInterval", Daycare.QueueInterval)
     end)
 
-    createUnifiedToggle(daycareFrame, 264, "Daycare Auto", false, function(state)
+    -- Restore the Daycare values and repaint the boxes. Registered as sinks so
+    -- a later SetSetting also pushes straight into the UI.
+    local DAYCARE_FIELDS = {
+        { key = "daycareProtect",      field = "Protect",       box = protectBox },
+        { key = "daycareSlots",        field = "SlotOverride",  box = slotsBox },
+        { key = "daycareMinPower",     field = "MinSize",       box = minSizeBox },
+        { key = "daycareInterval",     field = "Interval",      box = intervalBox },
+        { key = "daycareKeepPower",    field = "KeepPower",     box = keepPowerBox },
+        { key = "daycareBatch",        field = "EnrollBatch",   box = batchBox },
+        { key = "daycareQueueInterval", field = "QueueInterval", box = qIntervalBox },
+    }
+    for _, entry in ipairs(DAYCARE_FIELDS) do
+        local v = GetSetting(entry.key, nil)
+        if v ~= nil then
+            Daycare[entry.field] = v
+            entry.box.Text = tostring(v)
+        end
+    end
+    local savedExclude = GetSetting("daycareExclude", nil)
+    if type(savedExclude) == "string" then
+        Daycare.ExcludeText = savedExclude
+        excludeBox.Text = savedExclude
+    end
+
+    -- ---- toggles ----
+    createUnifiedToggle(daycareFrame, 448, "Daycare Auto (Team)", false, function(state)
         Daycare.Auto = state
         if state then
             Daycare.LastRun = 0
@@ -3166,18 +3796,21 @@ task.spawn(function()
         end
     end)
 
-    local daycareStatus = Instance.new("TextLabel")
-    daycareStatus.Size = UDim2.new(1, 0, 0, 34)
-    daycareStatus.Position = UDim2.new(0, 0, 0, 384)
-    daycareStatus.BackgroundTransparency = 1
-    daycareStatus.Text = "Ready"
-    daycareStatus.TextColor3 = Color3.fromRGB(180, 180, 190)
-    daycareStatus.Font = Enum.Font.GothamBold
-    daycareStatus.TextSize = 12
-    daycareStatus.TextWrapped = true
-    daycareStatus.TextXAlignment = Enum.TextXAlignment.Left
-    daycareStatus.Parent = daycareFrame
+    createUnifiedToggle(daycareFrame, 490, "Auto Claim Daycare", false, function(state)
+        Daycare.AutoClaim = state
+        Daycare.LastQueueRun = 0
+    end)
 
+    createUnifiedToggle(daycareFrame, 532, "Auto Enroll Pets", false, function(state)
+        Daycare.AutoEnroll = state
+        Daycare.LastQueueRun = 0
+    end)
+
+    createUnifiedToggle(daycareFrame, 574, "Enroll Dry Run", true, function(state)
+        Daycare.DryRun = state
+    end)
+
+    -- ---- manual buttons ----
     local function daycareActionButton(text, y, x, color, callback)
         local btn = Instance.new("TextButton")
         btn.Size = UDim2.new(0.31, -4, 0, 34)
@@ -3186,7 +3819,7 @@ task.spawn(function()
         btn.Text = text
         btn.TextColor3 = Color3.fromRGB(255, 255, 255)
         btn.Font = Enum.Font.GothamBold
-        btn.TextSize = 11
+        btn.TextSize = 10
         btn.TextWrapped = true
         btn.BorderSizePixel = 0
         btn.Parent = daycareFrame
@@ -3195,7 +3828,19 @@ task.spawn(function()
         return btn
     end
 
-    daycareActionButton("SAVE CURRENT TEAM", 304, 0, Color3.fromRGB(55, 55, 78), function()
+    local daycareStatus = Instance.new("TextLabel")
+    daycareStatus.Size = UDim2.new(1, 0, 0, 34)
+    daycareStatus.Position = UDim2.new(0, 0, 0, 616)
+    daycareStatus.BackgroundTransparency = 1
+    daycareStatus.Text = "Ready"
+    daycareStatus.TextColor3 = Color3.fromRGB(180, 180, 190)
+    daycareStatus.Font = Enum.Font.GothamBold
+    daycareStatus.TextSize = 11
+    daycareStatus.TextWrapped = true
+    daycareStatus.TextXAlignment = Enum.TextXAlignment.Left
+    daycareStatus.Parent = daycareFrame
+
+    daycareActionButton("SAVE TEAM", 656, 0, Color3.fromRGB(55, 55, 78), function()
         if saveTeam() then
             daycareStatus.Text = "Team snapshot saved."
             daycareStatus.TextColor3 = Color3.fromRGB(120, 255, 180)
@@ -3205,7 +3850,7 @@ task.spawn(function()
         end
     end)
 
-    daycareActionButton("APPLY NOW", 304, 0.345, Color3.fromRGB(45, 105, 65), function()
+    daycareActionButton("APPLY TEAM", 656, 0.345, Color3.fromRGB(45, 105, 65), function()
         if applyDaycare() then
             daycareStatus.Text = "Applying best-pets team..."
             daycareStatus.TextColor3 = Color3.fromRGB(120, 255, 180)
@@ -3215,7 +3860,7 @@ task.spawn(function()
         end
     end)
 
-    daycareActionButton("RESTORE TEAM", 304, 0.69, Color3.fromRGB(120, 70, 45), function()
+    daycareActionButton("RESTORE TEAM", 656, 0.69, Color3.fromRGB(120, 70, 45), function()
         if restoreDaycareTeam() then
             daycareStatus.Text = "Restoring saved team..."
             daycareStatus.TextColor3 = Color3.fromRGB(255, 200, 120)
@@ -3225,14 +3870,49 @@ task.spawn(function()
         end
     end)
 
+    daycareActionButton("CLAIM NOW", 696, 0, Color3.fromRGB(50, 90, 130), function()
+        Daycare.LastQueueRun = 0
+        local ok = daycareClaim()
+        daycareStatus.Text = ok and "Claimed." or ("Claim: " .. tostring(Daycare.LastResult))
+        daycareStatus.TextColor3 = ok and Color3.fromRGB(120, 255, 180) or Color3.fromRGB(255, 160, 120)
+    end)
+
+    daycareActionButton("ENROLL NOW", 696, 0.345, Color3.fromRGB(130, 70, 30), function()
+        local ok = daycareEnroll()
+        daycareStatus.Text = tostring(Daycare.LastResult)
+        daycareStatus.TextColor3 = ok and Color3.fromRGB(120, 255, 180) or Color3.fromRGB(255, 200, 120)
+    end)
+
+    daycareActionButton("REFRESH", 696, 0.69, Color3.fromRGB(60, 60, 75), function()
+        Daycare.LastQueueRun = 0
+        Daycare.LastRun = 0
+        local cands = buildCandidates()
+        Daycare.EligibleCount = #cands
+        daycareStatus.Text = ("%d eligible, %d queued, %d free"):format(
+            #cands, Daycare.Queued, Daycare.FreeSlots)
+        daycareStatus.TextColor3 = Color3.fromRGB(180, 200, 230)
+    end)
+
+    -- ---- eligibility preview ----
+    local previewTitle = Instance.new("TextLabel")
+    previewTitle.Size = UDim2.new(1, 0, 0, 20)
+    previewTitle.Position = UDim2.new(0, 0, 0, 740)
+    previewTitle.BackgroundTransparency = 1
+    previewTitle.Text = "NEXT PETS THAT WOULD BE ENROLLED (lowest ranked first)"
+    previewTitle.TextColor3 = Color3.fromRGB(255, 200, 120)
+    previewTitle.Font = Enum.Font.GothamBold
+    previewTitle.TextSize = 11
+    previewTitle.TextXAlignment = Enum.TextXAlignment.Left
+    previewTitle.Parent = daycareFrame
+
     local protectedList = Instance.new("TextLabel")
-    protectedList.Size = UDim2.new(1, 0, 1, -428)
-    protectedList.Position = UDim2.new(0, 0, 0, 420)
+    protectedList.Size = UDim2.new(1, 0, 0, 170)
+    protectedList.Position = UDim2.new(0, 0, 0, 762)
     protectedList.BackgroundColor3 = activeTheme.panel
     protectedList.BorderSizePixel = 0
     protectedList.TextColor3 = Color3.fromRGB(200, 200, 215)
     protectedList.Font = Enum.Font.Gotham
-    protectedList.TextSize = 11
+    protectedList.TextSize = 10
     protectedList.TextWrapped = true
     protectedList.TextXAlignment = Enum.TextXAlignment.Left
     protectedList.TextYAlignment = Enum.TextYAlignment.Top
@@ -3240,7 +3920,45 @@ task.spawn(function()
     protectedList.Parent = daycareFrame
     do local _c = Instance.new("UICorner") _c.CornerRadius = UDim.new(0, 8) _c.Parent = protectedList end
 
-    -- Ranking readout. Runs at 3 Hz and only rebuilds when the numbers move.
+    local topList = Instance.new("TextLabel")
+    topList.Size = UDim2.new(1, 0, 0, 130)
+    topList.Position = UDim2.new(0, 0, 0, 940)
+    topList.BackgroundColor3 = activeTheme.panel
+    topList.BorderSizePixel = 0
+    topList.TextColor3 = Color3.fromRGB(200, 220, 240)
+    topList.Font = Enum.Font.Gotham
+    topList.TextSize = 10
+    topList.TextWrapped = true
+    topList.TextXAlignment = Enum.TextXAlignment.Left
+    topList.TextYAlignment = Enum.TextYAlignment.Top
+    topList.Text = ""
+    topList.Parent = daycareFrame
+    do local _c = Instance.new("UICorner") _c.CornerRadius = UDim.new(0, 8) _c.Parent = topList end
+
+    -- The Daycare tab needs to scroll: the controls alone exceed the frame.
+    if not daycareFrame:FindFirstChild("Scroll") then
+        local scroll = Instance.new("ScrollingFrame")
+        scroll.Name = "Scroll"
+        scroll.Size = UDim2.new(1, 0, 1, 0)
+        scroll.Position = UDim2.new(0, 0, 0, 0)
+        scroll.BackgroundTransparency = 1
+        scroll.BorderSizePixel = 0
+        scroll.ScrollBarThickness = 5
+        scroll.AutomaticCanvasSize = Enum.AutomaticSize.Y
+        scroll.ZIndex = 1
+        scroll.Parent = daycareFrame
+        local pad = Instance.new("UIPadding")
+        pad.PaddingBottom = UDim.new(0, 20)
+        pad.Parent = scroll
+        -- reparent everything we already built into the scroller
+        for _, child in ipairs(daycareFrame:GetChildren()) do
+            if child ~= scroll and not child:IsA("UIPadding") then
+                child.Parent = scroll
+            end
+        end
+    end
+
+    -- Ranking + eligibility readout. Runs at 3 Hz and only rebuilds on change.
     task.spawn(function()
         local lastSignature
         while daycareFrame and daycareFrame.Parent do
@@ -3257,25 +3975,58 @@ task.spawn(function()
                     top[#top + 1] = ("%d. %s%s - %s"):format(i, pet.id, tag, shortNumber(pet.size))
                 end
 
+                local cands = buildCandidates()
+                Daycare.EligibleCount = #cands
+                local terms = excludedTerms()
+                local excludedCount = 0
+                if save and #terms > 0 then
+                    for _, pet in pairs(save.Pets or {}) do
+                        if type(pet) == "table" and isExcluded(pet, terms) then
+                            excludedCount += 1
+                        end
+                    end
+                end
+                if #terms > 0 then
+                    excludeCount.Text = ("%d pet(s) match the exclude bar and are protected.")
+                        :format(excludedCount)
+                else
+                    excludeCount.Text = "No exclusions set. Type names to protect them."
+                end
+
+                local sample = {}
+                -- Mirror daycareEnroll: walk from the TAIL, because the
+                -- candidate list is sorted strongest-first.
+                for i = 0, math.min(#cands, 8) - 1 do
+                    local c = cands[#cands - i]
+                    sample[#sample + 1] = ("%s%s  %s  %s"):format(
+                        c.rainbow and "[R] " or (c.golden and "[G] " or (c.shiny and "[S] " or "")),
+                        c.id, c.nk, shortNumber(c.power))
+                end
+
                 local signature = table.concat({
                     tostring(#ranked), tostring(equipped), tostring(maxEquipped),
                     tostring(Daycare.Protect), tostring(Daycare.Auto), tostring(Daycare.LastResult),
-                    top[1] or "", top[2] or ""
+                    tostring(#cands), tostring(excludedCount), tostring(Daycare.Queued),
+                    tostring(Daycare.FreeSlots), tostring(Daycare.DryRun),
+                    top[1] or "", top[2] or "", sample[1] or ""
                 }, "|")
 
                 if signature ~= lastSignature then
                     lastSignature = signature
-                    daycareStats.Text = ("Pets: %d  |  Equipped: %d / %s  |  Auto: %s")
-                        :format(#ranked, equipped, tostring(maxEquipped), Daycare.Auto and "ON" or "OFF")
-                    protectedList.Text = "STRONGEST PETS (highest first)\n" .. table.concat(top, "\n")
-                        .. "\n\n" .. tostring(Daycare.LastResult)
+                    daycareStats.Text = ("Pets: %d  |  Equipped: %d / %s  |  Eligible: %d  |  Queued: %d  |  Free: %d")
+                        :format(#ranked, equipped, tostring(maxEquipped), #cands,
+                            Daycare.Queued, Daycare.FreeSlots)
+                    protectedList.Text = #sample > 0
+                        and ("WOULD ENROLL (dry run " .. (Daycare.DryRun and "ON" or "OFF") .. "):\n"
+                            .. table.concat(sample, "\n"))
+                        or "No pets match the current filter."
+                    topList.Text = "STRONGEST TEAM PETS (highest first)\n" .. table.concat(top, "\n")
                 end
             end
             task.wait(0.33)
         end
     end)
     end
-
     buildDaycareUI()
 
     -- =====================================================================
@@ -3893,7 +4644,7 @@ task.spawn(function()
 
     local statsContainer = Instance.new("Frame")
     statsContainer.Name = "StatsContainer"
-    statsContainer.Size = UDim2.new(1, 0, 0, 142)
+    statsContainer.Size = UDim2.new(1, 0, 0, 232)
     statsContainer.Position = UDim2.new(0, 0, 0, 0)
     statsContainer.BackgroundColor3 = Color3.fromRGB(28, 29, 38)
     statsContainer.Parent = hatchFrame
@@ -3953,7 +4704,7 @@ task.spawn(function()
 
     local SearchBox = Instance.new("TextBox")
     SearchBox.Size = UDim2.new(1, 0, 0, 32)
-    SearchBox.Position = UDim2.new(0, 0, 0, 152)
+    SearchBox.Position = UDim2.new(0, 0, 0, 242)
     SearchBox.PlaceholderText = "Search egg to hatch..."
     SearchBox.Text = ""
     SearchBox.BackgroundColor3 = Color3.fromRGB(30, 30, 40)
@@ -3974,7 +4725,7 @@ task.spawn(function()
 
     local SelectedEggLabel = Instance.new("TextLabel")
     SelectedEggLabel.Size = UDim2.new(1, 0, 0, 20)
-    SelectedEggLabel.Position = UDim2.new(0, 0, 0, 190)
+    SelectedEggLabel.Position = UDim2.new(0, 0, 0, 280)
     SelectedEggLabel.Text = "Selected: Spawn Egg"
     SelectedEggLabel.TextColor3 = Color3.fromRGB(100, 225, 100)
     SelectedEggLabel.Font = Enum.Font.GothamBold
@@ -3985,7 +4736,7 @@ task.spawn(function()
 
     local DropdownFrame = Instance.new("ScrollingFrame")
     DropdownFrame.Size = UDim2.new(1, 0, 0, 100)
-    DropdownFrame.Position = UDim2.new(0, 0, 0, 216)
+    DropdownFrame.Position = UDim2.new(0, 0, 0, 306)
     DropdownFrame.BackgroundColor3 = Color3.fromRGB(25, 25, 35)
     DropdownFrame.BorderSizePixel = 0
     DropdownFrame.CanvasSize = UDim2.new(0, 0, 0, 0)
@@ -4140,7 +4891,7 @@ task.spawn(function()
         end)
     end
 
-    createUnifiedToggle(hatchFrame, 326, "AFK CPU Reducer", false, function(value) setAfkMode(value) end)
+    createUnifiedToggle(hatchFrame, 416, "AFK CPU Reducer", false, function(value) setAfkMode(value) end)
 
     -- Wrapped in a block purely to keep its locals out of the UI thread's
     -- register budget (Luau caps a function at 200 registers).
@@ -4156,7 +4907,7 @@ task.spawn(function()
     local recentPanel = Instance.new("Frame")
     recentPanel.Name = "RecentHatchesPanel"
     recentPanel.Size = UDim2.new(1, -6, 0, 150)
-    recentPanel.Position = UDim2.new(0, 3, 0, 412)
+    recentPanel.Position = UDim2.new(0, 3, 0, 502)
     recentPanel.BackgroundColor3 = activeTheme.panel
     recentPanel.BorderSizePixel = 0
     recentPanel.Parent = hatchFrame
@@ -4321,7 +5072,7 @@ task.spawn(function()
         local webhookPanel = Instance.new("Frame")
         webhookPanel.Name = "WebhookPanel"
         webhookPanel.Size = UDim2.new(1, -16, 0, 290)
-        webhookPanel.Position = UDim2.new(0, 8, 0, 572)
+        webhookPanel.Position = UDim2.new(0, 8, 0, 662)
         webhookPanel.BackgroundColor3 = activeTheme.panel
         webhookPanel.BorderSizePixel = 0
         webhookPanel.Parent = hatchFrame
@@ -4474,19 +5225,70 @@ task.spawn(function()
             }
         end
 
-        local function makePayload(testMessage, category, petName, totals)
+        local function makePayload(testMessage, category, petName, totals, pet)
             local fields = {
                 {name="Huges", value="**"..numberText(totals.Huge).."**", inline=true},
                 {name="Secrets", value="**"..numberText(totals.Secret).."**", inline=true},
                 {name="Titanics", value="**"..numberText(totals.Titanic).."**", inline=true},
-                {name="Gargantuans", value="**"..numberText(totals.Gargantuan).."**", inline=true}
+                {name="Gargantuans", value="**"..numberText(totals.Gargantuans or totals.Gargantuan).."**", inline=true}
             }
+
+            -- Rarity line. A rainbow pet takes the headline colour, because that
+            -- is the hatch you actually care about being pinged for.
+            local variantText = nil
+            local embedColor = 5793266 -- default green
+            if pet then
+                local tags = {}
+                if pet.rainbow then
+                    table.insert(tags, "Rainbow")
+                    embedColor = 16711935 -- magenta
+                end
+                if pet.golden then
+                    table.insert(tags, "Golden")
+                    if not pet.rainbow then embedColor = 15844367 end
+                end
+                if pet.shiny then
+                    table.insert(tags, "Shiny")
+                    if not pet.rainbow and not pet.golden then embedColor = 65495 end
+                end
+                if #tags > 0 then
+                    variantText = table.concat(tags, "  +  ")
+                end
+            end
+
+            -- Running variant subtotals across every tier, so the embed tells
+            -- you "20 rainbow huges owned" and not just this one hatch.
+            local vlines = {}
+            local order = {
+                {"Huges", "Huges"},
+                {"Titanics", "Titanics"},
+                {"Gargantuans", "Gargantuans"},
+                {"Secrets", "Secrets"},
+            }
+            for _, pair in ipairs(order) do
+                local base = pair[1]
+                local rb = variantCounts[base] or 0
+                local gd = variantCounts[base .. "Golden"] or 0
+                local sh = variantCounts[base .. "Shiny"] or 0
+                if rb > 0 or gd > 0 or sh > 0 then
+                    table.insert(vlines, ("%s — R:%d  G:%d  S:%d"):format(pair[2], rb, gd, sh))
+                end
+            end
+            local variantBlock = #vlines > 0 and ("\n\n**Variants owned**\n" .. table.concat(vlines, "\n")) or ""
+
+            local desc = testMessage and "Your rare-pet webhook is connected."
+                or ("## " .. tostring(petName or "Unknown Pet"))
+            if variantText then
+                desc = desc .. "\n" .. variantText
+            end
+            desc = desc .. variantBlock
+
             return {
                 username="Pet Dimensions Hub",
                 embeds={{
                     title=testMessage and "Webhook Test" or ("New "..tostring(category).."!"),
-                    description=testMessage and "Your rare-pet webhook is connected." or ("## "..tostring(petName or "Unknown Pet")),
-                    color=5793266,
+                    description=desc,
+                    color=embedColor,
                     fields=fields,
                     footer={text="Pet Dimensions Hub - Rare Hatch Tracker"},
                     timestamp=os.date("!%Y-%m-%dT%H:%M:%SZ")
@@ -4536,7 +5338,13 @@ task.spawn(function()
                     if entry and entry.uid then
                         result[tostring(entry.uid)] = {
                             category = data.category,
-                            name = entry.name
+                            name = entry.name,
+                            -- carry the rarity flags through so the webhook can
+                            -- report Rainbow/Golden/Shiny instead of a bare name
+                            rainbow = entry.rainbow == true,
+                            golden = entry.golden == true,
+                            shiny = entry.shiny == true,
+                            nickname = entry.nickname,
                         }
                     end
                 end
@@ -4558,7 +5366,11 @@ task.spawn(function()
                             if category and WebhookNotify[category] then
                                 table.insert(additions, {
                                     category = category,
-                                    name = tostring(entry.name or "Unknown Pet")
+                                    name = tostring(entry.name or "Unknown Pet"),
+                                    rainbow = entry.rainbow == true,
+                                    golden = entry.golden == true,
+                                    shiny = entry.shiny == true,
+                                    nickname = entry.nickname,
                                 })
                             end
                         end
@@ -4576,7 +5388,7 @@ task.spawn(function()
                                 WebhookSending = true
                                 local totals = getCurrentTotals()
                                 pcall(function()
-                                    webhookSend(makePayload(false, item.category, item.name, totals))
+                                    webhookSend(makePayload(false, item.category, item.name, totals, item))
                                 end)
                                 WebhookSending = false
                                 task.wait(0.15)
@@ -4591,8 +5403,16 @@ task.spawn(function()
     -- Apply saved toggle states only after every toggle has been created.
     -- This is important for AFK CPU Reducer and Auto-Hatch because their
     -- callbacks depend on UI/functions that are created later in the script.
+    --
+    -- AFK CPU Reducer is deliberately EXEMPT. Restoring it made the script open
+    -- straight into the full-screen AFK overlay with the hub hidden, so every
+    -- execute looked like it had thrown the UI away. It also resets the
+    -- session counters and forces PotatoMode on, which is a behavioural change
+    -- you should never inherit silently from a previous run. It still saves
+    -- like every other toggle, it just never auto-restores.
+    local AFK_TOGGLE = "AFK CPU Reducer"
     for key, callback in pairs(toggleCallbacks) do
-        if CurrentToggleStates[key] == true then
+        if key ~= AFK_TOGGLE and CurrentToggleStates[key] == true then
             pcall(callback, true)
             if toggleRegistry[key] then
                 for _, syncFunc in ipairs(toggleRegistry[key]) do
@@ -4909,7 +5729,7 @@ end
 
     -- Rebind the toggle to the real hatch state instead of only changing the
     -- custom AutoBuying flag.
-    createUnifiedToggle(hatchFrame, 368, "Auto-Hatch Egg", false, function(value)
+    createUnifiedToggle(hatchFrame, 458, "Auto-Hatch Egg", false, function(value)
         setAutoHatchState(value)
     end)
 
@@ -5135,8 +5955,8 @@ end
     end)
 
     local themeLabel = Instance.new("TextLabel")
-    themeLabel.Size = UDim2.new(1, 0, 0, 20)
-    themeLabel.Position = UDim2.new(0, 0, 0, 102)
+    themeLabel.Size = UDim2.new(0.6, 0, 0, 20)
+    themeLabel.Position = UDim2.new(0, 0, 0, 100)
     themeLabel.BackgroundTransparency = 1
     themeLabel.Text = "Select UI Theme:"
     themeLabel.TextColor3 = Color3.fromRGB(200, 200, 200)
@@ -5145,9 +5965,31 @@ end
     themeLabel.TextXAlignment = Enum.TextXAlignment.Left
     themeLabel.Parent = settingsFrame
 
+    -- Row registry + counter, declared before the loop that fills them.
+    local themeRows = {}
+    local themeIndex = 0
+
+    -- Search box. With 56 themes a flat list needs scrolling past half the
+    -- alphabet to reach anything.
+    local themeSearch = Instance.new("TextBox")
+    themeSearch.Size = UDim2.new(1, 0, 0, 30)
+    themeSearch.Position = UDim2.new(0, 0, 0, 122)
+    themeSearch.BackgroundColor3 = Color3.fromRGB(30, 30, 40)
+    themeSearch.BorderSizePixel = 0
+    themeSearch.ClearTextOnFocus = false
+    themeSearch.Text = ""
+    themeSearch.PlaceholderText = "Search themes..."
+    themeSearch.TextColor3 = Color3.fromRGB(255, 255, 255)
+    themeSearch.Font = Enum.Font.Gotham
+    themeSearch.TextSize = 12
+    themeSearch.Parent = settingsFrame
+    do local _c = Instance.new("UICorner") _c.CornerRadius = UDim.new(0, 6) _c.Parent = themeSearch end
+    do local _s = Instance.new("UIStroke") _s.Color = Color3.fromRGB(80, 80, 100) _s.Thickness = 1
+        _s.Transparency = 0.7 _s.Parent = themeSearch end
+
     local themeScroll = Instance.new("ScrollingFrame")
-    themeScroll.Size = UDim2.new(1, 0, 1, -130)
-    themeScroll.Position = UDim2.new(0, 0, 0, 126)
+    themeScroll.Size = UDim2.new(1, 0, 1, -186)
+    themeScroll.Position = UDim2.new(0, 0, 0, 158)
     themeScroll.BackgroundColor3 = activeTheme.panel
     themeScroll.BorderSizePixel = 0
     themeScroll.ScrollBarThickness = 5
@@ -5163,42 +6005,148 @@ end
     themeScrollLayout.Padding = UDim.new(0, 4)
     themeScrollLayout.Parent = themeScroll
 
+    -- Built as its own function, NOT inline at thread scope. The UI thread is
+    -- already at Luau's 200-register cap; adding this loop's locals (row,
+    -- swatches, chip, tLabel, check, tStroke, ...) at thread scope stops the
+    -- entire script from compiling. A `do` block is not enough here - only a
+    -- real function body gets its own register budget.
+    local function buildThemeRows()
     for _, themeObj in ipairs(Themes) do
-        local tBtn = Instance.new("TextButton")
-        tBtn.Size = UDim2.new(1, -8, 0, 30)
-        tBtn.BackgroundColor3 = themeObj.surface
-        tBtn.Text = "  " .. themeObj.name
-        tBtn.TextColor3 = themeObj.text
-        tBtn.Font = Enum.Font.GothamBold
-        tBtn.TextSize = 12
-        tBtn.TextXAlignment = Enum.TextXAlignment.Left
-        tBtn:SetAttribute("ThemePreview", true)
-        tBtn.Parent = themeScroll
+        local row = Instance.new("TextButton")
+        row.Name = "ThemeRow"
+        row.LayoutOrder = themeIndex
+        row.Size = UDim2.new(1, -8, 0, 38)
+        row.BackgroundColor3 = themeObj.background
+        row.Text = ""
+        row.TextColor3 = themeObj.text
+        row.Font = Enum.Font.GothamBold
+        row.TextSize = 12
+        row.TextXAlignment = Enum.TextXAlignment.Left
+        row:SetAttribute("ThemePreview", true)
+        row:SetAttribute("ThemeName", themeObj.name)
+        row.Parent = themeScroll
 
-        local tCorner = Instance.new("UICorner")
-        tCorner.CornerRadius = UDim.new(0, 4)
-        tCorner.Parent = tBtn
+        local rowCorner = Instance.new("UICorner")
+        rowCorner.CornerRadius = UDim.new(0, 7)
+        rowCorner.Parent = row
+
+        -- Each row is painted with the theme it represents: its own background,
+        -- four real colour chips for the palette, and a border in the accent.
+        -- That replaces a flat list of grey buttons where every entry looked
+        -- identical until you clicked it and the whole window changed.
+        local swatches = { "surface", "accent", "controlOn", "danger" }
+        for index, key in ipairs(swatches) do
+            local chip = Instance.new("Frame")
+            chip.Name = "Chip"
+            chip.LayoutOrder = index
+            chip.Size = UDim2.new(0, 16, 0, 16)
+            chip.Position = UDim2.new(0, 8 + (index - 1) * 20, 0.5, -8)
+            chip.BackgroundColor3 = themeObj[key]
+            chip.BorderSizePixel = 0
+            chip.Parent = row
+            local chipCorner = Instance.new("UICorner")
+            chipCorner.CornerRadius = UDim.new(1, 0)
+            chipCorner.Parent = chip
+            local chipStroke = Instance.new("UIStroke")
+            chipStroke.Color = themeObj.stroke
+            chipStroke.Thickness = 1
+            chipStroke.Transparency = 0.45
+            chipStroke.Parent = chip
+        end
+
+        local tLabel = Instance.new("TextLabel")
+        tLabel.Name = "Name"
+        tLabel.Size = UDim2.new(1, -108, 1, 0)
+        tLabel.Position = UDim2.new(0, 98, 0, 0)
+        tLabel.BackgroundTransparency = 1
+        tLabel.Text = themeObj.name
+        tLabel.TextColor3 = themeObj.text
+        tLabel.Font = Enum.Font.GothamBold
+        tLabel.TextSize = 12
+        tLabel.TextXAlignment = Enum.TextXAlignment.Left
+        tLabel.TextTruncate = Enum.TextTruncate.AtEnd
+        tLabel.Parent = row
 
         local tStroke = Instance.new("UIStroke")
+        tStroke.Name = "Ring"
         tStroke.Color = themeObj.accent
         tStroke.Thickness = 1
-        tStroke.Transparency = 0.5
-        tStroke.Parent = tBtn
+        tStroke.Transparency = 0.55
+        tStroke.Parent = row
 
-        tBtn.MouseButton1Click:Connect(function()
+        -- Selected marker, shown only on the active theme.
+        local check = Instance.new("TextLabel")
+        check.Name = "Check"
+        check.Size = UDim2.fromOffset(22, 22)
+        check.Position = UDim2.new(1, -28, 0.5, -11)
+        check.BackgroundTransparency = 1
+        check.Text = "✓"
+        check.TextColor3 = themeObj.accent
+        check.Font = Enum.Font.GothamBold
+        check.TextSize = 15
+        check.Visible = false
+        check.Parent = row
+
+        themeRows[themeObj.name] = { row = row, check = check, stroke = tStroke, label = tLabel }
+        themeIndex += 1
+
+        row.MouseButton1Click:Connect(function()
             applyTheme(themeObj)
         end)
+        row.MouseEnter:Connect(function()
+            tStroke.Transparency = 0.1
+            tStroke.Thickness = 1.6
+        end)
+        row.MouseLeave:Connect(function()
+            local isActive = (CurrentThemeName == themeObj.name)
+            tStroke.Transparency = isActive and 0 or 0.55
+            tStroke.Thickness = isActive and 2 or 1
+        end)
     end
+    end
+    buildThemeRows()
+
+    -- Filter the list by name. Reorders rather than hides-and-reflows so the
+    -- row order stays stable while typing.
+    local function filterThemes()
+        local query = string.lower(tostring(themeSearch.Text or ""))
+        query = string.gsub(query, "^%s+", "")
+        query = string.gsub(query, "%s+$", "")
+        local shown = 0
+        local order = 0
+        for _, entry in pairs(themeRows) do
+            local name = tostring(entry.row:GetAttribute("ThemeName") or "")
+            local match = (query == "") or (string.find(string.lower(name), query, 1, true) ~= nil)
+            entry.row.Visible = match
+            if match then
+                order += 1
+                entry.row.LayoutOrder = order
+                shown += 1
+            end
+        end
+        themeLabel.Text = (query == "")
+            and (("%d themes"):format(shown))
+            or (("%d / %d"):format(shown, #Themes))
+    end
+    themeSearch:GetPropertyChangedSignal("Text"):Connect(filterThemes)
+    filterThemes()
 
     -- Apply the saved theme only after every UI element has been created
     -- from the Default Dark base. Non-button/detail elements therefore stay
     -- at their original dark colors instead of inheriting a previous theme.
-    for _, themeObj in ipairs(Themes) do
-        if themeObj.name == savedThemeName then
-            applyTheme(themeObj)
-            break
+    --
+    -- Wrapped in a function purely for the register budget: this thread is at
+    -- Luau's 200-local limit, and even this two-line loop's `themeObj` local
+    -- pushed it over. (buildThemeRows has the same reason for being a function.)
+    local function applySavedTheme()
+        for _, themeObj in ipairs(Themes) do
+            if themeObj.name == savedThemeName then
+                applyTheme(themeObj)
+                return
+            end
         end
     end
+    applySavedTheme()
 	end)
 
 	--
