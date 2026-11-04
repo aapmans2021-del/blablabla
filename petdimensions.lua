@@ -23,6 +23,8 @@ local PersistedSettings = {
     webhook = {
         url = "",
         enabled = false,
+        summaryEnabled = false,
+        summaryMinutes = 30,
         notify = { Huge = true, Secret = true, Titanic = true, Gargantuan = true }
     },
     -- Free-form bag for every other setting (Anti-AFK interval, ...).
@@ -89,6 +91,12 @@ end
 if type(SavedSettings.webhook) == "table" then
     PersistedSettings.webhook.url = tostring(SavedSettings.webhook.url or "")
     PersistedSettings.webhook.enabled = SavedSettings.webhook.enabled == true
+    if SavedSettings.webhook.summaryEnabled ~= nil then
+        PersistedSettings.webhook.summaryEnabled = SavedSettings.webhook.summaryEnabled == true
+    end
+    if tonumber(SavedSettings.webhook.summaryMinutes) then
+        PersistedSettings.webhook.summaryMinutes = math.clamp(tonumber(SavedSettings.webhook.summaryMinutes), 1, 1440)
+    end
     if type(SavedSettings.webhook.notify) == "table" then
         for _, key in ipairs({"Huge", "Secret", "Titanic", "Gargantuan"}) do
             if SavedSettings.webhook.notify[key] ~= nil then
@@ -1386,6 +1394,15 @@ task.spawn(function()
         Titanics = 0,
         Gargantuans = 0,
     }
+    -- Variant breakdown for rare pets hatched during the current AFK session.
+    -- Rainbow/Golden/Shiny are tracked separately per tier so the AFK panel
+    -- never hides the fact that a rare hatch was also a variant.
+    local afkSessionVariants = {
+        Huges = { R = 0, G = 0, S = 0 },
+        Secrets = { R = 0, G = 0, S = 0 },
+        Titanics = { R = 0, G = 0, S = 0 },
+        Gargantuans = { R = 0, G = 0, S = 0 },
+    }
     local startupCounts = {
         Huges = 0,
         Secrets = 0,
@@ -1404,6 +1421,7 @@ task.spawn(function()
     local hatchRareLabels = {}
     local afkRareLabels = {}
     local afkSessionLabels = {}
+    local afkSessionVariantLabels = {}
     local startupLabels = {}
     local hatchRecentLists = {}
     local afkRecentLists = {}
@@ -1516,6 +1534,12 @@ task.spawn(function()
                             startupCounts[category .. "s"] = (startupCounts[category .. "s"] or 0) + 1
                             if afkSessionActive then
                                 afkSessionCounts[category .. "s"] = (afkSessionCounts[category .. "s"] or 0) + 1
+                                local sessionVariants = afkSessionVariants[category .. "s"]
+                                if sessionVariants then
+                                    if entry.rainbow then sessionVariants.R = sessionVariants.R + 1 end
+                                    if entry.golden then sessionVariants.G = sessionVariants.G + 1 end
+                                    if entry.shiny then sessionVariants.S = sessionVariants.S + 1 end
+                                end
                             end
 
                             if category == "Huge" then
@@ -1772,12 +1796,12 @@ task.spawn(function()
     tabBar.BackgroundTransparency = 1
     tabBar.Parent = autoHatchMain
 
-    local TAB_TOTAL = 6
+    local TAB_TOTAL = { count = 6 }
     local function createTabButton(text, index)
         local btn = Instance.new("TextButton")
-        btn.Size = UDim2.new(1 / 5, -7, 1, 0)
+        btn.Size = UDim2.new(1 / TAB_TOTAL.count, -7, 1, 0)
         btn.AnchorPoint = Vector2.new(0.5, 0)
-        btn.Position = UDim2.new((index - 0.5) / 5, 0, 0, 0)
+        btn.Position = UDim2.new((index - 0.5) / TAB_TOTAL.count, 0, 0, 0)
         btn.Text = text
         btn.BackgroundColor3 = Color3.fromRGB(32, 32, 42)
         btn.TextColor3 = Color3.fromRGB(160, 171, 193)
@@ -1803,6 +1827,7 @@ task.spawn(function()
     local settingsTab = createTabButton("Settings", 3)
     local eggTab = createTabButton("Egg Chances", 4)
     local farmTab = createTabButton("Farm", 5)
+    TAB_TOTAL.tab = createTabButton("Daycare", 6)
 
     local hatchFrame = Instance.new("ScrollingFrame")
     hatchFrame.Size = UDim2.new(1, -40, 1, -136)
@@ -1847,6 +1872,19 @@ task.spawn(function()
     farmFrame.Visible = false
     farmFrame.Parent = autoHatchMain
     do local _fp = Instance.new("UIPadding") _fp.PaddingBottom = UDim.new(0, 24) _fp.Parent = farmFrame end
+
+    TAB_TOTAL.frame = Instance.new("ScrollingFrame")
+    TAB_TOTAL.frame.Name = "DaycareScroll"
+    TAB_TOTAL.frame.Size = UDim2.new(1, -40, 1, -136)
+    TAB_TOTAL.frame.Position = UDim2.new(0, 20, 0, 128)
+    TAB_TOTAL.frame.BackgroundTransparency = 1
+    TAB_TOTAL.frame.BorderSizePixel = 0
+    TAB_TOTAL.frame.ScrollBarThickness = 5
+    TAB_TOTAL.frame.AutomaticCanvasSize = Enum.AutomaticSize.Y
+    TAB_TOTAL.frame.CanvasSize = UDim2.new(0, 0, 0, 0)
+    TAB_TOTAL.frame.Visible = false
+    TAB_TOTAL.frame.Parent = autoHatchMain
+    do local _dp = Instance.new("UIPadding") _dp.PaddingBottom = UDim.new(0, 24) _dp.Parent = TAB_TOTAL.frame end
 
 
     -- =====================================================================
@@ -2062,7 +2100,7 @@ task.spawn(function()
         -- entirely and sat oddly against every palette except the default.
         autoTitle.TextColor3 = activeTheme.accent
 
-        for _, btn in ipairs({hatchTab, tpTab, settingsTab, eggTab, farmTab}) do
+        for _, btn in ipairs({hatchTab, tpTab, settingsTab, eggTab, farmTab, TAB_TOTAL.tab}) do
             if btn == currentTabBtn then
                 btn.BackgroundColor3 = activeTheme.accent
                 btn.TextColor3 = Color3.fromRGB(255, 255, 255)
@@ -2104,8 +2142,9 @@ task.spawn(function()
         settingsFrame.Visible = false
         eggFrame.Visible = false
         farmFrame.Visible = false
+        TAB_TOTAL.frame.Visible = false
 
-        for _, btn in ipairs({hatchTab, tpTab, settingsTab, eggTab, farmTab}) do
+        for _, btn in ipairs({hatchTab, tpTab, settingsTab, eggTab, farmTab, TAB_TOTAL.tab}) do
             btn.BackgroundColor3 = activeTheme.surface
             btn.TextColor3 = Color3.fromRGB(180, 180, 190)
         end
@@ -2122,6 +2161,7 @@ task.spawn(function()
     settingsTab.MouseButton1Click:Connect(function() switchTab(settingsTab, settingsFrame) end)
     eggTab.MouseButton1Click:Connect(function() switchTab(eggTab, eggFrame) end)
     farmTab.MouseButton1Click:Connect(function() switchTab(farmTab, farmFrame) end)
+    TAB_TOTAL.tab.MouseButton1Click:Connect(function() switchTab(TAB_TOTAL.tab, TAB_TOTAL.frame) end)
 
     switchTab(hatchTab, hatchFrame)
 
@@ -3165,6 +3205,12 @@ task.spawn(function()
             Titanics = afkSessionLabels.Titanics,
             Gargantuans = afkSessionLabels.Gargantuans,
         }
+        local sessionVariantLabels = {
+            Huges = afkSessionVariantLabels.Huges,
+            Secrets = afkSessionVariantLabels.Secrets,
+            Titanics = afkSessionVariantLabels.Titanics,
+            Gargantuans = afkSessionVariantLabels.Gargantuans,
+        }
         local startupLabelSet = {
             Huges = startupLabels.Huges,
             Secrets = startupLabels.Secrets,
@@ -3175,6 +3221,16 @@ task.spawn(function()
         for key, label in pairs(sessionLabels) do
             if label then
                 label.Text = "+" .. tostring(afkSessionCounts[key] or 0) .. " (this AFK session)"
+            end
+        end
+        for key, label in pairs(sessionVariantLabels) do
+            if label then
+                local variants = afkSessionVariants[key] or {}
+                label.Text = ("R:%d  G:%d  S:%d"):format(
+                    tonumber(variants.R) or 0,
+                    tonumber(variants.G) or 0,
+                    tonumber(variants.S) or 0
+                )
             end
         end
         for key, label in pairs(startupLabelSet) do
@@ -3189,6 +3245,11 @@ task.spawn(function()
         afkSessionCounts.Secrets = 0
         afkSessionCounts.Titanics = 0
         afkSessionCounts.Gargantuans = 0
+        for _, variants in pairs(afkSessionVariants) do
+            variants.R = 0
+            variants.G = 0
+            variants.S = 0
+        end
         updateAfkSessionLabels()
     end
 
@@ -3352,6 +3413,10 @@ task.spawn(function()
         local WebhookSending = false
         local WebhookInitialized = false
         local WebhookKnownPets = {}
+        local WebhookAccountName = (localPlayer and (localPlayer.Name or localPlayer.DisplayName)) or "Unknown"
+        local WebhookSummaryEnabled = PersistedSettings.webhook.summaryEnabled == true
+        local WebhookSummaryMinutes = math.clamp(tonumber(PersistedSettings.webhook.summaryMinutes) or 30, 1, 1440)
+        local WebhookSummaryLastSent = os.clock()
 
         local function webhookRequest()
             local env = _G
@@ -3521,6 +3586,82 @@ task.spawn(function()
         addToggle("Titanics", "Titanic", 0, 168)
         addToggle("Gargantuans", "Gargantuan", 0.53, 168)
 
+        local summaryToggle = Instance.new("TextButton")
+        summaryToggle.Size = UDim2.new(0.56, -12, 0, 26)
+        summaryToggle.Position = UDim2.new(0, 12, 0, 246)
+        summaryToggle.BackgroundColor3 = activeTheme.surface
+        summaryToggle.BorderSizePixel = 0
+        summaryToggle.TextColor3 = Color3.fromRGB(255, 255, 255)
+        summaryToggle.Font = Enum.Font.GothamSemibold
+        summaryToggle.TextSize = 10
+        summaryToggle.Parent = webhookPanel
+        do
+            local c = Instance.new("UICorner")
+            c.CornerRadius = UDim.new(0, 6)
+            c.Parent = summaryToggle
+        end
+
+        local summaryBox = Instance.new("TextBox")
+        summaryBox.Size = UDim2.new(0.16, 0, 0, 26)
+        summaryBox.Position = UDim2.new(0.60, 0, 0, 246)
+        summaryBox.BackgroundColor3 = activeTheme.surface
+        summaryBox.BorderSizePixel = 0
+        summaryBox.ClearTextOnFocus = false
+        summaryBox.Text = tostring(WebhookSummaryMinutes)
+        summaryBox.PlaceholderText = "Min"
+        summaryBox.TextColor3 = Color3.fromRGB(255, 255, 255)
+        summaryBox.Font = Enum.Font.GothamBold
+        summaryBox.TextSize = 11
+        summaryBox.Parent = webhookPanel
+        do
+            local c = Instance.new("UICorner")
+            c.CornerRadius = UDim.new(0, 6)
+            c.Parent = summaryBox
+        end
+
+        local summarySuffix = Instance.new("TextLabel")
+        summarySuffix.Size = UDim2.new(0.23, -6, 0, 26)
+        summarySuffix.Position = UDim2.new(0.77, 0, 0, 246)
+        summarySuffix.BackgroundTransparency = 1
+        summarySuffix.Text = "minutes"
+        summarySuffix.TextColor3 = activeTheme.muted
+        summarySuffix.Font = Enum.Font.Gotham
+        summarySuffix.TextSize = 10
+        summarySuffix.TextXAlignment = Enum.TextXAlignment.Left
+        summarySuffix.Parent = webhookPanel
+
+        local function updateSummary()
+            summaryToggle.Text = WebhookSummaryEnabled and "Summary every: ON" or "Summary every: OFF"
+            summaryToggle.BackgroundColor3 = WebhookSummaryEnabled and activeTheme.controlOn or activeTheme.surface
+        end
+        updateSummary()
+
+        local function persistWebhookSettings()
+            PersistedSettings.webhook.url = WebhookURL
+            PersistedSettings.webhook.enabled = WebhookEnabled
+            PersistedSettings.webhook.notify = WebhookNotify
+            PersistedSettings.webhook.summaryEnabled = WebhookSummaryEnabled
+            PersistedSettings.webhook.summaryMinutes = WebhookSummaryMinutes
+            saveSettings()
+        end
+
+        summaryToggle.MouseButton1Click:Connect(function()
+            WebhookSummaryEnabled = not WebhookSummaryEnabled
+            WebhookSummaryLastSent = os.clock()
+            persistWebhookSettings()
+            updateSummary()
+        end)
+
+        summaryBox.FocusLost:Connect(function()
+            local value = tonumber(summaryBox.Text)
+            if not value then value = 30 end
+            value = math.clamp(value, 1, 1440)
+            WebhookSummaryMinutes = value
+            summaryBox.Text = tostring(value)
+            WebhookSummaryLastSent = os.clock()
+            persistWebhookSettings()
+        end)
+
         local test = Instance.new("TextButton")
         test.Size = UDim2.new(1,-24,0,34)
         test.Position = UDim2.new(0,12,0,206)
@@ -3555,8 +3696,68 @@ task.spawn(function()
             }
         end
 
+        -- Live account values for the periodic summary. leaderstats is the
+        -- source of truth; the Hatch labels are only a fallback because they
+        -- are repainted by the leaderstat hooks a fraction later.
+        local function getAccountStats()
+            local eggs, diamonds = 0, 0
+            pcall(function()
+                local leaderstats = localPlayer and localPlayer:FindFirstChild("leaderstats")
+                if not leaderstats then return end
+                local eggStat = leaderstats:FindFirstChild("Eggs Hatched")
+                local gemStat = leaderstats:FindFirstChild("Diamonds")
+                eggs = tonumber(eggStat and eggStat.Value) or eggs
+                diamonds = tonumber(gemStat and gemStat.Value) or diamonds
+            end)
+            if eggs == 0 then eggs = readCounter(EggsLabel) end
+            if diamonds == 0 then diamonds = readCounter(GemsLabel) end
+            return eggs, diamonds
+        end
+
+        local function makeSummaryPayload()
+            local totals = getCurrentTotals()
+            local eggs, diamonds = getAccountStats()
+            local fields = {
+                {name="Account", value="**"..WebhookAccountName.."**", inline=true},
+                {name="Eggs Hatched", value="**"..formatNumber(eggs).."**", inline=true},
+                {name="Diamonds", value="**"..formatNumber(diamonds).."**", inline=true},
+                {name="Huges", value="**"..numberText(totals.Huge).."**", inline=true},
+                {name="Secrets", value="**"..numberText(totals.Secret).."**", inline=true},
+                {name="Titanics", value="**"..numberText(totals.Titanic).."**", inline=true},
+                {name="Gargantuans", value="**"..numberText(totals.Gargantuan).."**", inline=true}
+            }
+
+            local vlines = {}
+            for _, base in ipairs({ "Huges", "Titanics", "Gargantuans", "Secrets" }) do
+                local rb = variantCounts[base] or 0
+                local gd = variantCounts[base .. "Golden"] or 0
+                local sh = variantCounts[base .. "Shiny"] or 0
+                if rb > 0 or gd > 0 or sh > 0 then
+                    table.insert(vlines, ("%s - R:%d  G:%d  S:%d"):format(base, rb, gd, sh))
+                end
+            end
+
+            local desc = ("Periodic account summary for **%s**."):format(WebhookAccountName)
+            if #vlines > 0 then
+                desc = desc .. "\n\n**Variants owned**\n" .. table.concat(vlines, "\n")
+            end
+
+            return {
+                username = "Pet Dimensions Hub",
+                embeds = {{
+                    title = "Account Summary",
+                    description = desc,
+                    color = 5793266,
+                    fields = fields,
+                    footer = { text = "Pet Dimensions Hub - " .. WebhookAccountName },
+                    timestamp = os.date("!%Y-%m-%dT%H:%M:%SZ")
+                }}
+            }
+        end
+
         local function makePayload(testMessage, category, petName, totals, pet)
             local fields = {
+                {name="Account", value="**"..WebhookAccountName.."**", inline=true},
                 {name="Huges", value="**"..numberText(totals.Huge).."**", inline=true},
                 {name="Secrets", value="**"..numberText(totals.Secret).."**", inline=true},
                 {name="Titanics", value="**"..numberText(totals.Titanic).."**", inline=true},
@@ -3620,7 +3821,7 @@ task.spawn(function()
                     description=desc,
                     color=embedColor,
                     fields=fields,
-                    footer={text="Pet Dimensions Hub - Rare Hatch Tracker"},
+                    footer={text="Pet Dimensions Hub - Rare Hatch Tracker | "..WebhookAccountName},
                     timestamp=os.date("!%Y-%m-%dT%H:%M:%SZ")
                 }}
             }
@@ -3711,6 +3912,625 @@ task.spawn(function()
                         task.wait(5)
                     end
                 end
+
+                -- Periodic account summary. Runs on its own clock and only when
+                -- the master webhook switch and the summary switch are both on.
+                if WebhookEnabled and WebhookSummaryEnabled and not WebhookSending
+                    and tostring(WebhookURL or ""):match("%S") then
+                    local interval = math.max(60, WebhookSummaryMinutes * 60)
+                    if os.clock() - WebhookSummaryLastSent >= interval then
+                        WebhookSending = true
+                        local ok, sent, err = pcall(function()
+                            return webhookSend(makeSummaryPayload())
+                        end)
+                        WebhookSending = false
+                        if ok and sent then
+                            WebhookSummaryLastSent = os.clock()
+                            status.Text = "Summary sent (" .. tostring(WebhookSummaryMinutes) .. " min interval)"
+                        else
+                            warn("[Pet Hub] Summary webhook failed: " .. tostring(ok and err or sent))
+                            -- Retry in 30 seconds instead of waiting another full
+                            -- interval after a transient failure.
+                            WebhookSummaryLastSent = os.clock() - interval + 30
+                        end
+                    end
+                end
+                task.wait(1)
+            end
+        end)
+    end)
+
+    -- =====================================================================
+    -- DAYCARE TAB
+    --
+    -- Strongest-first enrolment with a permanent shield on the three most
+    -- powerful pets the account owns. Locked, equipped, trading-booth,
+    -- huge/titanic and banned-rarity pets are still skipped, so the protected
+    -- three are the only thing that changes relative to the game's defaults.
+    --
+    -- The whole feature is wrapped in pcall because a missing Daycare module
+    -- or a changed remote signature must never take the hub down with it.
+    -- =====================================================================
+    pcall(function()
+        local daycareFrame = TAB_TOTAL.frame
+        if not daycareFrame then return end
+
+        local DaycareModule = Library.Modules and Library.Modules.Daycare
+        local Network = Library.Network
+        local Signal = Library.Signal
+        local Shared = Library.Shared
+        local Directory = Library.Directory
+
+        local BANNED_RARITIES = {
+            Exclusive = true,
+            Secret = true,
+            Quest = true,
+            ["No rarity yet"] = true,
+        }
+        local PROTECTED_COUNT = 3
+        local INTERVAL = 6
+        local running = false
+        local busy = false
+        local pendingFill = false
+        local pendingClaim = false
+        local lastStatus = "Idle"
+        local nextPassAt = 0
+        local blockedCache = {}
+        local lastListRefresh = 0
+
+        local function invoke(name, ...)
+            if not Network or type(Network.Invoke) ~= "function" then
+                return false, "network unavailable"
+            end
+
+            local genv = (type(getgenv) == "function" and getgenv()) or _G
+            if type(genv) ~= "table" then
+                local ok, a, b, c = pcall(Network.Invoke, name, ...)
+                if not ok then return false, tostring(a) end
+                return a, b, c
+            end
+
+            -- The framework refuses calls from executors when it can see these
+            -- two globals. Hide them only for the duration of the request.
+            local savedGetgenv = rawget(genv, "getgenv")
+            local savedSettings = rawget(genv, "settings")
+            rawset(genv, "getgenv", nil)
+            rawset(genv, "settings", nil)
+
+            local ok, a, b, c = pcall(Network.Invoke, name, ...)
+
+            rawset(genv, "getgenv", savedGetgenv)
+            rawset(genv, "settings", savedSettings)
+
+            if not ok then return false, tostring(a) end
+            return a, b, c
+        end
+
+        local function isBlocked(pet)
+            if type(pet) ~= "table" or type(pet.uid) ~= "string" then return true end
+            local cached = blockedCache[pet.uid]
+            local now = os.clock()
+            if cached and (now - cached.at) < 30 then return cached.value end
+
+            local ok, result = pcall(function()
+                return Signal.Invoke("Is Trading Booth Pet", pet.uid)
+            end)
+            local value = ok and result == true
+            blockedCache[pet.uid] = { value = value, at = now }
+            return value
+        end
+
+        local function isEligible(pet)
+            if type(pet) ~= "table" or type(pet.uid) ~= "string" then return false end
+            if pet.l then return false end
+
+            local definition = Directory and Directory.Pets and Directory.Pets[pet.id]
+            if not definition then return false end
+            if definition.huge or definition.titanic then return false end
+            if BANNED_RARITIES[tostring(definition.rarity)] then return false end
+            return true
+        end
+
+        local function getCapacity(save)
+            if not DaycareModule then return 0 end
+            local maxSlots = tonumber(DaycareModule.SLOTS_MAX) or 0
+            local freeSlots = tonumber(DaycareModule.SLOTS_FREE) or 0
+            local tierBonus = 0
+            if (tonumber(save.DaycareTier) or 0) > 0 then
+                tierBonus = maxSlots - freeSlots
+            end
+            local vouchers = math.min(
+                tonumber(save.DaycareSlotVouchers) or 0,
+                tonumber(DaycareModule.VOUCHER_SLOTS_MAX) or 0
+            )
+            return math.min(maxSlots, freeSlots + tierBonus + vouchers)
+        end
+
+        local function queueEntries(save)
+            local entries = {}
+            local queue = save and save.DaycareQueue
+            if type(queue) ~= "table" then return entries end
+            for _, entry in ipairs(queue) do
+                if type(entry) == "table" then table.insert(entries, entry) end
+            end
+            for _, entry in pairs(queue) do
+                if type(entry) == "table" and not table.find(entries, entry) then
+                    table.insert(entries, entry)
+                end
+            end
+            return entries
+        end
+
+        local function getEnrolled(save)
+            local enrolled = {}
+            for _, entry in ipairs(queueEntries(save)) do
+                if type(entry.Pet) == "table" and entry.Pet.uid then
+                    enrolled[entry.Pet.uid] = true
+                end
+            end
+            return enrolled
+        end
+
+        local function getEquipped(save)
+            local equipped = {}
+            for _, pet in pairs(save.PetsEquipped or {}) do
+                if type(pet) == "table" and pet.uid then equipped[pet.uid] = true end
+            end
+            pcall(function()
+                local live = Library.PetCmds.GetEquipped()
+                for uid, petData in pairs(live or {}) do
+                    if type(petData) == "table" and petData.uid then
+                        equipped[petData.uid] = true
+                    elseif type(uid) == "string" then
+                        equipped[uid] = true
+                    end
+                end
+            end)
+            return equipped
+        end
+
+        local function ownedPets(save)
+            local pets, seen = {}, {}
+            local source = save and save.Pets
+            if type(source) ~= "table" then return pets end
+
+            for _, pet in ipairs(source) do
+                if type(pet) == "table" and type(pet.uid) == "string" and not seen[pet] then
+                    seen[pet] = true
+                    table.insert(pets, pet)
+                end
+            end
+            for _, pet in pairs(source) do
+                if type(pet) == "table" and type(pet.uid) == "string" and not seen[pet] then
+                    seen[pet] = true
+                    table.insert(pets, pet)
+                end
+            end
+            return pets
+        end
+
+        -- Exact requested policy: sort every owned pet by power descending,
+        -- permanently skip the three strongest, then take the rest in order.
+        local function pickPets(save, amount)
+            local enrolled = getEnrolled(save)
+            local equipped = getEquipped(save)
+            local allPets = ownedPets(save)
+
+            table.sort(allPets, function(a, b)
+                local strengthA = tonumber(a.s) or 0
+                local strengthB = tonumber(b.s) or 0
+                if strengthA ~= strengthB then
+                    return strengthA > strengthB
+                end
+                return a.uid < b.uid
+            end)
+
+            local picked = {}
+            for index = PROTECTED_COUNT + 1, #allPets do
+                if #picked >= amount then break end
+
+                local pet = allPets[index]
+                if isEligible(pet)
+                    and not enrolled[pet.uid]
+                    and not equipped[pet.uid]
+                    and not isBlocked(pet) then
+                    table.insert(picked, pet.uid)
+                end
+            end
+            return picked
+        end
+
+        local function resolveEntryPet(save, entry)
+            if type(entry) ~= "table" then return nil end
+            if type(entry.Pet) == "table" then return entry.Pet end
+
+            local uid = entry.uid or entry.UID or entry.Uid or entry.petUid
+            if type(uid) ~= "string" or type(save.Pets) ~= "table" then return nil end
+            for _, pet in ipairs(save.Pets) do
+                if type(pet) == "table" and pet.uid == uid then return pet end
+            end
+            for _, pet in pairs(save.Pets) do
+                if type(pet) == "table" and pet.uid == uid then return pet end
+            end
+            return nil
+        end
+
+        local function readyCount(save)
+            local ready = 0
+            if not Shared or type(Shared.DaycareComputeRemainingTime) ~= "function" then
+                return ready
+            end
+            for _, entry in ipairs(queueEntries(save)) do
+                local ok, remaining = pcall(Shared.DaycareComputeRemainingTime, save, entry)
+                if ok and type(remaining) == "number" and remaining <= 0 then
+                    ready = ready + 1
+                end
+            end
+            return ready
+        end
+
+        local function claimNow()
+            local save = Save and Save.Get and Save.Get()
+            if not save then return false, "save not loaded" end
+
+            local ready = readyCount(save)
+            if ready <= 0 then return false, "nothing ready" end
+
+            local success, message = invoke("Daycare: Claim")
+            if success then
+                return true, ("claimed %d pet(s)"):format(ready)
+            end
+            return false, tostring(message)
+        end
+
+        local function fillNow()
+            local save = Save and Save.Get and Save.Get()
+            if not save then return false, "save not loaded" end
+
+            local capacity = getCapacity(save)
+            if capacity <= 0 then return false, "daycare module unavailable" end
+
+            local entries = queueEntries(save)
+            local free = capacity - #entries
+            if free <= 0 then return false, "daycare full" end
+
+            local picked = pickPets(save, free)
+            if #picked == 0 then return false, "no eligible pets" end
+
+            local success, message = invoke("Daycare: Enroll", picked)
+
+            -- The server rejects the whole batch when it is one too large.
+            if not success and type(message) == "string" then
+                local holds = tonumber(message:match("holds (%d+) pets"))
+                if holds then
+                    local retry = holds - #queueEntries(save)
+                    if retry > 0 then
+                        local trimmed = {}
+                        for index = 1, math.min(retry, #picked) do
+                            trimmed[index] = picked[index]
+                        end
+                        success, message = invoke("Daycare: Enroll", trimmed)
+                        if success then
+                            return true, ("enrolled %d pet(s)"):format(#trimmed)
+                        end
+                    end
+                end
+            end
+
+            if success then
+                return true, ("enrolled %d pet(s)"):format(#picked)
+            end
+            return false, tostring(message)
+        end
+
+        local function formatDuration(seconds)
+            seconds = math.max(0, math.floor(tonumber(seconds) or 0))
+            local hours = math.floor(seconds / 3600)
+            local minutes = math.floor((seconds % 3600) / 60)
+            local secs = seconds % 60
+            if hours > 0 then
+                return ("%dh %dm %ds"):format(hours, minutes, secs)
+            elseif minutes > 0 then
+                return ("%dm %ds"):format(minutes, secs)
+            end
+            return ("%ds"):format(secs)
+        end
+
+        local function variantText(pet)
+            local tags = {}
+            if type(pet) == "table" then
+                if pet.r == true then table.insert(tags, "R") end
+                if pet.g == true then table.insert(tags, "G") end
+                if pet.sh == true then table.insert(tags, "S") end
+            end
+            return #tags > 0 and ("[" .. table.concat(tags, "+") .. "] ") or ""
+        end
+
+        -- ------------------------------------------------------------------
+        -- UI
+        -- ------------------------------------------------------------------
+        local title = Instance.new("TextLabel")
+        title.Size = UDim2.new(1, 0, 0, 24)
+        title.Position = UDim2.new(0, 0, 0, 0)
+        title.BackgroundTransparency = 1
+        title.Text = "DAYCARE AUTOMATION"
+        title.TextColor3 = Color3.fromRGB(255, 255, 255)
+        title.Font = Enum.Font.GothamBold
+        title.TextSize = 14
+        title.TextXAlignment = Enum.TextXAlignment.Left
+        title.Parent = daycareFrame
+
+        createUnifiedToggle(daycareFrame, 32, "Auto Daycare", false, function(value)
+            running = value
+            if value then
+                pendingFill = true
+                pendingClaim = true
+                lastStatus = "starting..."
+            else
+                pendingFill = false
+                pendingClaim = false
+                lastStatus = "Idle"
+            end
+        end)
+
+        local statusPanel = Instance.new("Frame")
+        statusPanel.Size = UDim2.new(1, 0, 0, 190)
+        statusPanel.Position = UDim2.new(0, 0, 0, 76)
+        statusPanel.BackgroundColor3 = activeTheme.panel
+        statusPanel.BorderSizePixel = 0
+        statusPanel.Parent = daycareFrame
+        do
+            local c = Instance.new("UICorner")
+            c.CornerRadius = UDim.new(0, 8)
+            c.Parent = statusPanel
+            local s = Instance.new("UIStroke")
+            s.Color = activeTheme.stroke
+            s.Transparency = 0.45
+            s.Parent = statusPanel
+        end
+
+        local function makeStatusLabel(y, color, size)
+            local label = Instance.new("TextLabel")
+            label.Size = UDim2.new(1, -20, 0, 22)
+            label.Position = UDim2.new(0, 10, 0, y)
+            label.BackgroundTransparency = 1
+            label.Text = ""
+            label.TextColor3 = color
+            label.Font = Enum.Font.GothamBold
+            label.TextSize = size or 13
+            label.TextXAlignment = Enum.TextXAlignment.Left
+            label.Parent = statusPanel
+            return label
+        end
+
+        local statusLabel = makeStatusLabel(8, Color3.fromRGB(120, 255, 180))
+        local slotsLabel = makeStatusLabel(32, Color3.fromRGB(190, 190, 200))
+        local petsLabel = makeStatusLabel(56, Color3.fromRGB(190, 190, 200))
+        local powerLabel = makeStatusLabel(80, Color3.fromRGB(255, 210, 80))
+        local timeLabel = makeStatusLabel(104, Color3.fromRGB(110, 185, 255))
+        local policyLabel = makeStatusLabel(128, Color3.fromRGB(160, 160, 175), 11)
+        policyLabel.Text = "Policy: top 3 power protected, rest strongest-first"
+
+        local fillButton = Instance.new("TextButton")
+        fillButton.Size = UDim2.new(0.48, 0, 0, 32)
+        fillButton.Position = UDim2.new(0, 0, 0, 276)
+        fillButton.BackgroundColor3 = activeTheme.accent
+        fillButton.Text = "Fill Now"
+        fillButton.TextColor3 = Color3.fromRGB(255, 255, 255)
+        fillButton.Font = Enum.Font.GothamBold
+        fillButton.TextSize = 12
+        fillButton.Parent = daycareFrame
+        do
+            local c = Instance.new("UICorner")
+            c.CornerRadius = UDim.new(0, 6)
+            c.Parent = fillButton
+        end
+        fillButton.MouseButton1Click:Connect(function()
+            pendingFill = true
+        end)
+
+        local claimButton = Instance.new("TextButton")
+        claimButton.Size = UDim2.new(0.48, 0, 0, 32)
+        claimButton.Position = UDim2.new(0.52, 0, 0, 276)
+        claimButton.BackgroundColor3 = activeTheme.controlOn
+        claimButton.Text = "Claim Ready"
+        claimButton.TextColor3 = Color3.fromRGB(255, 255, 255)
+        claimButton.Font = Enum.Font.GothamBold
+        claimButton.TextSize = 12
+        claimButton.Parent = daycareFrame
+        do
+            local c = Instance.new("UICorner")
+            c.CornerRadius = UDim.new(0, 6)
+            c.Parent = claimButton
+        end
+        claimButton.MouseButton1Click:Connect(function()
+            pendingClaim = true
+        end)
+
+        local listTitle = Instance.new("TextLabel")
+        listTitle.Size = UDim2.new(1, 0, 0, 20)
+        listTitle.Position = UDim2.new(0, 0, 0, 320)
+        listTitle.BackgroundTransparency = 1
+        listTitle.Text = "PETS IN DAYCARE"
+        listTitle.TextColor3 = Color3.fromRGB(255, 255, 255)
+        listTitle.Font = Enum.Font.GothamBold
+        listTitle.TextSize = 13
+        listTitle.TextXAlignment = Enum.TextXAlignment.Left
+        listTitle.Parent = daycareFrame
+
+        local list = Instance.new("ScrollingFrame")
+        list.Size = UDim2.new(1, 0, 0, 240)
+        list.Position = UDim2.new(0, 0, 0, 344)
+        list.BackgroundColor3 = activeTheme.panel
+        list.BackgroundTransparency = 0.25
+        list.BorderSizePixel = 0
+        list.ScrollBarThickness = 4
+        list.CanvasSize = UDim2.new(0, 0, 0, 0)
+        list.AutomaticCanvasSize = Enum.AutomaticSize.Y
+        list.Parent = daycareFrame
+        do
+            local c = Instance.new("UICorner")
+            c.CornerRadius = UDim.new(0, 8)
+            c.Parent = list
+            local p = Instance.new("UIPadding")
+            p.PaddingLeft = UDim.new(0, 8)
+            p.PaddingRight = UDim.new(0, 8)
+            p.PaddingTop = UDim.new(0, 6)
+            p.Parent = list
+            local layout = Instance.new("UIListLayout")
+            layout.SortOrder = Enum.SortOrder.LayoutOrder
+            layout.Padding = UDim.new(0, 2)
+            layout.Parent = list
+        end
+
+        local function updateStatus()
+            local save = Save and Save.Get and Save.Get()
+            if not save then
+                statusLabel.Text = "Status: save not loaded"
+                slotsLabel.Text = "Slots: --"
+                petsLabel.Text = "Pets in daycare: --"
+                powerLabel.Text = "Total power: --"
+                timeLabel.Text = "Next ready: --"
+                return
+            end
+
+            local entries = queueEntries(save)
+            local capacity = getCapacity(save)
+            local totalPower = 0
+            local nextRemaining = nil
+            local rows = {}
+
+            for _, entry in ipairs(entries) do
+                local pet = resolveEntryPet(save, entry)
+                local power = math.floor(tonumber(pet and pet.s) or 0)
+                totalPower = totalPower + power
+
+                local remaining = nil
+                if Shared and type(Shared.DaycareComputeRemainingTime) == "function" then
+                    local ok, value = pcall(Shared.DaycareComputeRemainingTime, save, entry)
+                    if ok and type(value) == "number" then
+                        remaining = value
+                    end
+                end
+                if remaining then
+                    nextRemaining = nextRemaining and math.min(nextRemaining, remaining) or remaining
+                end
+
+                local name = pet and getPetDisplayName(pet) or "Unknown Pet"
+                local timeText = remaining and (remaining <= 0 and "ready" or formatDuration(remaining)) or "--"
+                table.insert(rows, {
+                    text = ("- %s%s  |  %s power  |  %s"):format(
+                        variantText(pet),
+                        tostring(name),
+                        formatNumber(power),
+                        timeText
+                    ),
+                    rainbow = pet and pet.r == true,
+                    golden = pet and pet.g == true,
+                    shiny = pet and pet.sh == true,
+                })
+            end
+
+            local ready = readyCount(save)
+            statusLabel.Text = "Status: " .. tostring(lastStatus)
+            slotsLabel.Text = ("Slots: %d / %d"):format(#entries, capacity)
+            petsLabel.Text = ("Pets in daycare: %d"):format(#entries)
+            powerLabel.Text = ("Total power: %s"):format(formatNumber(totalPower))
+
+            if ready > 0 then
+                timeLabel.Text = ("Ready now: %d pet(s)"):format(ready)
+            elseif nextRemaining then
+                timeLabel.Text = "Next ready in: " .. formatDuration(nextRemaining)
+            else
+                timeLabel.Text = "Next ready: --"
+            end
+
+            local now = os.clock()
+            if now - lastListRefresh >= 5 then
+                lastListRefresh = now
+                for _, child in ipairs(list:GetChildren()) do
+                    if child:IsA("TextLabel") then child:Destroy() end
+                end
+                for index, row in ipairs(rows) do
+                    local label = Instance.new("TextLabel")
+                    label.Size = UDim2.new(1, -6, 0, 22)
+                    label.BackgroundTransparency = 1
+                    label.Text = row.text
+                    label.TextColor3 = Color3.fromRGB(190, 190, 200)
+                    if row.rainbow then
+                        label.TextColor3 = Color3.fromRGB(255, 120, 220)
+                    elseif row.golden then
+                        label.TextColor3 = Color3.fromRGB(255, 200, 70)
+                    elseif row.shiny then
+                        label.TextColor3 = Color3.fromRGB(120, 220, 255)
+                    end
+                    label.Font = Enum.Font.Gotham
+                    label.TextSize = 12
+                    label.TextXAlignment = Enum.TextXAlignment.Left
+                    label.TextTruncate = Enum.TextTruncate.AtEnd
+                    label.LayoutOrder = index
+                    label.Parent = list
+                end
+                if #rows == 0 then
+                    local empty = Instance.new("TextLabel")
+                    empty.Size = UDim2.new(1, -6, 0, 22)
+                    empty.BackgroundTransparency = 1
+                    empty.Text = "No pets enrolled."
+                    empty.TextColor3 = activeTheme.muted
+                    empty.Font = Enum.Font.Gotham
+                    empty.TextSize = 12
+                    empty.TextXAlignment = Enum.TextXAlignment.Left
+                    empty.Parent = list
+                end
+            end
+        end
+
+        local function performPass()
+            if busy then return end
+            busy = true
+
+            -- Manual presses always report back. The auto loop stays quiet on
+            -- the two expected no-ops so the status line does not flicker
+            -- between "daycare full" and the last real result every 6 s.
+            local manualClaim = pendingClaim
+            local manualFill = pendingFill
+            local doClaim = manualClaim or running
+            local doFill = manualFill or running
+            pendingClaim = false
+            pendingFill = false
+
+            if doClaim then
+                local ok, message = claimNow()
+                if ok then
+                    lastStatus = message
+                elseif message ~= "nothing ready" or manualClaim then
+                    lastStatus = tostring(message)
+                end
+            end
+
+            if doFill then
+                local ok, message = fillNow()
+                if ok then
+                    lastStatus = message
+                elseif (message ~= "daycare full" and message ~= "no eligible pets") or manualFill then
+                    lastStatus = tostring(message)
+                end
+            end
+
+            busy = false
+        end
+
+        task.spawn(function()
+            while daycareFrame.Parent do
+                updateStatus()
+
+                local now = os.clock()
+                local wants = running or pendingFill or pendingClaim
+                if wants and not busy and (pendingFill or pendingClaim or now >= nextPassAt) then
+                    performPass()
+                    nextPassAt = os.clock() + INTERVAL
+                end
+
                 task.wait(1)
             end
         end)
@@ -3808,9 +4628,21 @@ task.spawn(function()
         sessionLabel.Parent = column
         afkSessionLabels[category.name .. "s"] = sessionLabel
 
+        local variantLabel = Instance.new("TextLabel")
+        variantLabel.Size = UDim2.new(1, -6, 0, 24)
+        variantLabel.Position = UDim2.new(0, 3, 0, 58)
+        variantLabel.BackgroundTransparency = 1
+        variantLabel.Text = "R:0  G:0  S:0"
+        variantLabel.TextColor3 = category.color
+        variantLabel.Font = Enum.Font.GothamSemibold
+        variantLabel.TextSize = 16
+        variantLabel.TextXAlignment = Enum.TextXAlignment.Left
+        variantLabel.Parent = column
+        afkSessionVariantLabels[category.name .. "s"] = variantLabel
+
         local startupLabel = Instance.new("TextLabel")
         startupLabel.Size = UDim2.new(1, -6, 0, 28)
-        startupLabel.Position = UDim2.new(0, 3, 0, 58)
+        startupLabel.Position = UDim2.new(0, 3, 0, 84)
         startupLabel.BackgroundTransparency = 1
         startupLabel.Text = "+0 (since startup)"
         startupLabel.TextColor3 = category.color
@@ -3821,8 +4653,8 @@ task.spawn(function()
         startupLabels[category.name .. "s"] = startupLabel
 
         local list = Instance.new("Frame")
-        list.Size = UDim2.new(1, -6, 1, -94)
-        list.Position = UDim2.new(0, 3, 0, 90)
+        list.Size = UDim2.new(1, -6, 1, -118)
+        list.Position = UDim2.new(0, 3, 0, 114)
         list.BackgroundTransparency = 1
         list.Parent = column
         afkRecentLists[category.name] = { frame = list, entries = category.entries, color = category.color }
@@ -3830,8 +4662,8 @@ task.spawn(function()
 
     for index = 1, 3 do
         local divider = Instance.new("Frame")
-        divider.Size = UDim2.new(0, 1, 1, -100)
-        divider.Position = UDim2.new(index * 0.25, 0, 0, 90)
+        divider.Size = UDim2.new(0, 1, 1, -130)
+        divider.Position = UDim2.new(index * 0.25, 0, 0, 114)
         divider.BackgroundColor3 = activeTheme.stroke
         divider.BackgroundTransparency = 0.35
         divider.BorderSizePixel = 0
@@ -3850,8 +4682,20 @@ task.spawn(function()
                     label.Size = UDim2.new(1, 0, 0, 32)
                     label.Position = UDim2.new(0, 0, 0, (entryIndex - 1) * 34)
                     label.BackgroundTransparency = 1
-                    label.Text = "- " .. tostring(entryData.name)
+                    local variants = {}
+                    if entryData.rainbow then table.insert(variants, "R") end
+                    if entryData.golden then table.insert(variants, "G") end
+                    if entryData.shiny then table.insert(variants, "S") end
+                    local variantPrefix = #variants > 0 and ("[" .. table.concat(variants, "+") .. "] ") or ""
+                    label.Text = "- " .. variantPrefix .. tostring(entryData.name)
                     label.TextColor3 = listData.color
+                    if entryData.rainbow then
+                        label.TextColor3 = Color3.fromRGB(255, 120, 220)
+                    elseif entryData.golden then
+                        label.TextColor3 = Color3.fromRGB(255, 200, 70)
+                    elseif entryData.shiny then
+                        label.TextColor3 = Color3.fromRGB(120, 220, 255)
+                    end
                     label.Font = Enum.Font.Gotham
                     label.TextSize = 19
                     label.TextTruncate = Enum.TextTruncate.AtEnd
