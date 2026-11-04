@@ -1796,7 +1796,7 @@ task.spawn(function()
     tabBar.BackgroundTransparency = 1
     tabBar.Parent = autoHatchMain
 
-    local TAB_TOTAL = { count = 6 }
+    local TAB_TOTAL = { count = 7 }
     local function createTabButton(text, index)
         local btn = Instance.new("TextButton")
         btn.Size = UDim2.new(1 / TAB_TOTAL.count, -7, 1, 0)
@@ -1828,6 +1828,7 @@ task.spawn(function()
     local eggTab = createTabButton("Egg Chances", 4)
     local farmTab = createTabButton("Farm", 5)
     TAB_TOTAL.tab = createTabButton("Daycare", 6)
+    TAB_TOTAL.indexUI = { tab = createTabButton("Index", 7) }
 
     local hatchFrame = Instance.new("ScrollingFrame")
     hatchFrame.Size = UDim2.new(1, -40, 1, -136)
@@ -1872,6 +1873,93 @@ task.spawn(function()
     farmFrame.Visible = false
     farmFrame.Parent = autoHatchMain
     do local _fp = Instance.new("UIPadding") _fp.PaddingBottom = UDim.new(0, 24) _fp.Parent = farmFrame end
+
+    TAB_TOTAL.indexUI.frame = Instance.new("Frame")
+    TAB_TOTAL.indexUI.frame.Name = "IndexFrame"
+    TAB_TOTAL.indexUI.frame.Size = UDim2.new(1, -40, 1, -136)
+    TAB_TOTAL.indexUI.frame.Position = UDim2.new(0, 20, 0, 128)
+    TAB_TOTAL.indexUI.frame.BackgroundTransparency = 1
+    TAB_TOTAL.indexUI.frame.Visible = false
+    TAB_TOTAL.indexUI.frame.Parent = autoHatchMain
+
+    TAB_TOTAL.indexUI.search = Instance.new("TextBox")
+    TAB_TOTAL.indexUI.search.Name = "IndexSearch"
+    TAB_TOTAL.indexUI.search.Size = UDim2.new(1, -248, 0, 34)
+    TAB_TOTAL.indexUI.search.Position = UDim2.fromOffset(0, 2)
+    TAB_TOTAL.indexUI.search.BackgroundColor3 = Color3.fromRGB(32, 32, 42)
+    TAB_TOTAL.indexUI.search.TextColor3 = Color3.fromRGB(240, 242, 248)
+    TAB_TOTAL.indexUI.search.PlaceholderColor3 = Color3.fromRGB(145, 151, 166)
+    TAB_TOTAL.indexUI.search.PlaceholderText = "Search pets..."
+    TAB_TOTAL.indexUI.search.Text = ""
+    TAB_TOTAL.indexUI.search.ClearTextOnFocus = false
+    TAB_TOTAL.indexUI.search.Font = Enum.Font.Gotham
+    TAB_TOTAL.indexUI.search.TextSize = 12
+    TAB_TOTAL.indexUI.search.Parent = TAB_TOTAL.indexUI.frame
+    TAB_TOTAL.indexUI.searchCorner = Instance.new("UICorner")
+    TAB_TOTAL.indexUI.searchCorner.CornerRadius = UDim.new(0, 8)
+    TAB_TOTAL.indexUI.searchCorner.Parent = TAB_TOTAL.indexUI.search
+    TAB_TOTAL.indexUI.searchPadding = Instance.new("UIPadding")
+    TAB_TOTAL.indexUI.searchPadding.PaddingLeft = UDim.new(0, 10)
+    TAB_TOTAL.indexUI.searchPadding.Parent = TAB_TOTAL.indexUI.search
+
+    TAB_TOTAL.indexUI.refresh = Instance.new("TextButton")
+    TAB_TOTAL.indexUI.refresh.Name = "IndexRefresh"
+    TAB_TOTAL.indexUI.refresh.Size = UDim2.new(0, 82, 0, 34)
+    TAB_TOTAL.indexUI.refresh.Position = UDim2.new(1, -82, 0, 2)
+    TAB_TOTAL.indexUI.refresh.BackgroundColor3 = Color3.fromRGB(48, 112, 180)
+    TAB_TOTAL.indexUI.refresh.TextColor3 = Color3.fromRGB(255, 255, 255)
+    TAB_TOTAL.indexUI.refresh.Text = "Refresh"
+    TAB_TOTAL.indexUI.refresh.Font = Enum.Font.GothamBold
+    TAB_TOTAL.indexUI.refresh.TextSize = 12
+    TAB_TOTAL.indexUI.refresh.Parent = TAB_TOTAL.indexUI.frame
+    TAB_TOTAL.indexUI.refreshCorner = Instance.new("UICorner")
+    TAB_TOTAL.indexUI.refreshCorner.CornerRadius = UDim.new(0, 8)
+    TAB_TOTAL.indexUI.refreshCorner.Parent = TAB_TOTAL.indexUI.refresh
+
+    TAB_TOTAL.indexUI.nearbyToggle = Instance.new("TextButton")
+    TAB_TOTAL.indexUI.nearbyToggle.Name = "NearbyEggUIToggle"
+    TAB_TOTAL.indexUI.nearbyToggle.Size = UDim2.new(0, 154, 0, 34)
+    TAB_TOTAL.indexUI.nearbyToggle.Position = UDim2.new(1, -240, 0, 2)
+    TAB_TOTAL.indexUI.nearbyToggle.BackgroundColor3 = Color3.fromRGB(55, 62, 76)
+    TAB_TOTAL.indexUI.nearbyToggle.TextColor3 = Color3.fromRGB(245, 245, 250)
+    TAB_TOTAL.indexUI.nearbyToggle.Text = "Nearby Egg UI: OFF"
+    TAB_TOTAL.indexUI.nearbyToggle.Font = Enum.Font.GothamBold
+    TAB_TOTAL.indexUI.nearbyToggle.TextSize = 11
+    TAB_TOTAL.indexUI.nearbyToggle.Parent = TAB_TOTAL.indexUI.frame
+    TAB_TOTAL.indexUI.nearbyToggleCorner = Instance.new("UICorner")
+    TAB_TOTAL.indexUI.nearbyToggleCorner.CornerRadius = UDim.new(0, 8)
+    TAB_TOTAL.indexUI.nearbyToggleCorner.Parent = TAB_TOTAL.indexUI.nearbyToggle
+
+    TAB_TOTAL.indexUI.summary = Instance.new("TextLabel")
+    TAB_TOTAL.indexUI.summary.Name = "IndexSummary"
+    TAB_TOTAL.indexUI.summary.Size = UDim2.new(1, 0, 0, 22)
+    TAB_TOTAL.indexUI.summary.Position = UDim2.fromOffset(0, 42)
+    TAB_TOTAL.indexUI.summary.BackgroundTransparency = 1
+    TAB_TOTAL.indexUI.summary.TextColor3 = Color3.fromRGB(165, 174, 192)
+    TAB_TOTAL.indexUI.summary.TextXAlignment = Enum.TextXAlignment.Left
+    TAB_TOTAL.indexUI.summary.Font = Enum.Font.GothamMedium
+    TAB_TOTAL.indexUI.summary.TextSize = 11
+    TAB_TOTAL.indexUI.summary.Text = "Loading pet index..."
+    TAB_TOTAL.indexUI.summary.Parent = TAB_TOTAL.indexUI.frame
+
+    TAB_TOTAL.indexUI.list = Instance.new("ScrollingFrame")
+    TAB_TOTAL.indexUI.list.Name = "IndexPetList"
+    TAB_TOTAL.indexUI.list.Size = UDim2.new(1, 0, 1, -70)
+    TAB_TOTAL.indexUI.list.Position = UDim2.fromOffset(0, 68)
+    TAB_TOTAL.indexUI.list.BackgroundTransparency = 1
+    TAB_TOTAL.indexUI.list.BorderSizePixel = 0
+    TAB_TOTAL.indexUI.list.ScrollBarThickness = 4
+    TAB_TOTAL.indexUI.list.CanvasSize = UDim2.new(0, 0, 0, 0)
+    TAB_TOTAL.indexUI.list.AutomaticCanvasSize = Enum.AutomaticSize.Y
+    TAB_TOTAL.indexUI.list.Parent = TAB_TOTAL.indexUI.frame
+    TAB_TOTAL.indexUI.layout = Instance.new("UIListLayout")
+    TAB_TOTAL.indexUI.layout.SortOrder = Enum.SortOrder.LayoutOrder
+    TAB_TOTAL.indexUI.layout.Padding = UDim.new(0, 5)
+    TAB_TOTAL.indexUI.layout.Parent = TAB_TOTAL.indexUI.list
+    TAB_TOTAL.indexUI.padding = Instance.new("UIPadding")
+    TAB_TOTAL.indexUI.padding.PaddingBottom = UDim.new(0, 12)
+    TAB_TOTAL.indexUI.padding.Parent = TAB_TOTAL.indexUI.list
+
 
     TAB_TOTAL.frame = Instance.new("ScrollingFrame")
     TAB_TOTAL.frame.Name = "DaycareScroll"
@@ -2100,7 +2188,7 @@ task.spawn(function()
         -- entirely and sat oddly against every palette except the default.
         autoTitle.TextColor3 = activeTheme.accent
 
-        for _, btn in ipairs({hatchTab, tpTab, settingsTab, eggTab, farmTab, TAB_TOTAL.tab}) do
+        for _, btn in ipairs({hatchTab, tpTab, settingsTab, eggTab, farmTab, TAB_TOTAL.tab, TAB_TOTAL.indexUI.tab}) do
             if btn == currentTabBtn then
                 btn.BackgroundColor3 = activeTheme.accent
                 btn.TextColor3 = Color3.fromRGB(255, 255, 255)
@@ -2143,8 +2231,9 @@ task.spawn(function()
         eggFrame.Visible = false
         farmFrame.Visible = false
         TAB_TOTAL.frame.Visible = false
+        TAB_TOTAL.indexUI.frame.Visible = false
 
-        for _, btn in ipairs({hatchTab, tpTab, settingsTab, eggTab, farmTab, TAB_TOTAL.tab}) do
+        for _, btn in ipairs({hatchTab, tpTab, settingsTab, eggTab, farmTab, TAB_TOTAL.tab, TAB_TOTAL.indexUI.tab}) do
             btn.BackgroundColor3 = activeTheme.surface
             btn.TextColor3 = Color3.fromRGB(180, 180, 190)
         end
@@ -2162,6 +2251,7 @@ task.spawn(function()
     eggTab.MouseButton1Click:Connect(function() switchTab(eggTab, eggFrame) end)
     farmTab.MouseButton1Click:Connect(function() switchTab(farmTab, farmFrame) end)
     TAB_TOTAL.tab.MouseButton1Click:Connect(function() switchTab(TAB_TOTAL.tab, TAB_TOTAL.frame) end)
+    TAB_TOTAL.indexUI.tab.MouseButton1Click:Connect(function() switchTab(TAB_TOTAL.indexUI.tab, TAB_TOTAL.indexUI.frame) end)
 
     switchTab(hatchTab, hatchFrame)
 
@@ -5307,6 +5397,941 @@ end
         end
     end
     applySavedTheme()
+
+    task.spawn(function()
+        -- PET INDEX: integrated into the existing hub and tab switcher.
+        local variantNames = { [1] = "Base", [2] = "Golden", [3] = "Rainbow" }
+        local variantColors = {
+            [1] = Color3.fromRGB(150, 158, 176),
+            [2] = Color3.fromRGB(236, 186, 66),
+            [3] = Color3.fromRGB(226, 84, 164),
+        }
+        local indexQuery = ""
+        local lastIndexRenderSignature = nil
+        local searchRefreshQueued = false
+        local cachedIndexCollectables = nil
+        local indexCardPool = {}
+        local indexEmptyLabel = nil
+
+        -- Optional floating nearby-egg panel. Its proximity test follows the
+        -- working EggDex script: find each egg's Center part, measure distance
+        -- to the egg model's bounding box, and select the closest egg in range.
+        local nearbyPanelEnabled = false
+        local NEARBY_PANEL_RADIUS = 5
+        local NEARBY_PANEL_TICK = 0.15
+        local NEARBY_PANEL_OWNED_TICK = 0.60
+        local NEARBY_PANEL_EGG_SWEEP = 8
+        local nearbyEggList = {}
+        local nearbyEggLastId = nil
+        local nearbyEggRows = {}
+        local nearbyEggOwned = {}
+        local nearbyEggHasSave = false
+        local nearbyEggOwnedSignature = nil
+        local nearbyEggOwnedAcc = 0
+        local cachedGcCollectionSave = nil
+        local nextGcCollectionScanAt = 0
+        local nearbyEggSweepAcc = NEARBY_PANEL_EGG_SWEEP
+        local nearbyEggTickAcc = 0
+        local nearbyPanelLastRender = nil
+        local hiddenNearbyBillboards = setmetatable({}, { __mode = "k" })
+        local readIndexOwned
+
+        local nearbyPanel = Instance.new("Frame")
+        nearbyPanel.Name = "NearbyEggMissingPetsPanel"
+        nearbyPanel.AnchorPoint = Vector2.new(0, 0.5)
+        nearbyPanel.Position = UDim2.new(0, 18, 0.5, 0)
+        nearbyPanel.Size = UDim2.fromOffset(392, 486)
+        nearbyPanel.BackgroundColor3 = activeTheme.panel
+        nearbyPanel.BackgroundTransparency = 0.06
+        nearbyPanel.BorderSizePixel = 0
+        nearbyPanel.Visible = false
+        nearbyPanel.ZIndex = 150
+        nearbyPanel.Parent = ui
+        local nearbyPanelCorner = Instance.new("UICorner")
+        nearbyPanelCorner.CornerRadius = UDim.new(0, 10)
+        nearbyPanelCorner.Parent = nearbyPanel
+        local nearbyPanelStroke = Instance.new("UIStroke")
+        nearbyPanelStroke.Color = activeTheme.stroke
+        nearbyPanelStroke.Thickness = 1
+        nearbyPanelStroke.Transparency = 0.25
+        nearbyPanelStroke.Parent = nearbyPanel
+
+        local nearbyPanelAccent = Instance.new("Frame")
+        nearbyPanelAccent.Size = UDim2.new(1, 0, 0, 3)
+        nearbyPanelAccent.BackgroundColor3 = activeTheme.accent
+        nearbyPanelAccent.BorderSizePixel = 0
+        nearbyPanelAccent.ZIndex = 151
+        nearbyPanelAccent.Parent = nearbyPanel
+
+        local nearbyPanelTitle = Instance.new("TextLabel")
+        nearbyPanelTitle.Position = UDim2.fromOffset(14, 14)
+        nearbyPanelTitle.Size = UDim2.new(1, -28, 0, 20)
+        nearbyPanelTitle.BackgroundTransparency = 1
+        nearbyPanelTitle.Font = Enum.Font.GothamBold
+        nearbyPanelTitle.TextSize = 16
+        nearbyPanelTitle.TextColor3 = activeTheme.text
+        nearbyPanelTitle.TextXAlignment = Enum.TextXAlignment.Left
+        nearbyPanelTitle.Text = "Nearby Egg"
+        nearbyPanelTitle.ZIndex = 152
+        nearbyPanelTitle.Parent = nearbyPanel
+
+        local nearbyPanelSub = Instance.new("TextLabel")
+        nearbyPanelSub.Position = UDim2.fromOffset(14, 34)
+        nearbyPanelSub.Size = UDim2.new(1, -28, 0, 14)
+        nearbyPanelSub.BackgroundTransparency = 1
+        nearbyPanelSub.Font = Enum.Font.GothamMedium
+        nearbyPanelSub.TextSize = 11
+        nearbyPanelSub.TextColor3 = activeTheme.muted
+        nearbyPanelSub.TextXAlignment = Enum.TextXAlignment.Left
+        nearbyPanelSub.Text = "Move within 5 studs of an egg"
+        nearbyPanelSub.ZIndex = 152
+        nearbyPanelSub.Parent = nearbyPanel
+
+        local nearbyPanelDivider = Instance.new("Frame")
+        nearbyPanelDivider.Position = UDim2.fromOffset(14, 54)
+        nearbyPanelDivider.Size = UDim2.new(1, -28, 0, 1)
+        nearbyPanelDivider.BackgroundColor3 = activeTheme.stroke
+        nearbyPanelDivider.BorderSizePixel = 0
+        nearbyPanelDivider.ZIndex = 151
+        nearbyPanelDivider.Parent = nearbyPanel
+
+        local nearbyPanelList = Instance.new("ScrollingFrame")
+        nearbyPanelList.Position = UDim2.fromOffset(10, 62)
+        nearbyPanelList.Size = UDim2.new(1, -20, 1, -72)
+        nearbyPanelList.BackgroundTransparency = 1
+        nearbyPanelList.BorderSizePixel = 0
+        nearbyPanelList.CanvasSize = UDim2.new()
+        nearbyPanelList.AutomaticCanvasSize = Enum.AutomaticSize.Y
+        nearbyPanelList.ScrollBarThickness = 4
+        nearbyPanelList.ScrollBarImageColor3 = activeTheme.stroke
+        nearbyPanelList.ZIndex = 152
+        nearbyPanelList.Parent = nearbyPanel
+        local nearbyPanelLayout = Instance.new("UIListLayout")
+        nearbyPanelLayout.Padding = UDim.new(0, 4)
+        nearbyPanelLayout.SortOrder = Enum.SortOrder.LayoutOrder
+        nearbyPanelLayout.Parent = nearbyPanelList
+
+        local nearbyPanelEmpty = Instance.new("TextLabel")
+        nearbyPanelEmpty.Name = "EmptyMessage"
+        nearbyPanelEmpty.Size = UDim2.new(1, 0, 0, 40)
+        nearbyPanelEmpty.BackgroundTransparency = 1
+        nearbyPanelEmpty.Font = Enum.Font.GothamMedium
+        nearbyPanelEmpty.TextSize = 12
+        nearbyPanelEmpty.TextColor3 = activeTheme.muted
+        nearbyPanelEmpty.Text = ""
+        nearbyPanelEmpty.Visible = false
+        nearbyPanelEmpty.ZIndex = 153
+        nearbyPanelEmpty.Parent = nearbyPanelList
+
+        local function nearbyAsset(id)
+            if type(id) ~= "string" or id == "" then return nil end
+            if id:match("^rbx") then return id end
+            return "rbxassetid://" .. id
+        end
+
+        local function nearbyFormatChance(value)
+            value = tonumber(value) or 0
+            if value <= 0 then return "?" end
+            if value >= 1 then return ("%d%%"):format(value) end
+            if value >= 0.1 then return ("%.1f%%"):format(value) end
+            if value >= 0.01 then return ("%.2f%%"):format(value) end
+            return ("%.6f"):format(value):gsub("0+$", ""):gsub("%.$", "") .. "%"
+        end
+
+        local function scanNearbyPanelEggs()
+            local nextEggs = {}
+            local seen = {}
+            local map = Workspace:FindFirstChild("__MAP")
+            local eggsRoot = map and map:FindFirstChild("Eggs")
+            local eggDirectory = Library.Directory and Library.Directory.Eggs
+            if not eggsRoot or type(eggDirectory) ~= "table" then
+                nearbyEggList = nextEggs
+                return
+            end
+
+            for _, part in ipairs(eggsRoot:GetDescendants()) do
+                if part.Name == "Center" and part:IsA("BasePart") then
+                    local model = part.Parent
+                    while model and not model:IsA("Model") do
+                        model = model.Parent
+                    end
+                    local id = model and model:GetAttribute("ID")
+                    local cfg = id and (eggDirectory[id] or eggDirectory[tostring(id)])
+                    if cfg and type(cfg.drops) == "table" and not seen[part] then
+                        seen[part] = true
+                        local ok, cf, size = pcall(function()
+                            local boxCF, boxSize = model:GetBoundingBox()
+                            return boxCF, boxSize
+                        end)
+                        if ok and cf and size then
+                            nextEggs[#nextEggs + 1] = {
+                                id = tostring(id),
+                                part = part,
+                                cfg = cfg,
+                                cf = cf,
+                                size = size,
+                            }
+                        end
+                    end
+                end
+            end
+            nearbyEggList = nextEggs
+        end
+
+        local function getNearestNearbyPanelEgg()
+            local character = localPlayer.Character
+            local root = character and character:FindFirstChild("HumanoidRootPart")
+            if not root then return nil end
+            local origin = root.Position
+            local best, bestDistance
+            for _, egg in ipairs(nearbyEggList) do
+                if egg.part and egg.part.Parent then
+                    local relative = egg.cf:PointToObjectSpace(origin)
+                    local half = egg.size / 2
+                    local clamped = Vector3.new(
+                        math.clamp(relative.X, -half.X, half.X),
+                        math.clamp(relative.Y, -half.Y, half.Y),
+                        math.clamp(relative.Z, -half.Z, half.Z)
+                    )
+                    local distance = (relative - clamped).Magnitude
+                    if distance <= NEARBY_PANEL_RADIUS and (not bestDistance or distance < bestDistance) then
+                        best = egg
+                        bestDistance = distance
+                    end
+                end
+            end
+            return best, bestDistance
+        end
+
+        local function hideNearbyGameEggInfo(deep)
+            local function disableBillboard(item)
+                if item and item:IsA("BillboardGui") then
+                    if hiddenNearbyBillboards[item] == nil then
+                        hiddenNearbyBillboards[item] = item.Enabled
+                    end
+                    item.Enabled = false
+                end
+            end
+            for _, item in ipairs(playerGui:GetChildren()) do
+                if item:IsA("BillboardGui") then
+                    local frame = item:FindFirstChild("Frame")
+                    if item.Name:find("EggInfo") or (frame and frame:FindFirstChild("EggNameTitle")) then
+                        disableBillboard(item)
+                    end
+                end
+            end
+            if deep then
+                for _, item in ipairs(playerGui:GetDescendants()) do
+                    if item:IsA("BillboardGui") and item.Name:find("EggInfo") then
+                        disableBillboard(item)
+                    end
+                end
+            end
+        end
+
+        local function restoreNearbyGameEggInfo()
+            for billboard, wasEnabled in pairs(hiddenNearbyBillboards) do
+                if billboard and billboard.Parent then
+                    billboard.Enabled = wasEnabled
+                end
+                hiddenNearbyBillboards[billboard] = nil
+            end
+        end
+
+        local function buildNearbyPanelRows(cfg, owned)
+            local rows = {}
+            local variants = {}
+            local collectables = cachedIndexCollectables
+            if not collectables then
+                local ok, result = pcall(function()
+                    return Library.Shared.GetAllCollectablePets()
+                end)
+                if ok and type(result) == "table" then
+                    cachedIndexCollectables = result
+                    collectables = result
+                end
+            end
+            if type(collectables) ~= "table" then return rows end
+
+            for _, entry in ipairs(collectables) do
+                local petId = tostring(entry.petId)
+                local set = variants[petId] or {}
+                variants[petId] = set
+                if entry.isGolden then
+                    set.golden = true
+                elseif entry.isRainbow then
+                    set.rainbow = true
+                elseif not entry.isDarkMatter then
+                    set.base = true
+                end
+            end
+
+            local function addPet(petId, variant, chance)
+                local set = variants[petId]
+                -- readIndexOwned uses the same numeric variant IDs as the
+                -- Index tab: #1 = Base, #2 = Golden, #3 = Rainbow.
+                -- Convert the panel's text variant name before checking it;
+                -- comparing #base/#golden/#rainbow against #1/#2/#3 meant
+                -- owned variants were never recognized and all were shown.
+                local variantId = variant == "base" and 1
+                    or variant == "golden" and 2
+                    or variant == "rainbow" and 3
+                if not set or not set[variant] or (variantId and owned[petId .. "#" .. variantId]) then return end
+                local petDirectory = Library.Directory and Library.Directory.Pets
+                local pet = (petDirectory and (petDirectory[petId] or petDirectory[tostring(petId)])) or {}
+                rows[#rows + 1] = {
+                    name = tostring(pet.displayName or pet.name or petId),
+                    pet = pet,
+                    rarity = tostring(pet.rarity or "Basic"),
+                    chance = tonumber(chance) or 0,
+                    variant = variant,
+                }
+            end
+
+            for _, drop in ipairs(cfg.drops) do
+                local petId, chance
+                if type(drop) == "table" then
+                    petId = drop.petName or drop[1]
+                    chance = tonumber(drop.chance or drop[2]) or 0
+                else
+                    petId = drop
+                    chance = 0
+                end
+                if type(petId) == "string" then
+                    if cfg.isGolden then
+                        addPet(petId, "golden", chance)
+                        if not cfg.disableRainbow then addPet(petId, "rainbow", chance) end
+                    elseif cfg.disableModifiers then
+                        addPet(petId, "base", chance)
+                    else
+                        addPet(petId, "base", chance)
+                        if not cfg.disableGold then addPet(petId, "golden", chance) end
+                        if not cfg.disableRainbow then addPet(petId, "rainbow", chance) end
+                    end
+                end
+            end
+
+            table.sort(rows, function(a, b)
+                local rarityNumbers = Library.Shared.PetRarityNumbers
+                local ra = rarityNumbers[a.rarity] or 0
+                local rb = rarityNumbers[b.rarity] or 0
+                if ra ~= rb then return ra > rb end
+                if a.chance ~= b.chance then return a.chance > b.chance end
+                if a.name ~= b.name then return a.name < b.name end
+                local order = { base = 1, golden = 2, rainbow = 3 }
+                return order[a.variant] < order[b.variant]
+            end)
+            return rows
+        end
+
+        -- Reuse nearby-panel cards instead of destroying and recreating every
+        -- Frame/TextLabel/ImageLabel when ownership changes. Rebuilding dozens
+        -- of Instances in one frame was the main source of UI hitching.
+        local nearbyPanelCards = {}
+        local nearbyVariantInfo = {
+            base = { label = "Base", width = 38, color = Color3.fromRGB(126, 134, 152) },
+            golden = { label = "Golden", width = 50, color = Color3.fromRGB(224, 172, 48) },
+            rainbow = { label = "Rainbow", width = 58, color = Color3.fromRGB(226, 84, 164) },
+        }
+        local nearbyRarityColors = {
+            Basic = Color3.fromRGB(166, 172, 186), Rare = Color3.fromRGB(92, 166, 255),
+            Epic = Color3.fromRGB(176, 108, 255), Legendary = Color3.fromRGB(255, 172, 64),
+            Mythical = Color3.fromRGB(255, 92, 92), Secret = Color3.fromRGB(255, 68, 96),
+            Event = Color3.fromRGB(255, 126, 200), Exclusive = Color3.fromRGB(255, 214, 92),
+            Exotic = Color3.fromRGB(64, 226, 192), Godly = Color3.fromRGB(255, 244, 160),
+        }
+
+        local function createNearbyPanelCard()
+            local card = Instance.new("Frame")
+            card.Size = UDim2.new(1, -4, 0, 40)
+            card.BackgroundColor3 = activeTheme.surface
+            card.BackgroundTransparency = 0.35
+            card.BorderSizePixel = 0
+            card.ZIndex = 153
+            local cardCorner = Instance.new("UICorner")
+            cardCorner.CornerRadius = UDim.new(0, 6)
+            cardCorner.Parent = card
+
+            local icon = Instance.new("ImageLabel")
+            icon.Position = UDim2.fromOffset(5, 5)
+            icon.Size = UDim2.fromOffset(30, 30)
+            icon.BackgroundColor3 = Color3.fromRGB(22, 25, 33)
+            icon.BorderSizePixel = 0
+            icon.ZIndex = 154
+            icon.Parent = card
+            local iconCorner = Instance.new("UICorner")
+            iconCorner.CornerRadius = UDim.new(0, 5)
+            iconCorner.Parent = icon
+
+            local badge = Instance.new("TextLabel")
+            badge.AnchorPoint = Vector2.new(1, 0.5)
+            badge.Position = UDim2.new(1, -6, 0.5, 0)
+            badge.BackgroundTransparency = 0.15
+            badge.BorderSizePixel = 0
+            badge.Font = Enum.Font.GothamBold
+            badge.TextSize = 10
+            badge.TextColor3 = Color3.new(1, 1, 1)
+            badge.ZIndex = 155
+            badge.Parent = card
+            local badgeCorner = Instance.new("UICorner")
+            badgeCorner.CornerRadius = UDim.new(0, 4)
+            badgeCorner.Parent = badge
+
+            local nameLabel = Instance.new("TextLabel")
+            nameLabel.Position = UDim2.fromOffset(42, 3)
+            nameLabel.Size = UDim2.new(0.65, 0, 0, 17)
+            nameLabel.BackgroundTransparency = 1
+            nameLabel.Font = Enum.Font.GothamBold
+            nameLabel.TextSize = 13
+            nameLabel.TextColor3 = activeTheme.text
+            nameLabel.TextXAlignment = Enum.TextXAlignment.Left
+            nameLabel.TextTruncate = Enum.TextTruncate.AtEnd
+            nameLabel.ZIndex = 154
+            nameLabel.Parent = card
+
+            local detail = Instance.new("TextLabel")
+            detail.Position = UDim2.fromOffset(42, 20)
+            detail.Size = UDim2.new(0.65, 0, 0, 14)
+            detail.BackgroundTransparency = 1
+            detail.Font = Enum.Font.GothamMedium
+            detail.TextSize = 11
+            detail.RichText = true
+            detail.TextXAlignment = Enum.TextXAlignment.Left
+            detail.ZIndex = 154
+            detail.Parent = card
+            return { frame = card, icon = icon, badge = badge, name = nameLabel, detail = detail }
+        end
+
+        local function renderNearbyPanel(egg, distance, rows)
+            local cfg = egg.cfg
+            nearbyPanelTitle.Text = cfg.displayName or cfg.name or egg.id
+            nearbyPanelTitle.TextColor3 = cfg.isGolden and Color3.fromRGB(236, 186, 66) or activeTheme.text
+            local petCount, seenPets = 0, {}
+            for _, row in ipairs(rows) do
+                if not seenPets[row.name] then
+                    seenPets[row.name] = true
+                    petCount += 1
+                end
+            end
+            nearbyPanelSub.Text = ("%d missing variants · %d pets · %.1f studs"):format(#rows, petCount, distance)
+
+            if #rows == 0 then
+                nearbyPanelEmpty.Text = nearbyEggHasSave
+                    and "Every variant from this egg is collected"
+                    or "Waiting for pet collection data..."
+                nearbyPanelEmpty.Visible = true
+            else
+                nearbyPanelEmpty.Visible = false
+            end
+
+            for order, row in ipairs(rows) do
+                local cardData = nearbyPanelCards[order]
+                if not cardData then
+                    cardData = createNearbyPanelCard()
+                    nearbyPanelCards[order] = cardData
+                end
+                local info = nearbyVariantInfo[row.variant] or nearbyVariantInfo.base
+                local rarityColor = nearbyRarityColors[row.rarity] or nearbyRarityColors.Basic
+                local thumbnail = row.variant == "golden"
+                    and (row.pet.goldenThumbnail or row.pet.thumbnail)
+                    or (row.pet.thumbnail or row.pet.goldenThumbnail)
+
+                cardData.frame.LayoutOrder = order
+                cardData.frame.Visible = true
+                cardData.frame.Parent = nearbyPanelList
+                cardData.icon.Image = nearbyAsset(thumbnail) or ""
+                cardData.badge.Size = UDim2.fromOffset(info.width, 18)
+                cardData.badge.BackgroundColor3 = info.color
+                cardData.badge.Text = info.label
+                cardData.name.Size = UDim2.new(1 - (44 + info.width + 12) / 392, 0, 0, 17)
+                cardData.name.Text = row.name
+                cardData.name.TextColor3 = activeTheme.text
+                cardData.detail.Size = UDim2.new(1 - (44 + info.width + 12) / 392, 0, 0, 14)
+                cardData.detail.Text = ('<font color="#%s">%s</font><font color="#%s"> · %s</font>'):format(
+                    rarityColor:ToHex(), row.rarity, activeTheme.muted:ToHex(), nearbyFormatChance(row.chance)
+                )
+            end
+
+            for index = #rows + 1, #nearbyPanelCards do
+                nearbyPanelCards[index].frame.Visible = false
+            end
+        end
+
+        local function readNearbyPanelOwned()
+            local owned, hasSave = readIndexOwned()
+
+            -- Order-independent collection fingerprint. Avoid allocating and
+            -- sorting a second array of every owned pet key on each poll.
+            local hashA, hashB, keyCount = 0, 0, 0
+            if hasSave then
+                for key in pairs(owned) do
+                    local keyHash = 2166136261
+                    for index = 1, #key do
+                        keyHash = bit32.band(bit32.bxor(keyHash, string.byte(key, index)) * 16777619, 0x7fffffff)
+                    end
+                    hashA = (hashA + keyHash) % 2147483647
+                    hashB = (hashB + (keyHash * keyHash) % 2147483647) % 2147483647
+                    keyCount += 1
+                end
+            end
+            local signature = table.concat({ hasSave and "ready" or "unavailable", keyCount, hashA, hashB }, "|")
+            local changed = signature ~= nearbyEggOwnedSignature
+            nearbyEggOwnedSignature = signature
+            nearbyEggOwned = hasSave and owned or {}
+            nearbyEggHasSave = hasSave == true
+            return changed, nearbyEggHasSave
+        end
+
+        local function updateNearbyPanelToggle()
+            TAB_TOTAL.indexUI.nearbyToggle.Text = nearbyPanelEnabled and "Nearby Egg UI: ON" or "Nearby Egg UI: OFF"
+            TAB_TOTAL.indexUI.nearbyToggle.BackgroundColor3 = nearbyPanelEnabled and activeTheme.controlOn or activeTheme.surface
+            TAB_TOTAL.indexUI.nearbyToggle.TextColor3 = activeTheme.text
+        end
+        TAB_TOTAL.indexUI.nearbyToggle.MouseButton1Click:Connect(function()
+            nearbyPanelEnabled = not nearbyPanelEnabled
+            updateNearbyPanelToggle()
+            if not nearbyPanelEnabled then
+                nearbyPanel.Visible = false
+                restoreNearbyGameEggInfo()
+            else
+                nearbyEggSweepAcc = NEARBY_PANEL_EGG_SWEEP
+                nearbyEggOwnedAcc = NEARBY_PANEL_OWNED_TICK
+                nearbyEggLastId = nil
+                nearbyPanelLastRender = nil
+                scanNearbyPanelEggs()
+                readNearbyPanelOwned()
+            end
+        end)
+        updateNearbyPanelToggle()
+
+        -- Nearby-egg detection is deliberately throttled and only checks the
+        -- egg folder's direct children. It never scans the whole Workspace.
+        local INDEX_EGG_RANGE = 10
+        local EGG_SCAN_INTERVAL = 0.35
+        local cachedNearbyEgg = nil
+        local nextEggScanAt = 0
+
+        local function getEggWorldPosition(instance)
+            if not instance then return nil end
+            if instance:IsA("BasePart") then return instance.Position end
+            local ok, pivot = pcall(function() return instance:GetPivot() end)
+            if ok and pivot then return pivot.Position end
+            local part = instance:FindFirstChildWhichIsA("BasePart", true)
+            return part and part.Position or nil
+        end
+
+        local function resolveEggDirectoryEntry(instance, eggDirectory)
+            if not instance or type(eggDirectory) ~= "table" then return nil, nil end
+            local possibleIds = {
+                instance:GetAttribute("EggId"),
+                instance:GetAttribute("EggID"),
+                instance:GetAttribute("ID"),
+                instance:GetAttribute("id"),
+                instance:GetAttribute("Egg"),
+                instance.Name,
+            }
+            for _, rawId in pairs(possibleIds) do
+                if rawId ~= nil then
+                    local id = tostring(rawId)
+                    local entry = eggDirectory[rawId] or eggDirectory[id]
+                    if type(entry) == "table" and type(entry.drops) == "table" then
+                        return id, entry
+                    end
+                    -- Also support physical egg models named by display name.
+                    local lowered = id:lower()
+                    for directoryId, candidate in pairs(eggDirectory) do
+                        if type(candidate) == "table" and type(candidate.drops) == "table" then
+                            local display = tostring(candidate.displayName or candidate.name or directoryId):lower()
+                            if display == lowered then
+                                return tostring(directoryId), candidate
+                            end
+                        end
+                    end
+                end
+            end
+            return nil, nil
+        end
+
+        local function getNearbyEggPetIds()
+            local now = os.clock()
+            if now < nextEggScanAt then return cachedNearbyEgg end
+            nextEggScanAt = now + EGG_SCAN_INTERVAL
+            cachedNearbyEgg = nil
+
+            local character = localPlayer.Character
+            local root = character and character:FindFirstChild("HumanoidRootPart")
+            local eggDirectory = Library.Directory and Library.Directory.Eggs
+            if not root or type(eggDirectory) ~= "table" then return nil end
+
+            local things = Workspace:FindFirstChild("__THINGS")
+            local eggFolder = (things and things:FindFirstChild("Eggs"))
+                or Workspace:FindFirstChild("Eggs")
+            if not eggFolder then return nil end
+
+            local closestDistance = INDEX_EGG_RANGE + 0.001
+            local closestId, closestEntry = nil, nil
+            for _, instance in ipairs(eggFolder:GetChildren()) do
+                if instance and instance.Parent then
+                    local position = getEggWorldPosition(instance)
+                    if position then
+                        local distance = (root.Position - position).Magnitude
+                        if distance <= INDEX_EGG_RANGE and distance < closestDistance then
+                            local eggId, eggEntry = resolveEggDirectoryEntry(instance, eggDirectory)
+                            if eggEntry then
+                                closestDistance = distance
+                                closestId = eggId
+                                closestEntry = eggEntry
+                            end
+                        end
+                    end
+                end
+            end
+
+            if closestEntry then
+                local petIds = {}
+                for _, drop in ipairs(closestEntry.drops) do
+                    if type(drop) == "table" and drop[1] ~= nil then
+                        petIds[tostring(drop[1])] = true
+                    end
+                end
+                cachedNearbyEgg = {
+                    id = closestId,
+                    name = tostring(closestEntry.displayName or closestEntry.name or closestId),
+                    distance = closestDistance,
+                    petIds = petIds,
+                }
+            end
+            return cachedNearbyEgg
+        end
+
+        readIndexOwned = function()
+            local save
+            pcall(function()
+                if SaveModule and type(SaveModule.Get) == "function" then
+                    save = SaveModule.Get()
+                end
+            end)
+
+            -- Match the working standalone EggDex script: some game versions
+            -- expose the live save through getgc even when SaveModule.Get()
+            -- is unavailable or returns an incomplete table.
+            if type(save) ~= "table" or type(save.Collection) ~= "table" or next(save.Collection) == nil then
+                local stats = localPlayer:FindFirstChild("leaderstats")
+                local diamonds = stats and stats:FindFirstChild("Diamonds")
+                if diamonds and type(getgc) == "function" then
+                    local targetDiamonds = diamonds.Value
+                    if type(cachedGcCollectionSave) == "table"
+                        and type(cachedGcCollectionSave.Collection) == "table"
+                        and cachedGcCollectionSave.Diamonds == targetDiamonds then
+                        save = cachedGcCollectionSave
+                    elseif os.clock() >= nextGcCollectionScanAt then
+                        nextGcCollectionScanAt = os.clock() + 2
+                        pcall(function()
+                            for _, candidate in pairs(getgc(true)) do
+                                if type(candidate) == "table"
+                                    and type(candidate.Collection) == "table"
+                                    and type(candidate.Diamonds) == "number"
+                                    and candidate.Diamonds == targetDiamonds then
+                                    cachedGcCollectionSave = candidate
+                                    save = candidate
+                                    break
+                                end
+                            end
+                        end)
+                    end
+                end
+            end
+
+            if type(save) ~= "table" or type(save.Collection) ~= "table" then
+                return {}, false
+            end
+
+            local owned = {}
+            for _, key in pairs(save.Collection) do
+                if type(key) == "string" then
+                    local petId, suffix = key:match("^(.*)%-(%d+)$")
+                    local variantId = tonumber(suffix)
+                    if petId and variantNames[variantId] then
+                        owned[petId .. "#" .. variantId] = true
+                    end
+                end
+            end
+            return owned, true
+        end
+
+        local function refreshIndex()
+            local nearbyEgg = getNearbyEggPetIds()
+            local owned, hasSave = readIndexOwned()
+            local directory = Library.Directory and Library.Directory.Pets
+            if type(directory) ~= "table" then
+                TAB_TOTAL.indexUI.summary.Text = "Game pet directory is not available."
+                return
+            end
+
+            if not cachedIndexCollectables then
+                local ok, result = pcall(function()
+                    return Library.Shared.GetAllCollectablePets()
+                end)
+                if ok and type(result) == "table" then
+                    cachedIndexCollectables = result
+                end
+            end
+            local collectables = cachedIndexCollectables
+            if type(collectables) ~= "table" then
+                TAB_TOTAL.indexUI.summary.Text = "Could not read the game's collectable pet list."
+                return
+            end
+
+            local rows, seen = {}, {}
+            local totalOwned, totalVariants = 0, 0
+
+            for _, entry in ipairs(collectables) do
+                local petId = entry.petId
+                local variantId
+                if entry.isGolden then
+                    variantId = 2
+                elseif entry.isRainbow then
+                    variantId = 3
+                elseif not entry.isDarkMatter then
+                    variantId = 1
+                end
+
+                if petId ~= nil and variantId then
+                    local id = tostring(petId)
+                    local key = id .. "#" .. variantId
+                    if not seen[key] then
+                        seen[key] = true
+                        local pet = directory[petId] or directory[id] or {}
+                        local isOwned = owned[key] == true
+                        local isForNearbyEgg = not nearbyEgg or nearbyEgg.petIds[id] == true
+                        -- When standing beside an egg, show only missing index
+                        -- variants obtainable from that egg. Outside its range
+                        -- the normal complete index remains visible.
+                        if isForNearbyEgg and (not nearbyEgg or not isOwned) then
+                            totalVariants += 1
+                            if isOwned then totalOwned += 1 end
+
+                            local name = tostring(pet.displayName or pet.name or id)
+                            local rarity = tostring(pet.rarity or "Unknown")
+                            local search = (name .. " " .. rarity .. " " .. variantNames[variantId]):lower()
+                            if indexQuery == "" or search:find(indexQuery, 1, true) then
+                                rows[#rows + 1] = {
+                                    name = name,
+                                    rarity = rarity,
+                                    variantId = variantId,
+                                    owned = isOwned,
+                                }
+                            end
+                        end
+                    end
+                end
+            end
+
+            table.sort(rows, function(a, b)
+                if a.owned ~= b.owned then return not a.owned end
+                if a.name ~= b.name then return a.name:lower() < b.name:lower() end
+                return a.variantId < b.variantId
+            end)
+
+            -- Avoid destroying/recreating hundreds of UI instances on every
+            -- proximity poll. Rebuild only when the actual displayed rows change.
+            local signatureParts = { nearbyEgg and nearbyEgg.id or "all", indexQuery }
+            for _, row in ipairs(rows) do
+                signatureParts[#signatureParts + 1] = row.name .. "#" .. row.variantId .. (row.owned and "1" or "0")
+            end
+            local renderSignature = table.concat(signatureParts, "|")
+            if renderSignature ~= lastIndexRenderSignature then
+                lastIndexRenderSignature = renderSignature
+                local function createIndexCard()
+                    local card = Instance.new("Frame")
+                    card.Name = "IndexPetCard"
+                    card.Size = UDim2.new(1, -6, 0, 48)
+                    card.BackgroundColor3 = activeTheme.surface
+                    card.BackgroundTransparency = 0.12
+                    card.BorderSizePixel = 0
+                    local corner = Instance.new("UICorner")
+                    corner.CornerRadius = UDim.new(0, 7)
+                    corner.Parent = card
+                    local stroke = Instance.new("UIStroke")
+                    stroke.Color = activeTheme.stroke
+                    stroke.Transparency = 0.65
+                    stroke.Parent = card
+
+                    local nameLabel = Instance.new("TextLabel")
+                    nameLabel.Position = UDim2.fromOffset(10, 5)
+                    nameLabel.Size = UDim2.new(1, -112, 0, 19)
+                    nameLabel.BackgroundTransparency = 1
+                    nameLabel.TextColor3 = activeTheme.text
+                    nameLabel.Font = Enum.Font.GothamBold
+                    nameLabel.TextSize = 12
+                    nameLabel.TextXAlignment = Enum.TextXAlignment.Left
+                    nameLabel.TextTruncate = Enum.TextTruncate.AtEnd
+                    nameLabel.Parent = card
+
+                    local detail = Instance.new("TextLabel")
+                    detail.Position = UDim2.fromOffset(10, 25)
+                    detail.Size = UDim2.new(1, -112, 0, 15)
+                    detail.BackgroundTransparency = 1
+                    detail.Font = Enum.Font.Gotham
+                    detail.TextSize = 10
+                    detail.TextXAlignment = Enum.TextXAlignment.Left
+                    detail.Parent = card
+
+                    local status = Instance.new("TextLabel")
+                    status.AnchorPoint = Vector2.new(1, 0.5)
+                    status.Position = UDim2.new(1, -8, 0.5, 0)
+                    status.Size = UDim2.fromOffset(76, 24)
+                    status.BorderSizePixel = 0
+                    status.TextColor3 = Color3.new(1, 1, 1)
+                    status.Font = Enum.Font.GothamBold
+                    status.TextSize = 10
+                    status.Parent = card
+                    local statusCorner = Instance.new("UICorner")
+                    statusCorner.CornerRadius = UDim.new(0, 5)
+                    statusCorner.Parent = status
+                    return { frame = card, name = nameLabel, detail = detail, status = status }
+                end
+
+                for order, row in ipairs(rows) do
+                    local cardData = indexCardPool[order]
+                    if not cardData then
+                        cardData = createIndexCard()
+                        indexCardPool[order] = cardData
+                    end
+                    local card = cardData.frame
+                    card.LayoutOrder = order
+                    card.Visible = true
+                    card.Parent = TAB_TOTAL.indexUI.list
+                    cardData.name.Text = row.name
+                    cardData.name.TextColor3 = activeTheme.text
+                    cardData.detail.Text = row.rarity .. "  •  " .. variantNames[row.variantId]
+                    cardData.detail.TextColor3 = variantColors[row.variantId]
+                    cardData.status.BackgroundColor3 = row.owned
+                        and Color3.fromRGB(45, 145, 92) or Color3.fromRGB(100, 105, 120)
+                    cardData.status.BackgroundTransparency = row.owned and 0.12 or 0.35
+                    cardData.status.Text = row.owned and "OWNED" or "MISSING"
+                end
+                for index = #rows + 1, #indexCardPool do
+                    indexCardPool[index].frame.Visible = false
+                end
+
+                if #rows == 0 then
+                    if not indexEmptyLabel then
+                        indexEmptyLabel = Instance.new("TextLabel")
+                        indexEmptyLabel.Name = "IndexEmpty"
+                        indexEmptyLabel.Size = UDim2.new(1, -6, 0, 42)
+                        indexEmptyLabel.BackgroundTransparency = 1
+                        indexEmptyLabel.TextColor3 = activeTheme.muted
+                        indexEmptyLabel.Font = Enum.Font.Gotham
+                        indexEmptyLabel.TextSize = 12
+                    end
+                    indexEmptyLabel.Text = nearbyEgg and "You own every indexed pet from this egg." or (indexQuery == "" and "No index entries found." or "No pets match that search.")
+                    indexEmptyLabel.Visible = true
+                    indexEmptyLabel.Parent = TAB_TOTAL.indexUI.list
+                elseif indexEmptyLabel then
+                    indexEmptyLabel.Visible = false
+                end
+            end
+
+            if nearbyEgg then
+                TAB_TOTAL.indexUI.summary.Text = ("%s  •  %.1f studs  •  %d missing variants"):format(
+                    nearbyEgg.name, nearbyEgg.distance, #rows
+                )
+            else
+                local percent = totalVariants > 0 and math.floor(totalOwned / totalVariants * 100 + 0.5) or 0
+                TAB_TOTAL.indexUI.summary.Text = ("%d / %d variants collected (%d%%)  •  %d shown%s"):format(
+                    totalOwned, totalVariants, percent, #rows, hasSave and "" or "  •  save unavailable"
+                )
+            end
+
+        end
+
+        TAB_TOTAL.indexUI.search:GetPropertyChangedSignal("Text"):Connect(function()
+            indexQuery = TAB_TOTAL.indexUI.search.Text:lower():gsub("^%s+", ""):gsub("%s+$", "")
+            if not searchRefreshQueued then
+                searchRefreshQueued = true
+                task.delay(0.2, function()
+                    searchRefreshQueued = false
+                    if ui.Parent then refreshIndex() end
+                end)
+            end
+        end)
+        TAB_TOTAL.indexUI.refresh.MouseButton1Click:Connect(refreshIndex)
+        task.spawn(function()
+            while ui.Parent do
+                if TAB_TOTAL.indexUI.frame.Visible then refreshIndex() end
+                task.wait(1.25)
+            end
+        end)
+        refreshIndex()
+
+        -- Keep the floating missing-pets panel independent from the normal
+        -- Index list. Ownership is polled every 0.60 seconds for near-real-time
+        -- updates; the heavier egg hierarchy sweep runs only every 8 seconds.
+        task.spawn(function()
+            local previousTick = os.clock()
+            while ui.Parent do
+                local now = os.clock()
+                local elapsed = math.min(now - previousTick, 0.5)
+                previousTick = now
+                if nearbyPanelEnabled then
+                    nearbyEggTickAcc += elapsed
+                    nearbyEggOwnedAcc += elapsed
+                    nearbyEggSweepAcc += elapsed
+
+                    if nearbyEggSweepAcc >= NEARBY_PANEL_EGG_SWEEP then
+                        nearbyEggSweepAcc = 0
+                        scanNearbyPanelEggs()
+                        hideNearbyGameEggInfo(true)
+                    end
+
+                    if nearbyEggTickAcc >= NEARBY_PANEL_TICK then
+                        nearbyEggTickAcc = 0
+
+                        if nearbyEggOwnedAcc >= NEARBY_PANEL_OWNED_TICK then
+                            nearbyEggOwnedAcc = 0
+                            if readIndexOwned then
+                                local ownershipChanged = readNearbyPanelOwned()
+                                if ownershipChanged then
+                                    nearbyPanelLastRender = nil
+                                end
+                            end
+                        end
+
+                        local egg, distance = getNearestNearbyPanelEgg()
+                        if not egg then
+                            nearbyPanel.Visible = false
+                            nearbyEggLastId = nil
+                            nearbyEggRows = {}
+                        else
+                            nearbyPanel.Visible = true
+                            if egg.id ~= nearbyEggLastId or nearbyPanelLastRender == nil then
+                                nearbyEggLastId = egg.id
+                                nearbyEggRows = nearbyEggHasSave and buildNearbyPanelRows(egg.cfg, nearbyEggOwned) or {}
+                                renderNearbyPanel(egg, distance, nearbyEggRows)
+                                nearbyPanelLastRender = egg.id .. "|" .. tostring(#nearbyEggRows)
+                            else
+                                local petCount, seen = 0, {}
+                                for _, row in ipairs(nearbyEggRows) do
+                                    if not seen[row.name] then
+                                        seen[row.name] = true
+                                        petCount += 1
+                                    end
+                                end
+                                nearbyPanelSub.Text = ("%d missing variants · %d pets · %.1f studs"):format(
+                                    #nearbyEggRows, petCount, distance
+                                )
+                            end
+                        end
+                    end
+                elseif nearbyPanel.Visible then
+                    nearbyPanel.Visible = false
+                end
+                task.wait(NEARBY_PANEL_TICK)
+            end
+        end)
+    end)
+
 	end)
 
 
@@ -5375,7 +6400,6 @@ pcall(function()
         end
     end)
 end)
-
 
 
 
