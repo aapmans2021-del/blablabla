@@ -176,47 +176,83 @@ pcall(function()
 end)
 
 
+local PlayerPetModule = nil
+local FastPetSpeedHooked = false
+
 local function SetFastPetSpeed(enabled)
     FastPetSpeed = enabled
-    if not SaveModule or not SaveModule.Get then
-        return
+
+    -- Load the PlayerPet module once (it is a singleton already running).
+    if not PlayerPetModule then
+        pcall(function()
+            PlayerPetModule = require(
+                ReplicatedStorage:WaitForChild("Library", 2)
+                    :WaitForChild("Client", 2)
+                    :WaitForChild("PlayerPet", 2)
+            )
+        end)
     end
 
-    pcall(function()
-        local save = SaveModule.Get()
-        if not save then return end
-        save.Upgrades = save.Upgrades or {}
+    if not PlayerPetModule then return end
 
-        if enabled then
-            if not FastPetSpeedApplied then
-                PetWalkspeedUpgradeWasPresent = save.Upgrades["Pet Walkspeed"] ~= nil
-                OriginalPetWalkspeedUpgrade = save.Upgrades["Pet Walkspeed"]
-                FastPetSpeedApplied = true
+    if enabled and not FastPetSpeedHooked then
+        FastPetSpeedHooked = true
+
+        -- Wrap the method on the prototype table so every existing and future
+        -- instance is affected without iterating the full pet list.
+        local original = PlayerPetModule.CalculateSpeedMultiplier
+        PlayerPetModule.CalculateSpeedMultiplier = function(self)
+            if FastPetSpeed then
+                return 9999
             end
-            save.Upgrades["Pet Walkspeed"] = FastPetSpeedValue
-        else
-            if FastPetSpeedApplied then
-                if PetWalkspeedUpgradeWasPresent then
-                    save.Upgrades["Pet Walkspeed"] = OriginalPetWalkspeedUpgrade
-                else
-                    save.Upgrades["Pet Walkspeed"] = nil
-                end
-                FastPetSpeedApplied = false
-            end
+            return original(self)
         end
-    end)
+
+        -- Immediately broadcast the new speedMult to all currently spawned pets.
+        pcall(function()
+            for _, playerPet in PlayerPetModule.GetByPlayer(localPlayer) do
+                local newMult = playerPet:CalculateSpeedMultiplier()
+                if newMult ~= playerPet.speedMult then
+                    playerPet.speedMult = newMult
+                    playerPet.cpet:Broadcast("petSpeedMult", newMult)
+                end
+            end
+        end)
+    elseif not enabled and FastPetSpeedHooked then
+        -- Restore normal speed on all running pets immediately.
+        pcall(function()
+            for _, playerPet in PlayerPetModule.GetByPlayer(localPlayer) do
+                local newMult = playerPet:CalculateSpeedMultiplier()   -- now returns real value
+                if newMult ~= playerPet.speedMult then
+                    playerPet.speedMult = newMult
+                    playerPet.cpet:Broadcast("petSpeedMult", newMult)
+                end
+            end
+        end)
+    end
 end
 
+-- Keep a background loop so pets that spawn after the toggle is turned on
+-- also get the boost without waiting up to 1 second for the game's own
+-- updatePetSpeedTask to run.
 task.spawn(function()
     while true do
-        if FastPetSpeed then
-            SetFastPetSpeed(true)
+        if FastPetSpeed and PlayerPetModule then
+            pcall(function()
+                for _, playerPet in PlayerPetModule.GetByPlayer(localPlayer) do
+                    if playerPet.speedMult ~= 9999 then
+                        playerPet.speedMult = 9999
+                        playerPet.cpet:Broadcast("petSpeedMult", 9999)
+                    end
+                end
+            end)
             task.wait(0.5)
         else
             task.wait(1)
         end
     end
 end)
+
 
 local CurrentTarget = nil
 local CurrentTargetId = nil
@@ -1260,14 +1296,6 @@ task.spawn(function()
     ui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
     ui.Parent = playerGui
 
-    -- Separate AFK overlay ScreenGui: avoids inheriting the hub's UIScale.
-    -- Use PlayerGui lookup rather than another local to keep register usage low.
-    Instance.new("ScreenGui", playerGui).Name = "AfkOverlayScreen"
-    playerGui.AfkOverlayScreen.ResetOnSpawn = false
-    playerGui.AfkOverlayScreen.IgnoreGuiInset = true
-    playerGui.AfkOverlayScreen.DisplayOrder = 100000
-    playerGui.AfkOverlayScreen.ZIndexBehavior = Enum.ZIndexBehavior.Global
-
     -- =====================================================================
     -- RESPONSIVE / MOBILE UI SCALING
     -- The hub is designed around a 680x720 canvas. Instead of using a
@@ -1526,6 +1554,7 @@ task.spawn(function()
     local startupLabels = {}
     local hatchRecentLists = {}
     local hatchVariantLabels = {}
+    local updateHatchVariantOwned = function() end
     local afkRecentLists = {}
     local renderHatchRecent = function() end
     local renderAfkRecent = function() end
@@ -1698,6 +1727,7 @@ task.spawn(function()
 
         -- Variant totals: one line per tier that actually owns a variant pet.
         -- Rendered dynamically so a tier with zero rainbows costs no label.
+        pcall(updateHatchVariantOwned)
         if statsContainer then
             local order = { "Huges", "Titanics", "Gargantuans", "Secrets" }
             local used = 0
@@ -1791,22 +1821,31 @@ task.spawn(function()
     }
 
     -- =====================================================================
-    -- AFK OVERLAY
+    -- AFK OVERLAY (Full-Screen Dedicated ScreenGui)
     -- Built inside one function so its ~50 locals stay out of the main UI
     -- thread, which already sits close to Luau's 200-register ceiling.
+    -- Uses its own IgnoreGuiInset ScreenGui without UIScale interference
+    -- to guarantee complete 100% full-screen coverage.
     -- =====================================================================
+    local afkGui = Instance.new("ScreenGui")
+    afkGui.Name = "CombinedAutomationAfkUI"
+    afkGui.ResetOnSpawn = false
+    afkGui.IgnoreGuiInset = true
+    afkGui.DisplayOrder = 10000
+    afkGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+    afkGui.Enabled = false
+    afkGui.Parent = playerGui
+
     local afkOverlay, afkCenter, afkEggs, afkGems, afkExit, afkStartSession = (function()
-        -- Parent to the unscaled ScreenGui so the overlay covers the full viewport.
         local overlay = Instance.new("Frame")
         overlay.Name = "AfkOverlay"
-        overlay.AnchorPoint = Vector2.new(0, 0)
-        overlay.Size = UDim2.fromScale(1, 1)
-        overlay.Position = UDim2.fromScale(0, 0)
+        overlay.Size = UDim2.new(1, 0, 1, 0)
+        overlay.Position = UDim2.new(0, 0, 0, 0)
         overlay.BackgroundColor3 = Color3.fromRGB(5, 6, 10)
         overlay.BorderSizePixel = 0
-        overlay.Visible = false
+        overlay.Visible = true
         overlay.ZIndex = 100
-        overlay.Parent = playerGui:WaitForChild("AfkOverlayScreen")
+        overlay.Parent = afkGui
 
         local backdrop = Instance.new("Frame")
         backdrop.Name = "Backdrop"
@@ -1854,7 +1893,7 @@ task.spawn(function()
         -- HEADER -----------------------------------------------------------
         local header = Instance.new("Frame")
         header.Name = "Header"
-        header.Size = UDim2.new(1, 0, 0.16, 0)
+        header.Size = UDim2.new(1, 0, 0.14, 0)
         header.BackgroundTransparency = 1
         header.ZIndex = 102
         header.Parent = center
@@ -1938,8 +1977,8 @@ task.spawn(function()
         -- SESSION STATS ----------------------------------------------------
         local statsRow = Instance.new("Frame")
         statsRow.Name = "SessionStats"
-        statsRow.Size = UDim2.new(1, 0, 0.10, 0)
-        statsRow.Position = UDim2.new(0, 0, 0.17, 0)
+        statsRow.Size = UDim2.new(1, 0, 0.11, 0)
+        statsRow.Position = UDim2.new(0, 0, 0.15, 0)
         statsRow.BackgroundTransparency = 1
         statsRow.ZIndex = 102
         statsRow.Parent = center
@@ -1970,14 +2009,14 @@ task.spawn(function()
             captionLabel.Text = caption
             captionLabel.TextColor3 = Style.muted
             captionLabel.Font = Enum.Font.GothamBold
-            captionLabel.TextSize = 10
+            captionLabel.TextSize = 11
             captionLabel.TextXAlignment = Enum.TextXAlignment.Left
             captionLabel.ZIndex = 104
             captionLabel.Parent = card
 
             local valueLabel = Instance.new("TextLabel")
-            valueLabel.Size = UDim2.new(1, -24, 0, 26)
-            valueLabel.Position = UDim2.new(0, 12, 0, 24)
+            valueLabel.Size = UDim2.new(1, -24, 0, 28)
+            valueLabel.Position = UDim2.new(0, 12, 0, 23)
             valueLabel.BackgroundTransparency = 1
             valueLabel.Text = value
             valueLabel.TextColor3 = valueColor
@@ -1985,6 +2024,10 @@ task.spawn(function()
             valueLabel.TextScaled = true
             valueLabel.TextXAlignment = Enum.TextXAlignment.Left
             valueLabel.TextYAlignment = Enum.TextYAlignment.Center
+            local valueLimit = Instance.new("UITextSizeConstraint")
+            valueLimit.MinTextSize = 20
+            valueLimit.MaxTextSize = 30
+            valueLimit.Parent = valueLabel
             valueLabel.ZIndex = 104
             valueLabel.Parent = card
 
@@ -1995,25 +2038,73 @@ task.spawn(function()
         local statEggs = makeStat(2, "HATCHED THIS SESSION", "+0", Style.green)
         local statRares = makeStat(3, "RARES THIS SESSION", "+0", Style.violet)
 
-        -- Legacy labels the leaderstat hooks still write to. Hidden, but alive.
-        local eggsLegacy = Instance.new("TextLabel")
-        eggsLegacy.Text = "Eggs Hatched: --"
-        eggsLegacy.Visible = false
-        eggsLegacy.Size = UDim2.new(0, 1, 0, 1)
-        eggsLegacy.Parent = center
+-- Large lifetime totals in a dedicated, high-contrast row. Each card has
+-- a clear title and a separate oversized number for quick readability.
+local function makeLifetimeStat(name, caption, color, xScale)
+    local card = Instance.new("Frame")
+    card.Name = name .. "Card"
+    card.Size = UDim2.new(0.49, 0, 0.13, 0)
+    card.Position = UDim2.new(xScale, 0, 0.285, 0)
+    card.BackgroundColor3 = Color3.fromRGB(12, 16, 25)
+    card.BackgroundTransparency = 0.02
+    card.BorderSizePixel = 0
+    card.ZIndex = 104
+    card.Parent = center
 
-        local gemsLegacy = Instance.new("TextLabel")
-        gemsLegacy.Text = "Diamonds: --"
-        gemsLegacy.Visible = false
-        gemsLegacy.Size = UDim2.new(0, 1, 0, 1)
-        gemsLegacy.Parent = center
+    local corner = Instance.new("UICorner")
+    corner.CornerRadius = UDim.new(0, 16)
+    corner.Parent = card
+
+    local stroke = Instance.new("UIStroke")
+    stroke.Color = color
+    stroke.Thickness = 2
+    stroke.Transparency = 0.05
+    stroke.Parent = card
+
+    local captionLabel = Instance.new("TextLabel")
+    captionLabel.Name = name .. "Caption"
+    captionLabel.Size = UDim2.new(1, -24, 0, 18)
+    captionLabel.Position = UDim2.new(0, 12, 0, 10)
+    captionLabel.BackgroundTransparency = 1
+    captionLabel.Text = caption
+    captionLabel.TextColor3 = color
+    captionLabel.Font = Enum.Font.GothamBlack
+    captionLabel.TextSize = 12
+    captionLabel.TextXAlignment = Enum.TextXAlignment.Center
+    captionLabel.ZIndex = 105
+    captionLabel.Parent = card
+
+    local valueLabel = Instance.new("TextLabel")
+    valueLabel.Name = name .. "Value"
+    valueLabel.Size = UDim2.new(1, -24, 0, 44)
+    valueLabel.Position = UDim2.new(0, 12, 0, 31)
+    valueLabel.BackgroundTransparency = 1
+    valueLabel.Text = "0"
+    valueLabel.TextColor3 = Color3.fromRGB(255, 255, 255)
+    valueLabel.Font = Enum.Font.GothamBlack
+    valueLabel.TextSize = 34
+    valueLabel.TextScaled = true
+    valueLabel.TextXAlignment = Enum.TextXAlignment.Center
+    valueLabel.TextYAlignment = Enum.TextYAlignment.Center
+    valueLabel.ZIndex = 105
+    valueLabel.Parent = card
+
+    local sizeLimit = Instance.new("UITextSizeConstraint")
+    sizeLimit.MinTextSize = 24
+    sizeLimit.MaxTextSize = 36
+    sizeLimit.Parent = valueLabel
+    return valueLabel
+end
+
+local eggsLegacy = makeLifetimeStat("AfkEggs", "TOTAL EGGS HATCHED", Color3.fromRGB(95, 245, 135), 0)
+local gemsLegacy = makeLifetimeStat("AfkGems", "TOTAL DIAMONDS", Color3.fromRGB(105, 190, 255), 0.51)
 
         -- EXIT -------------------------------------------------------------
         local exitButton = Instance.new("TextButton")
         exitButton.Name = "ExitAFK"
         exitButton.Size = UDim2.new(0, 380, 0, 52)
         exitButton.AnchorPoint = Vector2.new(0.5, 0.5)
-        exitButton.Position = UDim2.new(0.5, 0, 0.955, 0)
+        exitButton.Position = UDim2.new(0.5, 0, 0.965, 0)
         exitButton.BackgroundColor3 = Color3.fromRGB(38, 20, 26)
         exitButton.Text = "TURN OFF AFK MODE"
         exitButton.TextColor3 = Color3.fromRGB(255, 220, 225)
@@ -2103,8 +2194,9 @@ task.spawn(function()
     autoHatchMain.Visible = true
     autoHatchMain.Parent = ui
 
-    -- Re-centre the main hub for the Roblox top inset. The AFK overlay is
-    -- in its own ScreenGui and does not need a position correction.
+    -- The ScreenGui origin is above the screen while IgnoreGuiInset is on, so
+    -- a freshly centred hub lands ~58 px high. Re-centre once the ScreenGui has
+    -- reported its real inset (it can be 0 on the first frame).
     task.defer(function()
         local inset = math.max(0, -ui.AbsolutePosition.Y)
         if inset <= 0 then return end
@@ -2264,8 +2356,8 @@ task.spawn(function()
     local settingsTab = createTabButton("Settings", 3)
     local eggTab = createTabButton("Egg Chances", 4)
     local farmTab = createTabButton("Farm", 5)
-    TAB_TOTAL.tab = createTabButton("Daycare", 6)
-    TAB_TOTAL.indexUI = { tab = createTabButton("Index", 7) }
+TAB_TOTAL.tab = createTabButton("Daycare", 6)
+TAB_TOTAL.indexUI = { tab = createTabButton("Index", 7) }
 
     local hatchFrame = Instance.new("ScrollingFrame")
     hatchFrame.Size = UDim2.new(1, -40, 1, -136)
@@ -2275,7 +2367,7 @@ task.spawn(function()
     hatchFrame.ClipsDescendants = true
     hatchFrame.ScrollBarThickness = 4
     hatchFrame.ScrollingDirection = Enum.ScrollingDirection.Y
-    hatchFrame.CanvasSize = UDim2.new(0, 0, 0, 965)
+    hatchFrame.CanvasSize = UDim2.new(0, 0, 0, 1020)
     hatchFrame.Parent = autoHatchMain
 
     local tpFrame = Instance.new("Frame")
@@ -2393,12 +2485,11 @@ task.spawn(function()
     TAB_TOTAL.indexUI.layout.SortOrder = Enum.SortOrder.LayoutOrder
     TAB_TOTAL.indexUI.layout.Padding = UDim.new(0, 5)
     TAB_TOTAL.indexUI.layout.Parent = TAB_TOTAL.indexUI.list
-    TAB_TOTAL.indexUI.padding = Instance.new("UIPadding")
-    TAB_TOTAL.indexUI.padding.PaddingBottom = UDim.new(0, 12)
-    TAB_TOTAL.indexUI.padding.Parent = TAB_TOTAL.indexUI.list
+TAB_TOTAL.indexUI.padding = Instance.new("UIPadding")
+TAB_TOTAL.indexUI.padding.PaddingBottom = UDim.new(0, 12)
+TAB_TOTAL.indexUI.padding.Parent = TAB_TOTAL.indexUI.list
 
-
-    TAB_TOTAL.frame = Instance.new("ScrollingFrame")
+TAB_TOTAL.frame = Instance.new("ScrollingFrame")
     TAB_TOTAL.frame.Name = "DaycareScroll"
     TAB_TOTAL.frame.Size = UDim2.new(1, -40, 1, -136)
     TAB_TOTAL.frame.Position = UDim2.new(0, 20, 0, 128)
@@ -2749,15 +2840,15 @@ task.spawn(function()
 
 
     local function switchTab(activeBtn, activeFrame)
-        hatchFrame.Visible = false
-        tpFrame.Visible = false
-        settingsFrame.Visible = false
-        eggFrame.Visible = false
-        farmFrame.Visible = false
-        TAB_TOTAL.frame.Visible = false
-        TAB_TOTAL.indexUI.frame.Visible = false
+    hatchFrame.Visible = false
+    tpFrame.Visible = false
+    settingsFrame.Visible = false
+    eggFrame.Visible = false
+    farmFrame.Visible = false
+    TAB_TOTAL.frame.Visible = false
+    TAB_TOTAL.indexUI.frame.Visible = false
 
-        for _, btn in ipairs({hatchTab, tpTab, settingsTab, eggTab, farmTab, TAB_TOTAL.tab, TAB_TOTAL.indexUI.tab}) do
+    for _, btn in ipairs({hatchTab, tpTab, settingsTab, eggTab, farmTab, TAB_TOTAL.tab, TAB_TOTAL.indexUI.tab}) do
             local tabStroke = btn:FindFirstChildOfClass("UIStroke")
             btn:SetAttribute("TabActive", false)
             btn.BackgroundColor3 = activeTheme.surface
@@ -2811,9 +2902,9 @@ task.spawn(function()
     eggTab.MouseButton1Click:Connect(function() switchTab(eggTab, eggFrame) end)
     farmTab.MouseButton1Click:Connect(function() switchTab(farmTab, farmFrame) end)
     TAB_TOTAL.tab.MouseButton1Click:Connect(function() switchTab(TAB_TOTAL.tab, TAB_TOTAL.frame) end)
-    TAB_TOTAL.indexUI.tab.MouseButton1Click:Connect(function() switchTab(TAB_TOTAL.indexUI.tab, TAB_TOTAL.indexUI.frame) end)
+TAB_TOTAL.indexUI.tab.MouseButton1Click:Connect(function() switchTab(TAB_TOTAL.indexUI.tab, TAB_TOTAL.indexUI.frame) end)
 
-    switchTab(hatchTab, hatchFrame)
+switchTab(hatchTab, hatchFrame)
 
     -- UNIFIED TOGGLE GENERATOR HELPER
     local toggleRegistry = {}
@@ -3808,7 +3899,7 @@ task.spawn(function()
         variantsTitle.Size = UDim2.new(1, -28, 0, 12)
         variantsTitle.Position = UDim2.new(0, 14, 0, 140)
         variantsTitle.BackgroundTransparency = 1
-        variantsTitle.Text = "VARIANTS HATCHED"
+        variantsTitle.Text = "VARIANTS OWNED"
         variantsTitle.TextColor3 = Color3.fromRGB(150, 160, 182)
         variantsTitle.Font = Enum.Font.GothamBold
         variantsTitle.TextSize = 10
@@ -3850,6 +3941,31 @@ task.spawn(function()
 
             hatchVariantLabels[def.key] = { label = chip, prefix = def.label }
         end
+
+        updateHatchVariantOwned = function()
+            local ownedVariants = { Rainbow = 0, Golden = 0, Shiny = 0 }
+            pcall(function()
+                if Save and Save.Get then
+                    local save = Save.Get()
+                    local pets = save and save.Pets
+                    if type(pets) == "table" then
+                        for _, pet in pairs(pets) do
+                            if type(pet) == "table" then
+                                if pet.r == true then ownedVariants.Rainbow += 1 end
+                                if pet.g == true then ownedVariants.Golden += 1 end
+                                if pet.sh == true then ownedVariants.Shiny += 1 end
+                            end
+                        end
+                    end
+                end
+            end)
+            for key, data in pairs(hatchVariantLabels) do
+                if data.label and data.label.Parent then
+                    data.label.Text = data.prefix .. "  " .. tostring(ownedVariants[key] or 0)
+                end
+            end
+        end
+        pcall(updateHatchVariantOwned)
     end
 
     local SearchBox = Instance.new("TextBox")
@@ -4030,6 +4146,14 @@ task.spawn(function()
                 label.Text = "+" .. tostring(startupCounts[key] or 0) .. " since launch"
             end
         end
+
+        -- Refresh the recent-hatch lists on the AFK screen every time the
+        -- session counts change. This is the fix for rare hatches not showing
+        -- in AFK mode – previously renderAfkRecent was only called once at
+        -- session start, so pets hatched after that never appeared.
+        if afkSessionActive then
+            pcall(renderAfkRecent)
+        end
     end
 
     local function resetAfkSessionCounts()
@@ -4051,11 +4175,19 @@ task.spawn(function()
             resetAfkSessionCounts()
 
             if enabled then
+                -- The AFK overlay lives in its own ScreenGui. Enabling only
+                -- the Frame is not enough: a disabled ScreenGui never renders.
+                afkGui.Enabled = true
                 afkOverlay.Visible = true
                 autoHatchMain.Visible = false
                 afkStartSession()
+                -- Render recent rare hatches immediately so the AFK panel
+                -- shows hatches from before the session started, not just
+                -- ones that hatch while AFK is active.
+                pcall(renderAfkRecent)
             else
                 afkOverlay.Visible = false
+                afkGui.Enabled = false
                 autoHatchMain.Visible = true
             end
         end)
@@ -4076,7 +4208,7 @@ task.spawn(function()
     do
     local recentPanel = Instance.new("Frame")
     recentPanel.Name = "RecentHatchesPanel"
-    recentPanel.Size = UDim2.new(1, -6, 0, 150)
+    recentPanel.Size = UDim2.new(1, -6, 0, 194)
     recentPanel.Position = UDim2.new(0, 3, 0, 502)
     recentPanel.BackgroundColor3 = activeTheme.panel
     recentPanel.BorderSizePixel = 0
@@ -4123,10 +4255,9 @@ task.spawn(function()
     recentHint.TextSize = 11
     recentHint.TextXAlignment = Enum.TextXAlignment.Right
     recentHint.Parent = recentPanel
-
     for index, category in ipairs(recentCategories) do
         local column = Instance.new("Frame")
-        column.Size = UDim2.new(0.25, -8, 1, -42)
+        column.Size = UDim2.new(0.25, -8, 0, 102)
         column.Position = UDim2.new((index - 1) * 0.25, 4, 0, 36)
         column.BackgroundColor3 = activeTheme.surface
         column.BackgroundTransparency = 0.45
@@ -4182,6 +4313,62 @@ task.spawn(function()
         hatchRecentLists[category.name] = { frame = list, entries = category.entries, color = category.color }
     end
 
+    -- Moved variants hatched under recent hatches
+    local recentHatchedSection = Instance.new("Frame")
+    recentHatchedSection.Name = "RecentHatchedVariants"
+    recentHatchedSection.Size = UDim2.new(1, -8, 0, 44)
+    recentHatchedSection.Position = UDim2.new(0, 4, 0, 144)
+    recentHatchedSection.BackgroundTransparency = 1
+    recentHatchedSection.Parent = recentPanel
+
+    local recentHatchedTitle = Instance.new("TextLabel")
+    recentHatchedTitle.Size = UDim2.new(1, 0, 0, 12)
+    recentHatchedTitle.Position = UDim2.new(0, 4, 0, 0)
+    recentHatchedTitle.BackgroundTransparency = 1
+    recentHatchedTitle.Text = "VARIANTS HATCHED (RECENT)"
+    recentHatchedTitle.TextColor3 = Color3.fromRGB(150, 160, 182)
+    recentHatchedTitle.Font = Enum.Font.GothamBold
+    recentHatchedTitle.TextSize = 9
+    recentHatchedTitle.TextXAlignment = Enum.TextXAlignment.Left
+    recentHatchedTitle.Parent = recentHatchedSection
+
+    local recentHatchChips = {}
+    local recentVariantDefs = {
+        { key = "Rainbow", label = "RAINBOW", color = Color3.fromRGB(255, 120, 220) },
+        { key = "Golden", label = "GOLDEN", color = Color3.fromRGB(255, 200, 70) },
+        { key = "Shiny", label = "SHINY", color = Color3.fromRGB(120, 220, 255) },
+    }
+
+    for index, def in ipairs(recentVariantDefs) do
+        local chip = Instance.new("TextLabel")
+        chip.Name = def.key .. "HatchedChip"
+        chip.Size = UDim2.new(1 / 3, -8, 0, 26)
+        chip.Position = UDim2.new((index - 1) / 3, 4, 0, 14)
+        chip.BackgroundColor3 = Color3.fromRGB(27, 30, 41)
+        chip.Text = def.label .. "  0"
+        chip.TextColor3 = def.color
+        chip.Font = Enum.Font.GothamBold
+        chip.TextSize = 10
+        chip.TextXAlignment = Enum.TextXAlignment.Left
+        chip.TextYAlignment = Enum.TextYAlignment.Center
+        chip.Parent = recentHatchedSection
+
+        local chipCorner = Instance.new("UICorner")
+        chipCorner.CornerRadius = UDim.new(0, 6)
+        chipCorner.Parent = chip
+
+        local chipPadding = Instance.new("UIPadding")
+        chipPadding.PaddingLeft = UDim.new(0, 8)
+        chipPadding.Parent = chip
+
+        local chipStroke = Instance.new("UIStroke")
+        chipStroke.Color = def.color
+        chipStroke.Transparency = 0.82
+        chipStroke.Parent = chip
+
+        recentHatchChips[def.key] = { label = chip, prefix = def.label }
+    end
+
     renderHatchRecent = function()
         local variantTotals = { Rainbow = 0, Golden = 0, Shiny = 0 }
         for _, category in ipairs(recentCategories) do
@@ -4227,7 +4414,7 @@ task.spawn(function()
             end
         end
 
-        for key, data in pairs(hatchVariantLabels) do
+        for key, data in pairs(recentHatchChips) do
             if data.label and data.label.Parent then
                 data.label.Text = data.prefix .. "  " .. tostring(variantTotals[key] or 0)
             end
@@ -4307,7 +4494,7 @@ task.spawn(function()
         local webhookPanel = Instance.new("Frame")
         webhookPanel.Name = "WebhookPanel"
         webhookPanel.Size = UDim2.new(1, -16, 0, 290)
-        webhookPanel.Position = UDim2.new(0, 8, 0, 662)
+        webhookPanel.Position = UDim2.new(0, 8, 0, 706)
         webhookPanel.BackgroundColor3 = activeTheme.panel
         webhookPanel.BorderSizePixel = 0
         webhookPanel.Parent = hatchFrame
@@ -5415,8 +5602,10 @@ task.spawn(function()
     do
         local panel = Instance.new("Frame")
         panel.Name = "AfkRarePanel"
-        panel.Size = UDim2.new(1, 0, 0.58, 0)
-        panel.Position = UDim2.new(0, 0, 0.29, 0)
+        -- Leave a dedicated, unobstructed row above for the large lifetime
+        -- Eggs and Diamonds cards.
+        panel.Size = UDim2.new(1, 0, 0.48, 0)
+        panel.Position = UDim2.new(0, 0, 0.44, 0)
         panel.BackgroundColor3 = Style.surfaceAlt
         panel.BackgroundTransparency = 0.12
         panel.BorderSizePixel = 0
@@ -5525,7 +5714,7 @@ task.spawn(function()
             nameLabel.Text = category.name:upper()
             nameLabel.TextColor3 = category.color
             nameLabel.Font = Enum.Font.GothamBold
-            nameLabel.TextSize = 11
+            nameLabel.TextSize = 12
             nameLabel.TextXAlignment = Enum.TextXAlignment.Left
             nameLabel.ZIndex = 105
             nameLabel.Parent = card
@@ -5537,7 +5726,7 @@ task.spawn(function()
             countLabel.Text = "0"
             countLabel.TextColor3 = Style.text
             countLabel.Font = Enum.Font.GothamBlack
-            countLabel.TextSize = 30
+            countLabel.TextSize = 28
             countLabel.TextXAlignment = Enum.TextXAlignment.Left
             countLabel.ZIndex = 105
             countLabel.Parent = card
@@ -5704,20 +5893,20 @@ task.spawn(function()
         local eggsStat = leaderstats:FindFirstChild("Eggs Hatched")
         if eggsStat then
             EggsLabel.Text = "Eggs: " .. formatNumber(eggsStat.Value)
-            afkEggs.Text = "Eggs Hatched: " .. formatNumber(eggsStat.Value)
+            afkEggs.Text = formatNumber(eggsStat.Value)
             eggsStat.Changed:Connect(function(value)
                 EggsLabel.Text = "Eggs: " .. formatNumber(value)
-                afkEggs.Text = "Eggs Hatched: " .. formatNumber(value)
+                afkEggs.Text = formatNumber(value)
             end)
         end
 
         local gemStat = leaderstats:FindFirstChild("Diamonds")
         if gemStat then
             GemsLabel.Text = "Diamonds: " .. formatNumber(gemStat.Value)
-            afkGems.Text = "Diamonds: " .. formatNumber(gemStat.Value)
+            afkGems.Text = formatNumber(gemStat.Value)
             gemStat.Changed:Connect(function(value)
                 GemsLabel.Text = "Diamonds: " .. formatNumber(value)
-                afkGems.Text = "Diamonds: " .. formatNumber(value)
+                afkGems.Text = formatNumber(value)
             end)
         end
     end
