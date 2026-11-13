@@ -1260,6 +1260,14 @@ task.spawn(function()
     ui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
     ui.Parent = playerGui
 
+    -- Separate AFK overlay ScreenGui: avoids inheriting the hub's UIScale.
+    -- Use PlayerGui lookup rather than another local to keep register usage low.
+    Instance.new("ScreenGui", playerGui).Name = "AfkOverlayScreen"
+    playerGui.AfkOverlayScreen.ResetOnSpawn = false
+    playerGui.AfkOverlayScreen.IgnoreGuiInset = true
+    playerGui.AfkOverlayScreen.DisplayOrder = 100000
+    playerGui.AfkOverlayScreen.ZIndexBehavior = Enum.ZIndexBehavior.Global
+
     -- =====================================================================
     -- RESPONSIVE / MOBILE UI SCALING
     -- The hub is designed around a 680x720 canvas. Instead of using a
@@ -1517,6 +1525,7 @@ task.spawn(function()
     local afkSessionVariantLabels = {}
     local startupLabels = {}
     local hatchRecentLists = {}
+    local hatchVariantLabels = {}
     local afkRecentLists = {}
     local renderHatchRecent = function() end
     local renderAfkRecent = function() end
@@ -1680,8 +1689,12 @@ task.spawn(function()
             hatchRareLabels.Gargantuans.TextColor3 = Color3.fromRGB(150, 35, 35)
             hatchRareLabels.Gargantuans:SetAttribute("ThemeLocked", true)
         end
-        if afkRareLabels.Huges then afkRareLabels.Huges.Text = hugeLabel.Text end
-        if afkRareLabels.Secrets then afkRareLabels.Secrets.Text = secretLabel.Text end
+        -- The AFK cards show the raw number, not the hatch panel's
+        -- "Huges: 12" string, and Gargantuans were never refreshed at all.
+        if afkRareLabels.Huges then afkRareLabels.Huges.Text = tostring(totalHuge) end
+        if afkRareLabels.Secrets then afkRareLabels.Secrets.Text = tostring(totalSecret) end
+        if afkRareLabels.Titanics then afkRareLabels.Titanics.Text = tostring(totalTitanic) end
+        if afkRareLabels.Gargantuans then afkRareLabels.Gargantuans.Text = tostring(totalGargantuan) end
 
         -- Variant totals: one line per tier that actually owns a variant pet.
         -- Rendered dynamically so a tier with zero rainbows costs no label.
@@ -1700,7 +1713,7 @@ task.spawn(function()
                         used += 1
                         label = Instance.new("TextLabel")
                         label.Size = UDim2.new(1, -20, 0, 20)
-                        label.Position = UDim2.new(0, 10, 0, 142 + (used - 1) * 22)
+                        label.Position = UDim2.new(0, 10, 0, 132 + (used - 1) * 22)
                         label.BackgroundTransparency = 1
                         label.TextColor3 = Color3.fromRGB(255, 120, 220)
                         label.Font = Enum.Font.GothamBold
@@ -1724,7 +1737,6 @@ task.spawn(function()
                 end
             end
         end
-        if afkRareLabels.Titanics then afkRareLabels.Titanics.Text = titanicLabel.Text end
         if afkSessionActive then
             updateAfkSessionLabels()
         end
@@ -1766,107 +1778,318 @@ task.spawn(function()
         end
     end)
 
+    -- Shared visual language for the AFK screen and the recent-hatch cards.
+    local Style = {
+        surface    = Color3.fromRGB(23, 26, 37),
+        surfaceAlt = Color3.fromRGB(17, 19, 28),
+        line       = Color3.fromRGB(48, 53, 70),
+        muted      = Color3.fromRGB(132, 142, 165),
+        text       = Color3.fromRGB(236, 240, 250),
+        green      = Color3.fromRGB(52, 211, 153),
+        violet     = Color3.fromRGB(167, 139, 250),
+        cyan       = Color3.fromRGB(34, 211, 238),
+    }
+
+    -- =====================================================================
     -- AFK OVERLAY
-    local afkOverlay = Instance.new("Frame")
-    afkOverlay.Name = "AfkOverlay"
-    afkOverlay.Size = UDim2.new(1, 0, 1, 0)
-    afkOverlay.Position = UDim2.new(0, 0, 0, 0)
-    afkOverlay.BackgroundColor3 = Color3.fromRGB(0, 0, 0)
-    afkOverlay.BorderSizePixel = 0
-    afkOverlay.Visible = false
-    afkOverlay.ZIndex = 100
-    afkOverlay.Parent = ui
+    -- Built inside one function so its ~50 locals stay out of the main UI
+    -- thread, which already sits close to Luau's 200-register ceiling.
+    -- =====================================================================
+    local afkOverlay, afkCenter, afkEggs, afkGems, afkExit, afkStartSession = (function()
+        -- Parent to the unscaled ScreenGui so the overlay covers the full viewport.
+        local overlay = Instance.new("Frame")
+        overlay.Name = "AfkOverlay"
+        overlay.AnchorPoint = Vector2.new(0, 0)
+        overlay.Size = UDim2.fromScale(1, 1)
+        overlay.Position = UDim2.fromScale(0, 0)
+        overlay.BackgroundColor3 = Color3.fromRGB(5, 6, 10)
+        overlay.BorderSizePixel = 0
+        overlay.Visible = false
+        overlay.ZIndex = 100
+        overlay.Parent = playerGui:WaitForChild("AfkOverlayScreen")
 
-    local blackFill = Instance.new("Frame")
-    blackFill.Size = UDim2.new(1, 0, 1, 0)
-    blackFill.BackgroundColor3 = Color3.fromRGB(0, 0, 0)
-    blackFill.BorderSizePixel = 0
-    blackFill.ZIndex = 101
-    blackFill.Parent = afkOverlay
+        local backdrop = Instance.new("Frame")
+        backdrop.Name = "Backdrop"
+        backdrop.Size = UDim2.new(1, 0, 1, 0)
+        backdrop.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
+        backdrop.BorderSizePixel = 0
+        backdrop.ZIndex = 101
+        backdrop.Parent = overlay
 
-    local afkCenter = Instance.new("Frame")
-    afkCenter.Size = UDim2.new(0.94, 0, 0.90, 0)
-    afkCenter.AnchorPoint = Vector2.new(0.5, 0.5)
-    afkCenter.Position = UDim2.new(0.5, 0, 0.46, 0)
-    afkCenter.BackgroundTransparency = 1
-    afkCenter.ZIndex = 102
-    afkCenter.Parent = afkOverlay
+        local backdropGradient = Instance.new("UIGradient")
+        backdropGradient.Rotation = 90
+        backdropGradient.Color = ColorSequence.new({
+            ColorSequenceKeypoint.new(0, Color3.fromRGB(28, 32, 52)),
+            ColorSequenceKeypoint.new(0.55, Color3.fromRGB(11, 13, 21)),
+            ColorSequenceKeypoint.new(1, Color3.fromRGB(5, 6, 10)),
+        })
+        backdropGradient.Parent = backdrop
 
-    local afkTitle = Instance.new("TextLabel")
-    afkTitle.Size = UDim2.new(1, 0, 0, 96)
-    afkTitle.Text = "AFK Mode"
-    afkTitle.TextColor3 = Color3.fromRGB(240, 245, 255)
-    afkTitle.Font = Enum.Font.GothamBlack
-    afkTitle.TextSize = 64
-    afkTitle.TextScaled = true
-    afkTitle.BackgroundTransparency = 1
-    afkTitle.TextXAlignment = Enum.TextXAlignment.Center
-    afkTitle.ZIndex = 102
-    afkTitle.Parent = afkCenter
+        local glow = Instance.new("Frame")
+        glow.Name = "Glow"
+        glow.Size = UDim2.new(1, 0, 0.45, 0)
+        glow.BackgroundColor3 = Style.violet
+        glow.BackgroundTransparency = 0.92
+        glow.BorderSizePixel = 0
+        glow.ZIndex = 101
+        glow.Parent = overlay
 
-    do
-        local afkSubtitle = Instance.new("TextLabel")
-        afkSubtitle.Size = UDim2.new(1, 0, 0, 28)
-        afkSubtitle.Position = UDim2.new(0, 0, 0, 98)
-        afkSubtitle.Text = "Pet Dimensions Hub"
-        afkSubtitle.TextColor3 = Color3.fromRGB(120, 150, 200)
-        afkSubtitle.Font = Enum.Font.GothamSemibold
-        afkSubtitle.TextSize = 18
-        afkSubtitle.BackgroundTransparency = 1
-        afkSubtitle.TextXAlignment = Enum.TextXAlignment.Center
-        afkSubtitle.ZIndex = 102
-        afkSubtitle.Parent = afkCenter
-    end
+        local glowGradient = Instance.new("UIGradient")
+        glowGradient.Rotation = 90
+        glowGradient.Transparency = NumberSequence.new({
+            NumberSequenceKeypoint.new(0, 0),
+            NumberSequenceKeypoint.new(1, 1),
+        })
+        glowGradient.Parent = glow
 
-    -- The old overlay showed live egg/gem counters. Keep the labels alive so
-    -- the leaderstat hooks that write to them stay valid, but hide them so
-    -- the screen reads as a plain AFK Mode panel.
-    local afkEggs = Instance.new("TextLabel")
-    afkEggs.Size = UDim2.new(1, 0, 0, 50)
-    afkEggs.Position = UDim2.new(0, 0, 0, 95)
-    afkEggs.Text = "Eggs Hatched: --"
-    afkEggs.Visible = false
-    afkEggs.TextColor3 = Color3.fromRGB(80, 230, 80)
-    afkEggs.Font = Enum.Font.GothamSemibold
-    afkEggs.TextSize = 42
-    afkEggs.TextScaled = true
-    afkEggs.BackgroundTransparency = 1
-    afkEggs.TextXAlignment = Enum.TextXAlignment.Center
-    afkEggs.ZIndex = 102
-    afkEggs.Parent = afkCenter
+        local center = Instance.new("Frame")
+        center.Name = "Center"
+        center.Size = UDim2.new(0.94, 0, 0.92, 0)
+        center.AnchorPoint = Vector2.new(0.5, 0.5)
+        center.Position = UDim2.new(0.5, 0, 0.5, 0)
+        center.BackgroundTransparency = 1
+        center.ZIndex = 102
+        center.Parent = overlay
 
-    local afkGems = Instance.new("TextLabel")
-    afkGems.Size = UDim2.new(1, 0, 0, 50)
-    afkGems.Position = UDim2.new(0, 0, 0, 155)
-    afkGems.Text = "Diamonds: --"
-    afkGems.Visible = false
-    afkGems.TextColor3 = Color3.fromRGB(110, 185, 255)
-    afkGems.Font = Enum.Font.GothamSemibold
-    afkGems.TextSize = 42
-    afkGems.TextScaled = true
-    afkGems.BackgroundTransparency = 1
-    afkGems.TextXAlignment = Enum.TextXAlignment.Center
-    afkGems.ZIndex = 102
-    afkGems.Parent = afkCenter
+        -- HEADER -----------------------------------------------------------
+        local header = Instance.new("Frame")
+        header.Name = "Header"
+        header.Size = UDim2.new(1, 0, 0.16, 0)
+        header.BackgroundTransparency = 1
+        header.ZIndex = 102
+        header.Parent = center
 
-    local afkExit = Instance.new("TextButton")
-    -- This button is anchored to the actual screen, not the old 950x780
-    -- design canvas, so it is ALWAYS reachable on a phone.
-    afkExit.Size = UDim2.new(0.72, 0, 0, 64)
-    afkExit.AnchorPoint = Vector2.new(0.5, 1)
-    afkExit.Position = UDim2.new(0.5, 0, 0.96, 0)
-    afkExit.Text = "Turn Off AFK Mode"
-    afkExit.TextColor3 = Color3.fromRGB(255, 255, 255)
-    afkExit.BackgroundColor3 = Color3.fromRGB(200, 50, 50)
-    afkExit.Font = Enum.Font.GothamSemibold
-    afkExit.TextSize = 32
-    afkExit.TextScaled = true
-    afkExit.ZIndex = 102
-    afkExit.Parent = afkCenter
+        local title = Instance.new("TextLabel")
+        title.Name = "Title"
+        title.Size = UDim2.new(1, 0, 0.58, 0)
+        title.BackgroundTransparency = 1
+        title.Text = "AFK MODE"
+        title.TextColor3 = Color3.fromRGB(255, 255, 255)
+        title.Font = Enum.Font.GothamBlack
+        title.TextScaled = true
+        title.ZIndex = 103
+        title.Parent = header
 
-    local afkExitCorner = Instance.new("UICorner")
-    afkExitCorner.CornerRadius = UDim.new(0, 12)
-    afkExitCorner.Parent = afkExit
+        local titleGradient = Instance.new("UIGradient")
+        titleGradient.Rotation = 0
+        titleGradient.Color = ColorSequence.new({
+            ColorSequenceKeypoint.new(0, Color3.fromRGB(226, 232, 255)),
+            ColorSequenceKeypoint.new(0.55, Style.violet),
+            ColorSequenceKeypoint.new(1, Style.cyan),
+        })
+        titleGradient.Parent = title
+
+        local pill = Instance.new("Frame")
+        pill.Name = "StatusPill"
+        pill.Size = UDim2.new(0, 236, 0, 26)
+        pill.AnchorPoint = Vector2.new(0.5, 0)
+        pill.Position = UDim2.new(0.5, 0, 0.66, 0)
+        pill.BackgroundColor3 = Color3.fromRGB(14, 24, 22)
+        pill.BorderSizePixel = 0
+        pill.ZIndex = 103
+        pill.Parent = header
+
+        local pillCorner = Instance.new("UICorner")
+        pillCorner.CornerRadius = UDim.new(1, 0)
+        pillCorner.Parent = pill
+
+        local pillStroke = Instance.new("UIStroke")
+        pillStroke.Color = Style.green
+        pillStroke.Thickness = 1
+        pillStroke.Transparency = 0.55
+        pillStroke.Parent = pill
+
+        local dot = Instance.new("Frame")
+        dot.Size = UDim2.new(0, 7, 0, 7)
+        dot.Position = UDim2.new(0, 12, 0.5, -3)
+        dot.BackgroundColor3 = Style.green
+        dot.BorderSizePixel = 0
+        dot.ZIndex = 104
+        dot.Parent = pill
+
+        local dotCorner = Instance.new("UICorner")
+        dotCorner.CornerRadius = UDim.new(1, 0)
+        dotCorner.Parent = dot
+
+        local pillText = Instance.new("TextLabel")
+        pillText.Size = UDim2.new(1, -28, 1, 0)
+        pillText.Position = UDim2.new(0, 26, 0, 0)
+        pillText.BackgroundTransparency = 1
+        pillText.Text = "LIVE  ·  PET DIMENSIONS HUB"
+        pillText.TextColor3 = Style.green
+        pillText.Font = Enum.Font.GothamBold
+        pillText.TextSize = 11
+        pillText.TextXAlignment = Enum.TextXAlignment.Left
+        pillText.ZIndex = 104
+        pillText.Parent = pill
+
+        task.spawn(function()
+            local tweenService = game:GetService("TweenService")
+            while dot.Parent do
+                local fadeOut = tweenService:Create(dot, TweenInfo.new(0.9, Enum.EasingStyle.Sine), { BackgroundTransparency = 0.7 })
+                fadeOut:Play()
+                fadeOut.Completed:Wait()
+                local fadeIn = tweenService:Create(dot, TweenInfo.new(0.9, Enum.EasingStyle.Sine), { BackgroundTransparency = 0 })
+                fadeIn:Play()
+                fadeIn.Completed:Wait()
+            end
+        end)
+
+        -- SESSION STATS ----------------------------------------------------
+        local statsRow = Instance.new("Frame")
+        statsRow.Name = "SessionStats"
+        statsRow.Size = UDim2.new(1, 0, 0.10, 0)
+        statsRow.Position = UDim2.new(0, 0, 0.17, 0)
+        statsRow.BackgroundTransparency = 1
+        statsRow.ZIndex = 102
+        statsRow.Parent = center
+
+        local function makeStat(index, caption, value, valueColor)
+            local card = Instance.new("Frame")
+            card.Size = UDim2.new(1 / 3, -8, 1, 0)
+            card.Position = UDim2.new((index - 1) / 3, 4, 0, 0)
+            card.BackgroundColor3 = Style.surfaceAlt
+            card.BackgroundTransparency = 0.1
+            card.BorderSizePixel = 0
+            card.ZIndex = 103
+            card.Parent = statsRow
+
+            local cardCorner = Instance.new("UICorner")
+            cardCorner.CornerRadius = UDim.new(0, 12)
+            cardCorner.Parent = card
+
+            local cardStroke = Instance.new("UIStroke")
+            cardStroke.Color = Style.line
+            cardStroke.Transparency = 0.45
+            cardStroke.Parent = card
+
+            local captionLabel = Instance.new("TextLabel")
+            captionLabel.Size = UDim2.new(1, -24, 0, 14)
+            captionLabel.Position = UDim2.new(0, 12, 0, 9)
+            captionLabel.BackgroundTransparency = 1
+            captionLabel.Text = caption
+            captionLabel.TextColor3 = Style.muted
+            captionLabel.Font = Enum.Font.GothamBold
+            captionLabel.TextSize = 10
+            captionLabel.TextXAlignment = Enum.TextXAlignment.Left
+            captionLabel.ZIndex = 104
+            captionLabel.Parent = card
+
+            local valueLabel = Instance.new("TextLabel")
+            valueLabel.Size = UDim2.new(1, -24, 0, 26)
+            valueLabel.Position = UDim2.new(0, 12, 0, 24)
+            valueLabel.BackgroundTransparency = 1
+            valueLabel.Text = value
+            valueLabel.TextColor3 = valueColor
+            valueLabel.Font = Enum.Font.GothamBlack
+            valueLabel.TextScaled = true
+            valueLabel.TextXAlignment = Enum.TextXAlignment.Left
+            valueLabel.TextYAlignment = Enum.TextYAlignment.Center
+            valueLabel.ZIndex = 104
+            valueLabel.Parent = card
+
+            return valueLabel
+        end
+
+        local statTime = makeStat(1, "SESSION TIME", "00:00", Style.text)
+        local statEggs = makeStat(2, "HATCHED THIS SESSION", "+0", Style.green)
+        local statRares = makeStat(3, "RARES THIS SESSION", "+0", Style.violet)
+
+        -- Legacy labels the leaderstat hooks still write to. Hidden, but alive.
+        local eggsLegacy = Instance.new("TextLabel")
+        eggsLegacy.Text = "Eggs Hatched: --"
+        eggsLegacy.Visible = false
+        eggsLegacy.Size = UDim2.new(0, 1, 0, 1)
+        eggsLegacy.Parent = center
+
+        local gemsLegacy = Instance.new("TextLabel")
+        gemsLegacy.Text = "Diamonds: --"
+        gemsLegacy.Visible = false
+        gemsLegacy.Size = UDim2.new(0, 1, 0, 1)
+        gemsLegacy.Parent = center
+
+        -- EXIT -------------------------------------------------------------
+        local exitButton = Instance.new("TextButton")
+        exitButton.Name = "ExitAFK"
+        exitButton.Size = UDim2.new(0, 380, 0, 52)
+        exitButton.AnchorPoint = Vector2.new(0.5, 0.5)
+        exitButton.Position = UDim2.new(0.5, 0, 0.955, 0)
+        exitButton.BackgroundColor3 = Color3.fromRGB(38, 20, 26)
+        exitButton.Text = "TURN OFF AFK MODE"
+        exitButton.TextColor3 = Color3.fromRGB(255, 220, 225)
+        exitButton.Font = Enum.Font.GothamBold
+        exitButton.TextSize = 15
+        exitButton.ZIndex = 103
+        exitButton.Parent = center
+
+        local exitConstraint = Instance.new("UISizeConstraint")
+        exitConstraint.MaxSize = Vector2.new(420, 56)
+        exitConstraint.MinSize = Vector2.new(220, 44)
+        exitConstraint.Parent = exitButton
+
+        local exitCorner = Instance.new("UICorner")
+        exitCorner.CornerRadius = UDim.new(0, 14)
+        exitCorner.Parent = exitButton
+
+        local exitStroke = Instance.new("UIStroke")
+        exitStroke.Color = Color3.fromRGB(255, 92, 110)
+        exitStroke.Transparency = 0.35
+        exitStroke.Thickness = 1
+        exitStroke.Parent = exitButton
+
+        exitButton.MouseEnter:Connect(function()
+            exitButton.BackgroundColor3 = Color3.fromRGB(60, 26, 34)
+            exitStroke.Transparency = 0.05
+        end)
+
+        exitButton.MouseLeave:Connect(function()
+            exitButton.BackgroundColor3 = Color3.fromRGB(38, 20, 26)
+            exitStroke.Transparency = 0.35
+        end)
+
+        -- Live header refresh ---------------------------------------------
+        local sessionStart, baseEggs
+
+        local function readLeaderstat(name)
+            if not localPlayer then return nil end
+            local stats = localPlayer:FindFirstChild("leaderstats")
+            local value = stats and stats:FindFirstChild(name)
+            return value and tonumber(value.Value) or nil
+        end
+
+        local function refreshHeader()
+            local elapsed = sessionStart and (os.clock() - sessionStart) or 0
+            statTime.Text = string.format("%02d:%02d", math.floor(elapsed / 60), math.floor(elapsed % 60))
+
+            local eggs = readLeaderstat("Eggs Hatched")
+            if eggs and baseEggs then
+                statEggs.Text = "+" .. tostring(math.max(eggs - baseEggs, 0))
+            else
+                statEggs.Text = "+0"
+            end
+
+            local rares = 0
+            for _, count in pairs(afkSessionCounts) do
+                rares += count
+            end
+            statRares.Text = "+" .. tostring(rares)
+        end
+
+        task.spawn(function()
+            while overlay.Parent do
+                if overlay.Visible then
+                    pcall(refreshHeader)
+                end
+                task.wait(0.5)
+            end
+        end)
+
+        return overlay, center, eggsLegacy, gemsLegacy, exitButton, function()
+            sessionStart = os.clock()
+            baseEggs = readLeaderstat("Eggs Hatched")
+            pcall(refreshHeader)
+        end
+    end)()
 
     -- MAIN HUB WINDOW
     local autoHatchMain = Instance.new("Frame")
@@ -1880,8 +2103,18 @@ task.spawn(function()
     autoHatchMain.Visible = true
     autoHatchMain.Parent = ui
 
+    -- Re-centre the main hub for the Roblox top inset. The AFK overlay is
+    -- in its own ScreenGui and does not need a position correction.
+    task.defer(function()
+        local inset = math.max(0, -ui.AbsolutePosition.Y)
+        if inset <= 0 then return end
+        if autoHatchMain.Position.Y.Offset == -360 then
+            autoHatchMain.Position = UDim2.new(0.5, -340, 0.5, -360 + inset)
+        end
+    end)
+
     local autoHatchCorner = Instance.new("UICorner")
-    autoHatchCorner.CornerRadius = UDim.new(0, 16)
+    autoHatchCorner.CornerRadius = UDim.new(0, 18)
     autoHatchCorner.Parent = autoHatchMain
 
     local autoHatchShadow = Instance.new("UIStroke")
@@ -1890,25 +2123,72 @@ task.spawn(function()
     autoHatchShadow.Transparency = 0.58
     autoHatchShadow.Parent = autoHatchMain
 
+    -- Soft accent halo + header wash. Both are children with ZIndex 0 so they
+    -- stay behind the content without needing another ScreenGui.
+    do
+        local halo = Instance.new("Frame")
+        halo.Name = "WindowHalo"
+        halo.Size = UDim2.new(1, 14, 1, 14)
+        halo.Position = UDim2.new(0, -7, 0, -7)
+        halo.BackgroundColor3 = Color3.fromRGB(60, 140, 220)
+        halo.BackgroundTransparency = 0.9
+        halo.BorderSizePixel = 0
+        halo.ZIndex = 0
+        halo.Parent = autoHatchMain
+
+        local haloCorner = Instance.new("UICorner")
+        haloCorner.CornerRadius = UDim.new(0, 22)
+        haloCorner.Parent = halo
+
+        local headerGlow = Instance.new("Frame")
+        headerGlow.Name = "HeaderGlow"
+        headerGlow.Size = UDim2.new(1, 0, 0, 118)
+        headerGlow.BackgroundColor3 = Color3.fromRGB(60, 140, 220)
+        headerGlow.BackgroundTransparency = 0.86
+        headerGlow.BorderSizePixel = 0
+        headerGlow.ZIndex = 0
+        headerGlow.Parent = autoHatchMain
+
+        local glowGradient = Instance.new("UIGradient")
+        glowGradient.Rotation = 90
+        glowGradient.Transparency = NumberSequence.new({
+            NumberSequenceKeypoint.new(0, 0),
+            NumberSequenceKeypoint.new(1, 1),
+        })
+        glowGradient.Parent = headerGlow
+    end
+
     local autoTitle = Instance.new("TextLabel")
-    autoTitle.Size = UDim2.new(1, -40, 0, 32)
-    autoTitle.Position = UDim2.new(0, 20, 0, 12)
+    autoTitle.Size = UDim2.new(1, -64, 0, 30)
+    autoTitle.Position = UDim2.new(0, 30, 0, 12)
     autoTitle.Text = "Pet Dimensions Hub"
     autoTitle.TextColor3 = Color3.fromRGB(60, 140, 220)
-    autoTitle.Font = Enum.Font.GothamBold
+    autoTitle.Font = Enum.Font.GothamBlack
     autoTitle.TextSize = 21
     autoTitle.BackgroundTransparency = 1
     autoTitle.TextXAlignment = Enum.TextXAlignment.Left
     autoTitle.Parent = autoHatchMain
 
     do
+        local accent = Instance.new("Frame")
+        accent.Name = "TitleAccent"
+        accent.Size = UDim2.new(0, 3, 0, 22)
+        accent.Position = UDim2.new(0, 18, 0, 16)
+        accent.BackgroundColor3 = Color3.fromRGB(60, 140, 220)
+        accent.BorderSizePixel = 0
+        accent.Parent = autoHatchMain
+
+        local accentCorner = Instance.new("UICorner")
+        accentCorner.CornerRadius = UDim.new(1, 0)
+        accentCorner.Parent = accent
+
         local autoSubtitle = Instance.new("TextLabel")
-        autoSubtitle.Size = UDim2.new(1, -40, 0, 16)
-        autoSubtitle.Position = UDim2.new(0, 20, 0, 44)
-        autoSubtitle.Text = "Hatch · Farm · Daycare automation"
+        autoSubtitle.Size = UDim2.new(1, -64, 0, 16)
+        autoSubtitle.Position = UDim2.new(0, 30, 0, 44)
+        autoSubtitle.Text = "HATCH  ·  FARM  ·  DAYCARE  ·  TELEPORT"
         autoSubtitle.TextColor3 = Color3.fromRGB(125, 135, 160)
         autoSubtitle.Font = Enum.Font.Gotham
-        autoSubtitle.TextSize = 12
+        autoSubtitle.TextSize = 11
         autoSubtitle.BackgroundTransparency = 1
         autoSubtitle.TextXAlignment = Enum.TextXAlignment.Left
         autoSubtitle.Parent = autoHatchMain
@@ -1920,11 +2200,19 @@ task.spawn(function()
         titleDivider.BackgroundColor3 = Color3.fromRGB(48, 56, 74)
         titleDivider.BorderSizePixel = 0
         titleDivider.Parent = autoHatchMain
+
+        local dividerGradient = Instance.new("UIGradient")
+        dividerGradient.Color = ColorSequence.new({
+            ColorSequenceKeypoint.new(0, Color3.fromRGB(60, 140, 220)),
+            ColorSequenceKeypoint.new(0.3, Color3.fromRGB(48, 56, 74)),
+            ColorSequenceKeypoint.new(1, Color3.fromRGB(48, 56, 74)),
+        })
+        dividerGradient.Parent = titleDivider
     end
 
     local tabBar = Instance.new("Frame")
     tabBar.Name = "TabContainer"
-    tabBar.Size = UDim2.new(1, -40, 0, 42)
+    tabBar.Size = UDim2.new(1, -40, 0, 44)
     tabBar.Position = UDim2.new(0, 20, 0, 74)
     tabBar.BackgroundTransparency = 1
     tabBar.Parent = autoHatchMain
@@ -1943,7 +2231,7 @@ task.spawn(function()
         btn.Parent = tabBar
 
         local corner = Instance.new("UICorner")
-        corner.CornerRadius = UDim.new(0, 9)
+        corner.CornerRadius = UDim.new(0, 11)
         corner.Parent = btn
 
         local stroke = Instance.new("UIStroke")
@@ -1954,11 +2242,11 @@ task.spawn(function()
 
         local underline = Instance.new("Frame")
         underline.Name = "ActiveUnderline"
-        underline.Size = UDim2.new(0.55, 0, 0, 2)
+        underline.Size = UDim2.new(0.42, 0, 0, 2)
         underline.AnchorPoint = Vector2.new(0.5, 1)
-        underline.Position = UDim2.new(0.5, 0, 1, -1)
+        underline.Position = UDim2.new(0.5, 0, 1, -3)
         underline.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
-        underline.BackgroundTransparency = 0.15
+        underline.BackgroundTransparency = 0.1
         underline.BorderSizePixel = 0
         underline.Visible = false
         underline.ZIndex = 2
@@ -2324,6 +2612,46 @@ task.spawn(function()
         end
     end
 
+    -- =====================================================================
+    -- GLOBAL CONTROL POLISH
+    -- One hover treatment for every button that does not already define its
+    -- own stroke. This keeps all seven tabs, toggles and generated lists
+    -- feeling like the same UI without touching each builder.
+    -- =====================================================================
+    local polishedStrokes = setmetatable({}, { __mode = "k" })
+
+    local function polishControl(obj)
+        if not obj:IsA("TextButton") then return end
+        if obj:GetAttribute("PolishDone") then return end
+        obj:SetAttribute("PolishDone", true)
+
+        if not obj:FindFirstChildOfClass("UICorner") then
+            local corner = Instance.new("UICorner")
+            corner.CornerRadius = UDim.new(0, 8)
+            corner.Parent = obj
+        end
+
+        if obj:FindFirstChildOfClass("UIStroke") then
+            return
+        end
+
+        local stroke = Instance.new("UIStroke")
+        stroke.Color = activeTheme.stroke
+        stroke.Thickness = 1
+        stroke.Transparency = 0.85
+        stroke.Parent = obj
+
+        obj.MouseEnter:Connect(function()
+            stroke.Transparency = 0.35
+        end)
+
+        obj.MouseLeave:Connect(function()
+            stroke.Transparency = 0.85
+        end)
+
+        polishedStrokes[obj] = stroke
+    end
+
     local function applyTheme(themeObj)
         activeTheme = themeObj
         CurrentThemeName = themeObj.name
@@ -2337,13 +2665,50 @@ task.spawn(function()
         -- entirely and sat oddly against every palette except the default.
         autoTitle.TextColor3 = activeTheme.accent
 
+        local halo = autoHatchMain:FindFirstChild("WindowHalo")
+        if halo then halo.BackgroundColor3 = activeTheme.accent end
+        local headerGlow = autoHatchMain:FindFirstChild("HeaderGlow")
+        if headerGlow then headerGlow.BackgroundColor3 = activeTheme.accent end
+        local titleAccent = autoHatchMain:FindFirstChild("TitleAccent")
+        if titleAccent then titleAccent.BackgroundColor3 = activeTheme.accent end
+        local titleDivider = autoHatchMain:FindFirstChild("TitleDivider")
+        if titleDivider then
+            local dividerGradient = titleDivider:FindFirstChildOfClass("UIGradient")
+            if dividerGradient then
+                dividerGradient.Color = ColorSequence.new({
+                    ColorSequenceKeypoint.new(0, activeTheme.accent),
+                    ColorSequenceKeypoint.new(0.3, activeTheme.stroke),
+                    ColorSequenceKeypoint.new(1, activeTheme.stroke),
+                })
+            end
+        end
+        trackerStroke.Color = activeTheme.accent
+        trackerStroke.Transparency = 0.55
+
+        for _, stroke in pairs(polishedStrokes) do
+            if stroke and stroke.Parent then
+                stroke.Color = activeTheme.stroke
+            end
+        end
+
         for _, btn in ipairs({hatchTab, tpTab, settingsTab, eggTab, farmTab, TAB_TOTAL.tab, TAB_TOTAL.indexUI.tab}) do
-            if btn == currentTabBtn then
+            local tabStroke = btn:FindFirstChildOfClass("UIStroke")
+            local isActive = (btn == currentTabBtn)
+            btn:SetAttribute("TabActive", isActive)
+            if isActive then
                 btn.BackgroundColor3 = activeTheme.accent
                 btn.TextColor3 = Color3.fromRGB(255, 255, 255)
+                if tabStroke then
+                    tabStroke.Color = activeTheme.accent
+                    tabStroke.Transparency = 0.15
+                end
             else
                 btn.BackgroundColor3 = activeTheme.surface
                 btn.TextColor3 = activeTheme.muted
+                if tabStroke then
+                    tabStroke.Color = activeTheme.stroke
+                    tabStroke.Transparency = 0.72
+                end
             end
         end
 
@@ -2368,9 +2733,19 @@ task.spawn(function()
         task.defer(function()
             if obj and obj.Parent then
                 applyThemeToObject(obj)
+                if obj:IsA("TextButton") then
+                    polishControl(obj)
+                end
             end
         end)
     end)
+
+    -- Sweep controls that existed before the connection above.
+    for _, obj in ipairs(ui:GetDescendants()) do
+        if obj:IsA("TextButton") then
+            polishControl(obj)
+        end
+    end
 
 
     local function switchTab(activeBtn, activeFrame)
@@ -2383,8 +2758,14 @@ task.spawn(function()
         TAB_TOTAL.indexUI.frame.Visible = false
 
         for _, btn in ipairs({hatchTab, tpTab, settingsTab, eggTab, farmTab, TAB_TOTAL.tab, TAB_TOTAL.indexUI.tab}) do
+            local tabStroke = btn:FindFirstChildOfClass("UIStroke")
+            btn:SetAttribute("TabActive", false)
             btn.BackgroundColor3 = activeTheme.surface
-            btn.TextColor3 = Color3.fromRGB(180, 180, 190)
+            btn.TextColor3 = activeTheme.muted
+            if tabStroke then
+                tabStroke.Color = activeTheme.stroke
+                tabStroke.Transparency = 0.72
+            end
             local tabUnderline = btn:FindFirstChild("ActiveUnderline")
             if tabUnderline then
                 tabUnderline.Visible = false
@@ -2392,14 +2773,36 @@ task.spawn(function()
         end
 
         activeFrame.Visible = true
+        activeBtn:SetAttribute("TabActive", true)
         activeBtn.BackgroundColor3 = activeTheme.accent
         activeBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+        local activeStroke = activeBtn:FindFirstChildOfClass("UIStroke")
+        if activeStroke then
+            activeStroke.Color = activeTheme.accent
+            activeStroke.Transparency = 0.15
+        end
         local activeUnderline = activeBtn:FindFirstChild("ActiveUnderline")
         if activeUnderline then
             activeUnderline.Visible = true
         end
         currentTabBtn = activeBtn
         currentTabFrame = activeFrame
+    end
+
+    -- Tab hover: lifts the fill toward the accent without touching the active
+    -- tab. Defined here because it needs activeTheme in scope.
+    for _, btn in ipairs({hatchTab, tpTab, settingsTab, eggTab, farmTab, TAB_TOTAL.tab, TAB_TOTAL.indexUI.tab}) do
+        local tabStroke = btn:FindFirstChildOfClass("UIStroke")
+        btn.MouseEnter:Connect(function()
+            if btn:GetAttribute("TabActive") then return end
+            btn.BackgroundColor3 = activeTheme.surface:Lerp(activeTheme.accent, 0.18)
+            if tabStroke then tabStroke.Transparency = 0.45 end
+        end)
+        btn.MouseLeave:Connect(function()
+            if btn:GetAttribute("TabActive") then return end
+            btn.BackgroundColor3 = activeTheme.surface
+            if tabStroke then tabStroke.Transparency = 0.72 end
+        end)
     end
 
     hatchTab.MouseButton1Click:Connect(function() switchTab(hatchTab, hatchFrame) end)
@@ -3271,33 +3674,62 @@ task.spawn(function()
     statsContainer.Name = "StatsContainer"
     statsContainer.Size = UDim2.new(1, 0, 0, 232)
     statsContainer.Position = UDim2.new(0, 0, 0, 0)
-    statsContainer.BackgroundColor3 = Color3.fromRGB(28, 29, 38)
+    statsContainer.BackgroundColor3 = Color3.fromRGB(22, 24, 33)
     statsContainer.Parent = hatchFrame
 
     local statsCorner = Instance.new("UICorner")
-    statsCorner.CornerRadius = UDim.new(0, 6)
+    statsCorner.CornerRadius = UDim.new(0, 14)
     statsCorner.Parent = statsContainer
 
+    local statsStroke = Instance.new("UIStroke")
+    statsStroke.Color = activeTheme.stroke
+    statsStroke.Transparency = 0.55
+    statsStroke.Parent = statsContainer
+
+    local statsTitle = Instance.new("TextLabel")
+    statsTitle.Size = UDim2.new(1, -140, 0, 16)
+    statsTitle.Position = UDim2.new(0, 14, 0, 10)
+    statsTitle.BackgroundTransparency = 1
+    statsTitle.Text = "SESSION STATS"
+    statsTitle.TextColor3 = Color3.fromRGB(150, 160, 182)
+    statsTitle.Font = Enum.Font.GothamBold
+    statsTitle.TextSize = 10
+    statsTitle.TextXAlignment = Enum.TextXAlignment.Left
+    statsTitle.Parent = statsContainer
+
+    local statsHint = Instance.new("TextLabel")
+    statsHint.Size = UDim2.new(0, 128, 0, 16)
+    statsHint.Position = UDim2.new(1, -142, 0, 10)
+    statsHint.BackgroundTransparency = 1
+    statsHint.Text = "live from save data"
+    statsHint.TextColor3 = Color3.fromRGB(110, 120, 140)
+    statsHint.Font = Enum.Font.Gotham
+    statsHint.TextSize = 10
+    statsHint.TextXAlignment = Enum.TextXAlignment.Right
+    statsHint.Parent = statsContainer
+
     local EggsLabel = Instance.new("TextLabel")
-    EggsLabel.Size = UDim2.new(1, -20, 0, 20)
-    EggsLabel.Position = UDim2.new(0, 10, 0, 6)
+    EggsLabel.Size = UDim2.new(0.5, -12, 0, 46)
+    EggsLabel.Position = UDim2.new(0, 8, 0, 32)
     EggsLabel.Text = "Eggs: 0"
     EggsLabel.TextColor3 = Color3.fromRGB(80, 230, 80)
+    EggsLabel.BackgroundColor3 = Color3.fromRGB(29, 32, 44)
     EggsLabel.Font = Enum.Font.GothamBold
-    EggsLabel.TextSize = 13
-    EggsLabel.BackgroundTransparency = 1
+    EggsLabel.TextSize = 15
     EggsLabel.TextXAlignment = Enum.TextXAlignment.Left
+    EggsLabel.TextYAlignment = Enum.TextYAlignment.Center
     EggsLabel.Parent = statsContainer
 
     local GemsLabel = Instance.new("TextLabel")
-    GemsLabel.Size = UDim2.new(1, -20, 0, 20)
-    GemsLabel.Position = UDim2.new(0, 10, 0, 28)
+    GemsLabel.Size = UDim2.new(0.5, -12, 0, 46)
+    GemsLabel.Position = UDim2.new(0.5, 4, 0, 32)
     GemsLabel.Text = "Diamonds: 0"
     GemsLabel.TextColor3 = Color3.fromRGB(110, 185, 255)
+    GemsLabel.BackgroundColor3 = Color3.fromRGB(29, 32, 44)
     GemsLabel.Font = Enum.Font.GothamBold
-    GemsLabel.TextSize = 13
-    GemsLabel.BackgroundTransparency = 1
+    GemsLabel.TextSize = 15
     GemsLabel.TextXAlignment = Enum.TextXAlignment.Left
+    GemsLabel.TextYAlignment = Enum.TextYAlignment.Center
     GemsLabel.Parent = statsContainer
 
     -- These Hatch-tab counters keep their fixed colors in every theme.
@@ -3308,24 +3740,117 @@ task.spawn(function()
     EggsLabel:SetAttribute("ThemeLocked", true)
     GemsLabel:SetAttribute("ThemeLocked", true)
 
-    local function makeHatchRareLabel(name, position)
-        local label = Instance.new("TextLabel")
-        label.Size = UDim2.new(1, -20, 0, 20)
-        label.Position = UDim2.new(0, 10, 0, position)
-        label.Text = name .. ": 0"
-        label.TextColor3 = Color3.fromRGB(255, 210, 80)
-        label.Font = Enum.Font.GothamBold
-        label.TextSize = 13
-        label.BackgroundTransparency = 1
-        label.TextXAlignment = Enum.TextXAlignment.Left
-        label.Parent = statsContainer
-        hatchRareLabels[name] = label
+    do
+        local function cardify(label)
+            local corner = Instance.new("UICorner")
+            corner.CornerRadius = UDim.new(0, 10)
+            corner.Parent = label
+
+            local padding = Instance.new("UIPadding")
+            padding.PaddingLeft = UDim.new(0, 12)
+            padding.PaddingRight = UDim.new(0, 8)
+            padding.Parent = label
+
+            local stroke = Instance.new("UIStroke")
+            stroke.Color = Color3.fromRGB(52, 58, 76)
+            stroke.Transparency = 0.55
+            stroke.Parent = label
+        end
+
+        cardify(EggsLabel)
+        cardify(GemsLabel)
     end
 
-    makeHatchRareLabel("Huges", 50)
-    makeHatchRareLabel("Secrets", 72)
-    makeHatchRareLabel("Titanics", 94)
-    makeHatchRareLabel("Gargantuans", 116)
+    local function makeHatchRareLabel(name, position)
+        local label = Instance.new("TextLabel")
+        label.Size = UDim2.new(0.25, -8, 0, 30)
+        label.Position = UDim2.new(position, 4, 0, 88)
+        label.Text = name .. ": 0"
+        label.TextColor3 = Color3.fromRGB(255, 210, 80)
+        label.BackgroundColor3 = Color3.fromRGB(27, 30, 41)
+        label.Font = Enum.Font.GothamBold
+        label.TextSize = 12
+        label.TextXAlignment = Enum.TextXAlignment.Left
+        label.TextYAlignment = Enum.TextYAlignment.Center
+        label.Parent = statsContainer
+        hatchRareLabels[name] = label
+
+        local corner = Instance.new("UICorner")
+        corner.CornerRadius = UDim.new(0, 8)
+        corner.Parent = label
+
+        local padding = Instance.new("UIPadding")
+        padding.PaddingLeft = UDim.new(0, 10)
+        padding.Parent = label
+    end
+
+    makeHatchRareLabel("Huges", 0)
+    makeHatchRareLabel("Secrets", 0.25)
+    makeHatchRareLabel("Titanics", 0.5)
+    makeHatchRareLabel("Gargantuans", 0.75)
+
+    do
+        local divider = Instance.new("Frame")
+        divider.Size = UDim2.new(1, -28, 0, 1)
+        divider.Position = UDim2.new(0, 14, 0, 126)
+        divider.BackgroundColor3 = activeTheme.stroke
+        divider.BackgroundTransparency = 0.5
+        divider.BorderSizePixel = 0
+        divider.Parent = statsContainer
+    end
+
+    -- Variant tallies fill the lower half of the stats card and give the
+    -- session an at-a-glance read on how many rares came out Rainbow /
+    -- Golden / Shiny. Counted in renderHatchRecent so they stay in sync
+    -- with the recent list instead of drifting from it.
+    do
+        local variantsTitle = Instance.new("TextLabel")
+        variantsTitle.Size = UDim2.new(1, -28, 0, 12)
+        variantsTitle.Position = UDim2.new(0, 14, 0, 140)
+        variantsTitle.BackgroundTransparency = 1
+        variantsTitle.Text = "VARIANTS HATCHED"
+        variantsTitle.TextColor3 = Color3.fromRGB(150, 160, 182)
+        variantsTitle.Font = Enum.Font.GothamBold
+        variantsTitle.TextSize = 10
+        variantsTitle.TextXAlignment = Enum.TextXAlignment.Left
+        variantsTitle.Parent = statsContainer
+
+        local variantDefs = {
+            { key = "Rainbow", label = "RAINBOW", color = Color3.fromRGB(255, 120, 220) },
+            { key = "Golden", label = "GOLDEN", color = Color3.fromRGB(255, 200, 70) },
+            { key = "Shiny", label = "SHINY", color = Color3.fromRGB(120, 220, 255) },
+        }
+
+        for index, def in ipairs(variantDefs) do
+            local chip = Instance.new("TextLabel")
+            chip.Name = def.key .. "Chip"
+            chip.Size = UDim2.new(1 / 3, -12, 0, 40)
+            chip.Position = UDim2.new((index - 1) / 3, 8, 0, 158)
+            chip.BackgroundColor3 = Color3.fromRGB(27, 30, 41)
+            chip.Text = def.label .. "  0"
+            chip.TextColor3 = def.color
+            chip.Font = Enum.Font.GothamBold
+            chip.TextSize = 11
+            chip.TextXAlignment = Enum.TextXAlignment.Left
+            chip.TextYAlignment = Enum.TextYAlignment.Center
+            chip.Parent = statsContainer
+
+            local chipCorner = Instance.new("UICorner")
+            chipCorner.CornerRadius = UDim.new(0, 9)
+            chipCorner.Parent = chip
+
+            local chipPadding = Instance.new("UIPadding")
+            chipPadding.PaddingLeft = UDim.new(0, 12)
+            chipPadding.Parent = chip
+
+            local chipStroke = Instance.new("UIStroke")
+            chipStroke.Color = def.color
+            chipStroke.Transparency = 0.82
+            chipStroke.Parent = chip
+
+            hatchVariantLabels[def.key] = { label = chip, prefix = def.label }
+        end
+    end
 
     local SearchBox = Instance.new("TextBox")
     SearchBox.Size = UDim2.new(1, 0, 0, 32)
@@ -3487,13 +4012,13 @@ task.spawn(function()
 
         for key, label in pairs(sessionLabels) do
             if label then
-                label.Text = "+" .. tostring(afkSessionCounts[key] or 0) .. " (this AFK session)"
+                label.Text = "+" .. tostring(afkSessionCounts[key] or 0) .. " this session"
             end
         end
         for key, label in pairs(sessionVariantLabels) do
             if label then
                 local variants = afkSessionVariants[key] or {}
-                label.Text = ("R:%d  G:%d  S:%d"):format(
+                label.Text = ("R %d   G %d   S %d"):format(
                     tonumber(variants.R) or 0,
                     tonumber(variants.G) or 0,
                     tonumber(variants.S) or 0
@@ -3502,7 +4027,7 @@ task.spawn(function()
         end
         for key, label in pairs(startupLabelSet) do
             if label then
-                label.Text = "+" .. tostring(startupCounts[key] or 0) .. " (since startup)"
+                label.Text = "+" .. tostring(startupCounts[key] or 0) .. " since launch"
             end
         end
     end
@@ -3528,6 +4053,7 @@ task.spawn(function()
             if enabled then
                 afkOverlay.Visible = true
                 autoHatchMain.Visible = false
+                afkStartSession()
             else
                 afkOverlay.Visible = false
                 autoHatchMain.Visible = true
@@ -3557,52 +4083,96 @@ task.spawn(function()
     recentPanel.Parent = hatchFrame
 
     local recentPanelCorner = Instance.new("UICorner")
-    recentPanelCorner.CornerRadius = UDim.new(0, 8)
+    recentPanelCorner.CornerRadius = UDim.new(0, 12)
     recentPanelCorner.Parent = recentPanel
 
     local recentPanelStroke = Instance.new("UIStroke")
     recentPanelStroke.Color = activeTheme.stroke
-    recentPanelStroke.Transparency = 0.45
+    recentPanelStroke.Transparency = 0.4
     recentPanelStroke.Parent = recentPanel
 
+    local recentDot = Instance.new("Frame")
+    recentDot.Size = UDim2.new(0, 6, 0, 6)
+    recentDot.Position = UDim2.new(0, 12, 0, 12)
+    recentDot.BackgroundColor3 = Color3.fromRGB(167, 139, 250)
+    recentDot.BorderSizePixel = 0
+    recentDot.Parent = recentPanel
+
+    local recentDotCorner = Instance.new("UICorner")
+    recentDotCorner.CornerRadius = UDim.new(1, 0)
+    recentDotCorner.Parent = recentDot
+
     local recentTitle = Instance.new("TextLabel")
-    recentTitle.Size = UDim2.new(1, -16, 0, 24)
-    recentTitle.Position = UDim2.new(0, 8, 0, 6)
+    recentTitle.Size = UDim2.new(1, -110, 0, 22)
+    recentTitle.Position = UDim2.new(0, 24, 0, 4)
     recentTitle.BackgroundTransparency = 1
     recentTitle.Text = "RECENT RARE HATCHES"
     recentTitle.TextColor3 = Color3.fromRGB(255, 255, 255)
     recentTitle.Font = Enum.Font.GothamBold
-    recentTitle.TextSize = 13
+    recentTitle.TextSize = 12
     recentTitle.TextXAlignment = Enum.TextXAlignment.Left
     recentTitle.Parent = recentPanel
 
+    local recentHint = Instance.new("TextLabel")
+    recentHint.Size = UDim2.new(0, 80, 0, 22)
+    recentHint.Position = UDim2.new(1, -88, 0, 4)
+    recentHint.BackgroundTransparency = 1
+    recentHint.Text = "live"
+    recentHint.TextColor3 = Color3.fromRGB(132, 142, 165)
+    recentHint.Font = Enum.Font.Gotham
+    recentHint.TextSize = 11
+    recentHint.TextXAlignment = Enum.TextXAlignment.Right
+    recentHint.Parent = recentPanel
+
     for index, category in ipairs(recentCategories) do
         local column = Instance.new("Frame")
-        column.Size = UDim2.new(0.25, -6, 1, -34)
-        column.Position = UDim2.new((index - 1) * 0.25, 3, 0, 32)
-        column.BackgroundTransparency = 1
+        column.Size = UDim2.new(0.25, -8, 1, -42)
+        column.Position = UDim2.new((index - 1) * 0.25, 4, 0, 36)
+        column.BackgroundColor3 = activeTheme.surface
+        column.BackgroundTransparency = 0.45
+        column.BorderSizePixel = 0
         column.Parent = recentPanel
 
+        local columnCorner = Instance.new("UICorner")
+        columnCorner.CornerRadius = UDim.new(0, 9)
+        columnCorner.Parent = column
+
+        local columnDot = Instance.new("Frame")
+        columnDot.Size = UDim2.new(0, 5, 0, 5)
+        columnDot.Position = UDim2.new(0, 8, 0, 8)
+        columnDot.BackgroundColor3 = category.color
+        columnDot.BorderSizePixel = 0
+        columnDot.Parent = column
+
+        local columnDotCorner = Instance.new("UICorner")
+        columnDotCorner.CornerRadius = UDim.new(1, 0)
+        columnDotCorner.Parent = columnDot
+
         local header = Instance.new("TextLabel")
-        header.Size = UDim2.new(1, -6, 0, 20)
-        header.Position = UDim2.new(0, 3, 0, 0)
+        header.Size = UDim2.new(1, -20, 0, 18)
+        header.Position = UDim2.new(0, 17, 0, 1)
         header.BackgroundTransparency = 1
-        header.Text = category.name
+        header.Text = category.name:upper()
         header.TextColor3 = category.color
         header.Font = Enum.Font.GothamBold
-        header.TextSize = 12
+        header.TextSize = 10
         header.TextXAlignment = Enum.TextXAlignment.Left
         header.Parent = column
 
         local list = Instance.new("ScrollingFrame")
-        list.Size = UDim2.new(1, -4, 1, -22)
-        list.Position = UDim2.new(0, 2, 0, 22)
+        list.Size = UDim2.new(1, -8, 1, -24)
+        list.Position = UDim2.new(0, 4, 0, 20)
         list.BackgroundTransparency = 1
         list.BorderSizePixel = 0
         list.ScrollBarThickness = 2
         list.CanvasSize = UDim2.new(0, 0, 0, 0)
         list.AutomaticCanvasSize = Enum.AutomaticSize.Y
         list.Parent = column
+
+        local listPadding = Instance.new("UIPadding")
+        listPadding.PaddingLeft = UDim.new(0, 4)
+        listPadding.PaddingRight = UDim.new(0, 2)
+        listPadding.Parent = list
 
         local listLayout = Instance.new("UIListLayout")
         listLayout.SortOrder = Enum.SortOrder.LayoutOrder
@@ -3612,17 +4182,8 @@ task.spawn(function()
         hatchRecentLists[category.name] = { frame = list, entries = category.entries, color = category.color }
     end
 
-    for index = 1, 3 do
-        local divider = Instance.new("Frame")
-        divider.Size = UDim2.new(0, 1, 1, -42)
-        divider.Position = UDim2.new(index * 0.25, 0, 0, 34)
-        divider.BackgroundColor3 = activeTheme.stroke
-        divider.BackgroundTransparency = 0.35
-        divider.BorderSizePixel = 0
-        divider.Parent = recentPanel
-    end
-
     renderHatchRecent = function()
+        local variantTotals = { Rainbow = 0, Golden = 0, Shiny = 0 }
         for _, category in ipairs(recentCategories) do
             local listData = hatchRecentLists[category.name]
             if listData then
@@ -3631,12 +4192,21 @@ task.spawn(function()
                 end
                 for entryIndex, entryData in ipairs(listData.entries) do
                     local label = Instance.new("TextLabel")
-                    label.Size = UDim2.new(1, -2, 0, 20)
+                    label.Size = UDim2.new(1, 0, 0, 18)
                     label.BackgroundTransparency = 1
                     local variants = {}
-                    if entryData.rainbow then table.insert(variants, "Rainbow") end
-                    if entryData.golden then table.insert(variants, "Golden") end
-                    if entryData.shiny then table.insert(variants, "Shiny") end
+                    if entryData.rainbow then
+                        table.insert(variants, "Rainbow")
+                        variantTotals.Rainbow += 1
+                    end
+                    if entryData.golden then
+                        table.insert(variants, "Golden")
+                        variantTotals.Golden += 1
+                    end
+                    if entryData.shiny then
+                        table.insert(variants, "Shiny")
+                        variantTotals.Shiny += 1
+                    end
                     local variantPrefix = #variants > 0 and ("[" .. table.concat(variants, " + ") .. "] ") or ""
                     label.Text = "- " .. variantPrefix .. tostring(entryData.name)
                     label.TextColor3 = listData.color
@@ -3648,13 +4218,18 @@ task.spawn(function()
                         label.TextColor3 = Color3.fromRGB(120, 220, 255)
                     end
                     label.Font = Enum.Font.GothamMedium
-                    label.TextSize = 12
-                    label.TextWrapped = true
-                    label.AutomaticSize = Enum.AutomaticSize.Y
+                    label.TextSize = 11
+                    label.TextTruncate = Enum.TextTruncate.AtEnd
                     label.TextXAlignment = Enum.TextXAlignment.Left
                     label.LayoutOrder = entryIndex
                     label.Parent = listData.frame
                 end
+            end
+        end
+
+        for key, data in pairs(hatchVariantLabels) do
+            if data.label and data.label.Parent then
+                data.label.Text = data.prefix .. "  " .. tostring(variantTotals[key] or 0)
             end
         end
     end
@@ -4830,145 +5405,269 @@ task.spawn(function()
         end
     end)
 
-    -- AFK RARE PETS PANEL
+    -- =====================================================================
+    -- AFK RARE PANEL
+    -- Tier cards with live totals, session deltas, variant chips and the
+    -- recent hatches for the current session. This panel used to be built
+    -- with Visible = false and never re-shown, which is why the AFK screen
+    -- stopped reporting rare hatches entirely.
+    -- =====================================================================
     do
-    local afkRarePanel = Instance.new("Frame")
-    afkRarePanel.Name = "AfkRarePanel"
-    afkRarePanel.Size = UDim2.new(1, 0, 0, 440)
-    afkRarePanel.Position = UDim2.new(0, 0, 0, 220)
-    afkRarePanel.BackgroundColor3 = activeTheme.panel
-    afkRarePanel.BorderSizePixel = 0
-    afkRarePanel.Visible = false
-    afkRarePanel.Parent = afkCenter
+        local panel = Instance.new("Frame")
+        panel.Name = "AfkRarePanel"
+        panel.Size = UDim2.new(1, 0, 0.58, 0)
+        panel.Position = UDim2.new(0, 0, 0.29, 0)
+        panel.BackgroundColor3 = Style.surfaceAlt
+        panel.BackgroundTransparency = 0.12
+        panel.BorderSizePixel = 0
+        panel.Visible = true
+        panel.ZIndex = 103
+        panel.Parent = afkCenter
 
-    local afkRareCorner = Instance.new("UICorner")
-    afkRareCorner.CornerRadius = UDim.new(0, 12)
-    afkRareCorner.Parent = afkRarePanel
+        local panelCorner = Instance.new("UICorner")
+        panelCorner.CornerRadius = UDim.new(0, 16)
+        panelCorner.Parent = panel
 
-    local afkRareStroke = Instance.new("UIStroke")
-    afkRareStroke.Color = activeTheme.stroke
-    afkRareStroke.Transparency = 0.35
-    afkRareStroke.Parent = afkRarePanel
+        local panelStroke = Instance.new("UIStroke")
+        panelStroke.Color = Style.line
+        panelStroke.Transparency = 0.25
+        panelStroke.Parent = panel
 
-    local afkRareTitle = Instance.new("TextLabel")
-    afkRareTitle.Size = UDim2.new(1, -20, 0, 45)
-    afkRareTitle.Position = UDim2.new(0, 12, 0, 8)
-    afkRareTitle.BackgroundTransparency = 1
-    afkRareTitle.Text = "RARE PETS"
-    afkRareTitle.TextColor3 = Color3.fromRGB(255, 255, 255)
-    afkRareTitle.Font = Enum.Font.GothamBold
-    afkRareTitle.TextSize = 28
-    afkRareTitle.TextXAlignment = Enum.TextXAlignment.Left
-    afkRareTitle.Parent = afkRarePanel
+        local header = Instance.new("Frame")
+        header.Name = "Header"
+        header.Size = UDim2.new(1, 0, 0, 40)
+        header.BackgroundTransparency = 1
+        header.ZIndex = 104
+        header.Parent = panel
 
-    for index, category in ipairs(recentCategories) do
-        local column = Instance.new("Frame")
-        column.Size = UDim2.new(0.25, -8, 1, -60)
-        column.Position = UDim2.new((index - 1) * 0.25, 4, 0, 55)
-        column.BackgroundTransparency = 1
-        column.Parent = afkRarePanel
+        local headerDot = Instance.new("Frame")
+        headerDot.Size = UDim2.new(0, 7, 0, 7)
+        headerDot.Position = UDim2.new(0, 16, 0.5, -3)
+        headerDot.BackgroundColor3 = Style.violet
+        headerDot.BorderSizePixel = 0
+        headerDot.ZIndex = 105
+        headerDot.Parent = header
 
-        local countLabel = Instance.new("TextLabel")
-        countLabel.Size = UDim2.new(1, -6, 0, 34)
-        countLabel.Position = UDim2.new(0, 3, 0, 0)
-        countLabel.BackgroundTransparency = 1
-        countLabel.Text = category.name .. ": 0"
-        countLabel.TextColor3 = category.color
-        countLabel.Font = Enum.Font.GothamBold
-        countLabel.TextSize = 24
-        countLabel.TextXAlignment = Enum.TextXAlignment.Left
-        countLabel.Parent = column
-        afkRareLabels[category.name .. "s"] = countLabel
+        local headerDotCorner = Instance.new("UICorner")
+        headerDotCorner.CornerRadius = UDim.new(1, 0)
+        headerDotCorner.Parent = headerDot
 
-        local sessionLabel = Instance.new("TextLabel")
-        sessionLabel.Size = UDim2.new(1, -6, 0, 28)
-        sessionLabel.Position = UDim2.new(0, 3, 0, 32)
-        sessionLabel.BackgroundTransparency = 1
-        sessionLabel.Text = "+0 (this AFK session)"
-        sessionLabel.TextColor3 = category.color
-        sessionLabel.Font = Enum.Font.GothamBold
-        sessionLabel.TextSize = 20
-        sessionLabel.TextXAlignment = Enum.TextXAlignment.Left
-        sessionLabel.Parent = column
-        afkSessionLabels[category.name .. "s"] = sessionLabel
+        local headerTitle = Instance.new("TextLabel")
+        headerTitle.Size = UDim2.new(1, -220, 1, 0)
+        headerTitle.Position = UDim2.new(0, 30, 0, 0)
+        headerTitle.BackgroundTransparency = 1
+        headerTitle.Text = "RECENT RARE HATCHES"
+        headerTitle.TextColor3 = Style.text
+        headerTitle.Font = Enum.Font.GothamBold
+        headerTitle.TextSize = 13
+        headerTitle.TextXAlignment = Enum.TextXAlignment.Left
+        headerTitle.ZIndex = 105
+        headerTitle.Parent = header
 
-        local variantLabel = Instance.new("TextLabel")
-        variantLabel.Size = UDim2.new(1, -6, 0, 24)
-        variantLabel.Position = UDim2.new(0, 3, 0, 58)
-        variantLabel.BackgroundTransparency = 1
-        variantLabel.Text = "R:0  G:0  S:0"
-        variantLabel.TextColor3 = category.color
-        variantLabel.Font = Enum.Font.GothamSemibold
-        variantLabel.TextSize = 16
-        variantLabel.TextXAlignment = Enum.TextXAlignment.Left
-        variantLabel.Parent = column
-        afkSessionVariantLabels[category.name .. "s"] = variantLabel
+        local headerHint = Instance.new("TextLabel")
+        headerHint.Size = UDim2.new(0, 160, 1, 0)
+        headerHint.Position = UDim2.new(1, -176, 0, 0)
+        headerHint.BackgroundTransparency = 1
+        headerHint.Text = "this AFK session"
+        headerHint.TextColor3 = Style.muted
+        headerHint.Font = Enum.Font.Gotham
+        headerHint.TextSize = 11
+        headerHint.TextXAlignment = Enum.TextXAlignment.Right
+        headerHint.ZIndex = 105
+        headerHint.Parent = header
 
-        local startupLabel = Instance.new("TextLabel")
-        startupLabel.Size = UDim2.new(1, -6, 0, 28)
-        startupLabel.Position = UDim2.new(0, 3, 0, 84)
-        startupLabel.BackgroundTransparency = 1
-        startupLabel.Text = "+0 (since startup)"
-        startupLabel.TextColor3 = category.color
-        startupLabel.Font = Enum.Font.GothamBold
-        startupLabel.TextSize = 20
-        startupLabel.TextXAlignment = Enum.TextXAlignment.Left
-        startupLabel.Parent = column
-        startupLabels[category.name .. "s"] = startupLabel
+        local headerLine = Instance.new("Frame")
+        headerLine.Size = UDim2.new(1, -32, 0, 1)
+        headerLine.Position = UDim2.new(0, 16, 0, 40)
+        headerLine.BackgroundColor3 = Style.line
+        headerLine.BackgroundTransparency = 0.55
+        headerLine.BorderSizePixel = 0
+        headerLine.ZIndex = 104
+        headerLine.Parent = panel
 
-        local list = Instance.new("Frame")
-        list.Size = UDim2.new(1, -6, 1, -118)
-        list.Position = UDim2.new(0, 3, 0, 114)
-        list.BackgroundTransparency = 1
-        list.Parent = column
-        afkRecentLists[category.name] = { frame = list, entries = category.entries, color = category.color }
-    end
+        for index, category in ipairs(recentCategories) do
+            local card = Instance.new("Frame")
+            card.Name = category.name .. "Card"
+            card.Size = UDim2.new(0.25, -8, 1, -50)
+            card.Position = UDim2.new((index - 1) * 0.25, 4, 0, 45)
+            card.BackgroundColor3 = Style.surface
+            card.BackgroundTransparency = 0.12
+            card.BorderSizePixel = 0
+            card.ZIndex = 104
+            card.Parent = panel
 
-    for index = 1, 3 do
-        local divider = Instance.new("Frame")
-        divider.Size = UDim2.new(0, 1, 1, -130)
-        divider.Position = UDim2.new(index * 0.25, 0, 0, 114)
-        divider.BackgroundColor3 = activeTheme.stroke
-        divider.BackgroundTransparency = 0.35
-        divider.BorderSizePixel = 0
-        divider.Parent = afkRarePanel
-    end
+            local cardCorner = Instance.new("UICorner")
+            cardCorner.CornerRadius = UDim.new(0, 12)
+            cardCorner.Parent = card
 
-    renderAfkRecent = function()
-        for _, category in ipairs(recentCategories) do
-            local listData = afkRecentLists[category.name]
-            if listData then
-                for _, child in ipairs(listData.frame:GetChildren()) do
-                    if child:IsA("TextLabel") then child:Destroy() end
-                end
-                for entryIndex, entryData in ipairs(listData.entries) do
-                    local label = Instance.new("TextLabel")
-                    label.Size = UDim2.new(1, 0, 0, 32)
-                    label.Position = UDim2.new(0, 0, 0, (entryIndex - 1) * 34)
-                    label.BackgroundTransparency = 1
-                    local variants = {}
-                    if entryData.rainbow then table.insert(variants, "R") end
-                    if entryData.golden then table.insert(variants, "G") end
-                    if entryData.shiny then table.insert(variants, "S") end
-                    local variantPrefix = #variants > 0 and ("[" .. table.concat(variants, "+") .. "] ") or ""
-                    label.Text = "- " .. variantPrefix .. tostring(entryData.name)
-                    label.TextColor3 = listData.color
-                    if entryData.rainbow then
-                        label.TextColor3 = Color3.fromRGB(255, 120, 220)
-                    elseif entryData.golden then
-                        label.TextColor3 = Color3.fromRGB(255, 200, 70)
-                    elseif entryData.shiny then
-                        label.TextColor3 = Color3.fromRGB(120, 220, 255)
+            local cardStroke = Instance.new("UIStroke")
+            cardStroke.Color = category.color
+            cardStroke.Transparency = 0.72
+            cardStroke.Parent = card
+
+            local accent = Instance.new("Frame")
+            accent.Size = UDim2.new(1, -24, 0, 3)
+            accent.Position = UDim2.new(0, 12, 0, 8)
+            accent.BackgroundColor3 = category.color
+            accent.BackgroundTransparency = 0.15
+            accent.BorderSizePixel = 0
+            accent.ZIndex = 105
+            accent.Parent = card
+
+            local accentCorner = Instance.new("UICorner")
+            accentCorner.CornerRadius = UDim.new(1, 0)
+            accentCorner.Parent = accent
+
+            local nameLabel = Instance.new("TextLabel")
+            nameLabel.Size = UDim2.new(1, -24, 0, 14)
+            nameLabel.Position = UDim2.new(0, 12, 0, 16)
+            nameLabel.BackgroundTransparency = 1
+            nameLabel.Text = category.name:upper()
+            nameLabel.TextColor3 = category.color
+            nameLabel.Font = Enum.Font.GothamBold
+            nameLabel.TextSize = 11
+            nameLabel.TextXAlignment = Enum.TextXAlignment.Left
+            nameLabel.ZIndex = 105
+            nameLabel.Parent = card
+
+            local countLabel = Instance.new("TextLabel")
+            countLabel.Size = UDim2.new(1, -24, 0, 38)
+            countLabel.Position = UDim2.new(0, 12, 0, 32)
+            countLabel.BackgroundTransparency = 1
+            countLabel.Text = "0"
+            countLabel.TextColor3 = Style.text
+            countLabel.Font = Enum.Font.GothamBlack
+            countLabel.TextSize = 30
+            countLabel.TextXAlignment = Enum.TextXAlignment.Left
+            countLabel.ZIndex = 105
+            countLabel.Parent = card
+            afkRareLabels[category.name .. "s"] = countLabel
+
+            local sessionLabel = Instance.new("TextLabel")
+            sessionLabel.Size = UDim2.new(1, -24, 0, 15)
+            sessionLabel.Position = UDim2.new(0, 12, 0, 72)
+            sessionLabel.BackgroundTransparency = 1
+            sessionLabel.Text = "+0 this session"
+            sessionLabel.TextColor3 = category.color
+            sessionLabel.Font = Enum.Font.GothamBold
+            sessionLabel.TextSize = 11
+            sessionLabel.TextXAlignment = Enum.TextXAlignment.Left
+            sessionLabel.ZIndex = 105
+            sessionLabel.Parent = card
+            afkSessionLabels[category.name .. "s"] = sessionLabel
+
+            local variantLabel = Instance.new("TextLabel")
+            variantLabel.Size = UDim2.new(1, -24, 0, 14)
+            variantLabel.Position = UDim2.new(0, 12, 0, 90)
+            variantLabel.BackgroundTransparency = 1
+            variantLabel.Text = "R 0   G 0   S 0"
+            variantLabel.TextColor3 = Style.muted
+            variantLabel.Font = Enum.Font.GothamSemibold
+            variantLabel.TextSize = 10
+            variantLabel.TextXAlignment = Enum.TextXAlignment.Left
+            variantLabel.ZIndex = 105
+            variantLabel.Parent = card
+            afkSessionVariantLabels[category.name .. "s"] = variantLabel
+
+            local startupLabel = Instance.new("TextLabel")
+            startupLabel.Size = UDim2.new(1, -24, 0, 14)
+            startupLabel.Position = UDim2.new(0, 12, 0, 106)
+            startupLabel.BackgroundTransparency = 1
+            startupLabel.Text = "+0 since launch"
+            startupLabel.TextColor3 = Style.muted
+            startupLabel.Font = Enum.Font.Gotham
+            startupLabel.TextSize = 10
+            startupLabel.TextXAlignment = Enum.TextXAlignment.Left
+            startupLabel.ZIndex = 105
+            startupLabel.Parent = card
+            startupLabels[category.name .. "s"] = startupLabel
+
+            local divider = Instance.new("Frame")
+            divider.Size = UDim2.new(1, -24, 0, 1)
+            divider.Position = UDim2.new(0, 12, 0, 126)
+            divider.BackgroundColor3 = Style.line
+            divider.BackgroundTransparency = 0.45
+            divider.BorderSizePixel = 0
+            divider.ZIndex = 105
+            divider.Parent = card
+
+            local list = Instance.new("ScrollingFrame")
+            list.Name = category.name .. "Recent"
+            list.Size = UDim2.new(1, -12, 1, -138)
+            list.Position = UDim2.new(0, 6, 0, 134)
+            list.BackgroundTransparency = 1
+            list.BorderSizePixel = 0
+            list.ScrollBarThickness = 3
+            list.CanvasSize = UDim2.new(0, 0, 0, 0)
+            list.AutomaticCanvasSize = Enum.AutomaticSize.Y
+            list.ZIndex = 105
+            list.Parent = card
+
+            local listPadding = Instance.new("UIPadding")
+            listPadding.PaddingLeft = UDim.new(0, 6)
+            listPadding.PaddingRight = UDim.new(0, 4)
+            listPadding.Parent = list
+
+            local listLayout = Instance.new("UIListLayout")
+            listLayout.SortOrder = Enum.SortOrder.LayoutOrder
+            listLayout.Padding = UDim.new(0, 3)
+            listLayout.Parent = list
+
+            afkRecentLists[category.name] = { frame = list, entries = category.entries, color = category.color }
+        end
+
+        renderAfkRecent = function()
+            for _, category in ipairs(recentCategories) do
+                local listData = afkRecentLists[category.name]
+                if listData then
+                    for _, child in ipairs(listData.frame:GetChildren()) do
+                        if child:IsA("TextLabel") then child:Destroy() end
                     end
-                    label.Font = Enum.Font.Gotham
-                    label.TextSize = 19
-                    label.TextTruncate = Enum.TextTruncate.AtEnd
-                    label.TextXAlignment = Enum.TextXAlignment.Left
-                    label.Parent = listData.frame
+
+                    if #listData.entries == 0 then
+                        local empty = Instance.new("TextLabel")
+                        empty.Size = UDim2.new(1, 0, 0, 16)
+                        empty.BackgroundTransparency = 1
+                        empty.Text = "nothing hatched yet"
+                        empty.TextColor3 = Style.muted
+                        empty.Font = Enum.Font.Gotham
+                        empty.TextSize = 10
+                        empty.TextXAlignment = Enum.TextXAlignment.Left
+                        empty.TextTransparency = 0.4
+                        empty.Parent = listData.frame
+                    end
+
+                    for entryIndex, entryData in ipairs(listData.entries) do
+                        local label = Instance.new("TextLabel")
+                        label.Size = UDim2.new(1, 0, 0, 16)
+                        label.BackgroundTransparency = 1
+
+                        local variants = {}
+                        if entryData.rainbow then table.insert(variants, "R") end
+                        if entryData.golden then table.insert(variants, "G") end
+                        if entryData.shiny then table.insert(variants, "S") end
+                        local variantPrefix = #variants > 0 and ("[" .. table.concat(variants, "+") .. "] ") or ""
+                        label.Text = "- " .. variantPrefix .. tostring(entryData.name)
+
+                        label.TextColor3 = listData.color
+                        if entryData.rainbow then
+                            label.TextColor3 = Color3.fromRGB(255, 130, 225)
+                        elseif entryData.golden then
+                            label.TextColor3 = Color3.fromRGB(255, 205, 85)
+                        elseif entryData.shiny then
+                            label.TextColor3 = Color3.fromRGB(125, 225, 255)
+                        end
+
+                        label.Font = Enum.Font.GothamMedium
+                        label.TextSize = 11
+                        label.TextTruncate = Enum.TextTruncate.AtEnd
+                        label.TextXAlignment = Enum.TextXAlignment.Left
+                        label.LayoutOrder = entryIndex
+                        label.Parent = listData.frame
+                    end
                 end
             end
         end
-    end
     end
 
     local childNodes = ReplicatedStorage:GetChildren()
