@@ -143,6 +143,7 @@ local AntiAFKIntervalMinutes = 1
 local AutoFarmHackerBoss = false
 local AutoTokens = false
 local PotatoMode = false
+local AutoCollectFreeGifts = false
 local AutoFarmComet = false
 local FastPetSpeed = false
 local FastAttackSpeed = false
@@ -893,6 +894,98 @@ task.spawn(function()
             end
         else
             task.wait(0.25)
+        end
+    end
+end)
+
+-- AUTO FREE GIFTS
+-- Mirrors the game's own readiness rule (FreeGiftsTime >= waitTime and the
+-- index is not in FreeGiftsRedeemed) and claims through the same remote the
+-- Free Gifts UI uses. A local cooldown keeps the hub from re-sending a claim
+-- while the save is still catching up.
+local freeGiftClaimAt = {}
+local freeGiftRemote = nil
+
+-- The game's Network library runs a caller-script check that silently drops
+-- requests made from an executor (it returned nil and never reached the
+-- server). Grab the real RemoteFunction out of the Invoke closure's upvalues
+-- and call it directly instead.
+local function getFreeGiftRemote()
+    if freeGiftRemote and freeGiftRemote.Parent then
+        return freeGiftRemote
+    end
+    freeGiftRemote = nil
+
+    local invoke = Library.Network and Library.Network.Invoke
+    if type(invoke) ~= "function" then
+        return nil
+    end
+
+    local env = getgenv and getgenv() or _G
+    local getter = env and env.getupvalues
+    if type(getter) == "function" then
+        local ok, ups = pcall(getter, invoke)
+        if ok and type(ups) == "table" and type(ups[2]) == "function" then
+            local ok2, remote = pcall(ups[2], "Redeem Free Gift")
+            if ok2 and typeof(remote) == "Instance" and remote:IsA("RemoteFunction") then
+                freeGiftRemote = remote
+                return remote
+            end
+        end
+    end
+
+    return nil
+end
+
+-- Identifies the newest run so a reloaded hub stops the previous claim loop.
+local giftLoopToken = {}
+if getgenv then
+    getgenv().__pdhGiftLoopToken = giftLoopToken
+end
+
+task.spawn(function()
+    local function isCurrentRun()
+        if not getgenv then
+            return true
+        end
+        return getgenv().__pdhGiftLoopToken == giftLoopToken
+    end
+
+    while isCurrentRun() do
+        if AutoCollectFreeGifts then
+            pcall(function()
+                local save = Library.Save.Get()
+                local directory = Library.Directory and Library.Directory.FreeGifts
+                if not save or not directory or not save.FreeGiftsTime then
+                    return
+                end
+
+                local redeemed = {}
+                if type(save.FreeGiftsRedeemed) == "table" then
+                    for _, id in ipairs(save.FreeGiftsRedeemed) do
+                        redeemed[id] = true
+                    end
+                end
+
+                local now = os.clock()
+                for index, gift in ipairs(directory) do
+                    local waitTime = tonumber(gift.waitTime) or math.huge
+                    local lastTry = freeGiftClaimAt[index] or -math.huge
+                    if save.FreeGiftsTime >= waitTime
+                        and not redeemed[index]
+                        and (now - lastTry) >= 5 then
+                        freeGiftClaimAt[index] = now
+                        local remote = getFreeGiftRemote()
+                        if remote then
+                            remote:InvokeServer(index)
+                        end
+                        task.wait(0.2)
+                    end
+                end
+            end)
+            task.wait(2)
+        else
+            task.wait(1)
         end
     end
 end)
@@ -1700,9 +1793,9 @@ task.spawn(function()
     afkCenter.Parent = afkOverlay
 
     local afkTitle = Instance.new("TextLabel")
-    afkTitle.Size = UDim2.new(1, 0, 0, 70)
-    afkTitle.Text = "AFK MODE ACTIVE"
-    afkTitle.TextColor3 = Color3.fromRGB(255, 90, 90)
+    afkTitle.Size = UDim2.new(1, 0, 0, 96)
+    afkTitle.Text = "AFK Mode"
+    afkTitle.TextColor3 = Color3.fromRGB(240, 245, 255)
     afkTitle.Font = Enum.Font.GothamBlack
     afkTitle.TextSize = 64
     afkTitle.TextScaled = true
@@ -1711,10 +1804,28 @@ task.spawn(function()
     afkTitle.ZIndex = 102
     afkTitle.Parent = afkCenter
 
+    do
+        local afkSubtitle = Instance.new("TextLabel")
+        afkSubtitle.Size = UDim2.new(1, 0, 0, 28)
+        afkSubtitle.Position = UDim2.new(0, 0, 0, 98)
+        afkSubtitle.Text = "Pet Dimensions Hub"
+        afkSubtitle.TextColor3 = Color3.fromRGB(120, 150, 200)
+        afkSubtitle.Font = Enum.Font.GothamSemibold
+        afkSubtitle.TextSize = 18
+        afkSubtitle.BackgroundTransparency = 1
+        afkSubtitle.TextXAlignment = Enum.TextXAlignment.Center
+        afkSubtitle.ZIndex = 102
+        afkSubtitle.Parent = afkCenter
+    end
+
+    -- The old overlay showed live egg/gem counters. Keep the labels alive so
+    -- the leaderstat hooks that write to them stay valid, but hide them so
+    -- the screen reads as a plain AFK Mode panel.
     local afkEggs = Instance.new("TextLabel")
     afkEggs.Size = UDim2.new(1, 0, 0, 50)
     afkEggs.Position = UDim2.new(0, 0, 0, 95)
     afkEggs.Text = "Eggs Hatched: --"
+    afkEggs.Visible = false
     afkEggs.TextColor3 = Color3.fromRGB(80, 230, 80)
     afkEggs.Font = Enum.Font.GothamSemibold
     afkEggs.TextSize = 42
@@ -1728,6 +1839,7 @@ task.spawn(function()
     afkGems.Size = UDim2.new(1, 0, 0, 50)
     afkGems.Position = UDim2.new(0, 0, 0, 155)
     afkGems.Text = "Diamonds: --"
+    afkGems.Visible = false
     afkGems.TextColor3 = Color3.fromRGB(110, 185, 255)
     afkGems.Font = Enum.Font.GothamSemibold
     afkGems.TextSize = 42
@@ -1789,6 +1901,27 @@ task.spawn(function()
     autoTitle.TextXAlignment = Enum.TextXAlignment.Left
     autoTitle.Parent = autoHatchMain
 
+    do
+        local autoSubtitle = Instance.new("TextLabel")
+        autoSubtitle.Size = UDim2.new(1, -40, 0, 16)
+        autoSubtitle.Position = UDim2.new(0, 20, 0, 44)
+        autoSubtitle.Text = "Hatch · Farm · Daycare automation"
+        autoSubtitle.TextColor3 = Color3.fromRGB(125, 135, 160)
+        autoSubtitle.Font = Enum.Font.Gotham
+        autoSubtitle.TextSize = 12
+        autoSubtitle.BackgroundTransparency = 1
+        autoSubtitle.TextXAlignment = Enum.TextXAlignment.Left
+        autoSubtitle.Parent = autoHatchMain
+
+        local titleDivider = Instance.new("Frame")
+        titleDivider.Name = "TitleDivider"
+        titleDivider.Size = UDim2.new(1, -40, 0, 1)
+        titleDivider.Position = UDim2.new(0, 20, 0, 66)
+        titleDivider.BackgroundColor3 = Color3.fromRGB(48, 56, 74)
+        titleDivider.BorderSizePixel = 0
+        titleDivider.Parent = autoHatchMain
+    end
+
     local tabBar = Instance.new("Frame")
     tabBar.Name = "TabContainer"
     tabBar.Size = UDim2.new(1, -40, 0, 42)
@@ -1818,6 +1951,22 @@ task.spawn(function()
         stroke.Thickness = 1
         stroke.Transparency = 0.72
         stroke.Parent = btn
+
+        local underline = Instance.new("Frame")
+        underline.Name = "ActiveUnderline"
+        underline.Size = UDim2.new(0.55, 0, 0, 2)
+        underline.AnchorPoint = Vector2.new(0.5, 1)
+        underline.Position = UDim2.new(0.5, 0, 1, -1)
+        underline.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
+        underline.BackgroundTransparency = 0.15
+        underline.BorderSizePixel = 0
+        underline.Visible = false
+        underline.ZIndex = 2
+        underline.Parent = btn
+
+        local underlineCorner = Instance.new("UICorner")
+        underlineCorner.CornerRadius = UDim.new(1, 0)
+        underlineCorner.Parent = underline
 
         return btn
     end
@@ -2236,11 +2385,19 @@ task.spawn(function()
         for _, btn in ipairs({hatchTab, tpTab, settingsTab, eggTab, farmTab, TAB_TOTAL.tab, TAB_TOTAL.indexUI.tab}) do
             btn.BackgroundColor3 = activeTheme.surface
             btn.TextColor3 = Color3.fromRGB(180, 180, 190)
+            local tabUnderline = btn:FindFirstChild("ActiveUnderline")
+            if tabUnderline then
+                tabUnderline.Visible = false
+            end
         end
 
         activeFrame.Visible = true
         activeBtn.BackgroundColor3 = activeTheme.accent
         activeBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+        local activeUnderline = activeBtn:FindFirstChild("ActiveUnderline")
+        if activeUnderline then
+            activeUnderline.Visible = true
+        end
         currentTabBtn = activeBtn
         currentTabFrame = activeFrame
     end
@@ -2285,7 +2442,7 @@ task.spawn(function()
         -- execute look broken. Kept in a set so more toggles can be added
         -- later without touching the restore loop.
         local NEVER_RESTORE = {
-            ["AFK CPU Reducer"] = true,
+            ["AFK Mode"] = true,
         }
 
         local state = (not NEVER_RESTORE[text]) and CurrentToggleStates[text] == true or defaultState
@@ -2297,13 +2454,29 @@ task.spawn(function()
         btn:SetAttribute("ToggleState", state)
         toggleCallbacks[text] = callback
 
+        local hovered = false
+
         local function updateVisuals(newState)
             state = newState
             btn:SetAttribute("ToggleState", state)
-            btn.BackgroundColor3 = state and activeTheme.controlOn or activeTheme.surface
+            local base = state and activeTheme.controlOn or activeTheme.surface
+            if hovered and not state then
+                base = base:Lerp(activeTheme.accent, 0.14)
+            end
+            btn.BackgroundColor3 = base
             btn.Text = text .. (state and ": ON" or ": OFF")
             btn.TextColor3 = state and Color3.fromRGB(255, 255, 255) or Color3.fromRGB(180, 180, 190)
         end
+
+        btn.MouseEnter:Connect(function()
+            hovered = true
+            updateVisuals(state)
+        end)
+
+        btn.MouseLeave:Connect(function()
+            hovered = false
+            updateVisuals(state)
+        end)
 
         btn.MouseButton1Click:Connect(function()
             local newState = not state
@@ -2368,6 +2541,10 @@ task.spawn(function()
     -- returned nil every tick and the dodge/attack scheduler never had a
     -- status-bar and damage branches still read it.
 
+
+    createUnifiedToggle(farmFrame, 284, "Auto Free Gifts", false, function(state)
+        AutoCollectFreeGifts = state
+    end)
 
     createUnifiedToggle(farmFrame, 326, "Auto Tap", false, function(state)
         AutoTap = state
@@ -3349,18 +3526,16 @@ task.spawn(function()
             resetAfkSessionCounts()
 
             if enabled then
-                PotatoMode = true
                 afkOverlay.Visible = true
                 autoHatchMain.Visible = false
             else
-                PotatoMode = false
                 afkOverlay.Visible = false
                 autoHatchMain.Visible = true
             end
         end)
     end
 
-    createUnifiedToggle(hatchFrame, 416, "AFK CPU Reducer", false, function(value) setAfkMode(value) end)
+    createUnifiedToggle(hatchFrame, 416, "AFK Mode", false, function(value) setAfkMode(value) end)
 
     -- Wrapped in a block purely to keep its locals out of the UI thread's
     -- register budget (Luau caps a function at 200 registers).
@@ -4627,16 +4802,14 @@ task.spawn(function()
     end)
 
     -- Apply saved toggle states only after every toggle has been created.
-    -- This is important for AFK CPU Reducer and Auto-Hatch because their
-    -- callbacks depend on UI/functions that are created later in the script.
+    -- This is important for AFK Mode and Auto-Hatch because their callbacks
+    -- depend on UI/functions that are created later in the script.
     --
-    -- AFK CPU Reducer is deliberately EXEMPT. Restoring it made the script open
+    -- AFK Mode is deliberately EXEMPT. Restoring it made the script open
     -- straight into the full-screen AFK overlay with the hub hidden, so every
-    -- execute looked like it had thrown the UI away. It also resets the
-    -- session counters and forces PotatoMode on, which is a behavioural change
-    -- you should never inherit silently from a previous run. It still saves
-    -- like every other toggle, it just never auto-restores.
-    local AFK_TOGGLE = "AFK CPU Reducer"
+    -- execute looked like it had thrown the UI away. It still saves like
+    -- every other toggle, it just never auto-restores.
+    local AFK_TOGGLE = "AFK Mode"
     for key, callback in pairs(toggleCallbacks) do
         if key ~= AFK_TOGGLE and CurrentToggleStates[key] == true then
             pcall(callback, true)
@@ -4650,8 +4823,8 @@ task.spawn(function()
 
     afkExit.MouseButton1Click:Connect(function()
         setAfkMode(false)
-        if toggleRegistry["AFK CPU Reducer"] then
-            for _, syncFunc in ipairs(toggleRegistry["AFK CPU Reducer"]) do
+        if toggleRegistry["AFK Mode"] then
+            for _, syncFunc in ipairs(toggleRegistry["AFK Mode"]) do
                 syncFunc(false)
             end
         end
@@ -4665,6 +4838,7 @@ task.spawn(function()
     afkRarePanel.Position = UDim2.new(0, 0, 0, 220)
     afkRarePanel.BackgroundColor3 = activeTheme.panel
     afkRarePanel.BorderSizePixel = 0
+    afkRarePanel.Visible = false
     afkRarePanel.Parent = afkCenter
 
     local afkRareCorner = Instance.new("UICorner")
