@@ -5175,7 +5175,7 @@ end
     tpTip.Size = UDim2.new(1, 0, 0, 42)
     tpTip.Position = UDim2.new(0, 0, 0, 24)
     tpTip.BackgroundTransparency = 1
-    tpTip.Text = "Only teleport to the spots in the same world as you are currently in. It will glitch if you teleport to a different world."
+    tpTip.Text = "Click a world to expand it. Every teleport drops you in the middle of the area, 5 studs above the ground."
     tpTip.TextColor3 = Color3.fromRGB(255, 190, 80)
     tpTip.Font = Enum.Font.GothamSemibold
     tpTip.TextSize = 11
@@ -5186,7 +5186,7 @@ end
 
     -- Scrolling keeps the teleport list usable on smaller resolutions.
     local tpScroll = Instance.new("ScrollingFrame")
-    tpScroll.Size = UDim2.new(1, 0, 1, -72)
+    tpScroll.Size = UDim2.new(1, 0, 1, -96)
     tpScroll.Position = UDim2.new(0, 0, 0, 72)
     tpScroll.BackgroundTransparency = 1
     tpScroll.BorderSizePixel = 0
@@ -5206,70 +5206,472 @@ end
     tpPadding.PaddingBottom = UDim.new(0, 8)
     tpPadding.Parent = tpScroll
 
-    local function teleportTo(x, y, z)
-        local character = localPlayer.Character
-        if character and character:FindFirstChild("HumanoidRootPart") then
-            character.HumanoidRootPart.CFrame = CFrame.new(x, y, z)
+    -- The teleport tab is self-contained so it does not eat into the
+    -- local register budget of the rest of the UI builder.
+    local function buildTeleportTab()
+        -- Status line under the list. Every teleport reports here so a world that
+        -- refuses to load never looks like the script froze.
+        local tpStatus = Instance.new("TextLabel")
+        tpStatus.Size = UDim2.new(1, 0, 0, 20)
+        tpStatus.Position = UDim2.new(0, 0, 1, -24)
+        tpStatus.BackgroundTransparency = 1
+        tpStatus.Text = "Ready."
+        tpStatus.TextColor3 = Color3.fromRGB(170, 175, 185)
+        tpStatus.Font = Enum.Font.GothamSemibold
+        tpStatus.TextSize = 11
+        tpStatus.TextXAlignment = Enum.TextXAlignment.Left
+        tpStatus.TextTruncate = Enum.TextTruncate.AtEnd
+        tpStatus.Parent = tpFrame
+
+        local TP_OK_COLOR = Color3.fromRGB(120, 220, 150)
+        local TP_WARN_COLOR = Color3.fromRGB(255, 170, 70)
+
+        local function setTeleportStatus(text, color)
+            tpStatus.Text = text
+            tpStatus.TextColor3 = color or Color3.fromRGB(170, 175, 185)
         end
+
+        -- Executor helpers are looked up through getgenv because this environment
+        -- does not expose them as plain globals.
+        local executorGetUpvalues = nil
+        local executorSetupValue = nil
+        do
+            local okEnv, env = pcall(function() return getgenv() end)
+            if okEnv and type(env) == "table" then
+                if type(env.getupvalues) == "function" then
+                    executorGetUpvalues = env.getupvalues
+                end
+                if type(env.setupvalue) == "function" then
+                    executorSetupValue = env.setupvalue
+                end
+            end
+            if type(executorGetUpvalues) ~= "function" then
+                local okFn, fn = pcall(function() return getupvalues end)
+                if okFn and type(fn) == "function" then
+                    executorGetUpvalues = fn
+                end
+            end
+            if type(executorSetupValue) ~= "function" then
+                local okFn, fn = pcall(function() return setupvalue end)
+                if okFn and type(fn) == "function" then
+                    executorSetupValue = fn
+                end
+            end
+        end
+
+        local function getCharacterRoot()
+            local character = localPlayer.Character
+            if not character then return nil, nil end
+            local root = character:FindFirstChild("HumanoidRootPart")
+            if not root then return character, nil end
+            return character, root
+        end
+
+        -- Area centre resolution, in order of reliability:
+        --   1. the game's own spawn regions (flat pads sitting on the walkable floor)
+        --   2. the game's teleport pad for the area
+        --   3. the union of every part inside the area folder
+        -- The result is always 5 studs above the surface being used.
+        local function getAreaCenter(areaName)
+            local okRegions, regions = pcall(function()
+                return Library.WorldCmds.GetAreaSpawnRegions(areaName)
+            end)
+            if okRegions and type(regions) == "table" and #regions > 0 then
+                local minX, maxX, maxY, minZ, maxZ
+                local found = false
+                for _, region in ipairs(regions) do
+                    local cf, size = region.cframe, region.size
+                    if typeof(cf) == "CFrame" and typeof(size) == "Vector3" then
+                        local p = cf.Position
+                        local hx, hy, hz = size.X * 0.5, size.Y * 0.5, size.Z * 0.5
+                        local x1, x2 = p.X - hx, p.X + hx
+                        local y2 = p.Y + hy
+                        local z1, z2 = p.Z - hz, p.Z + hz
+                        minX = minX and math.min(minX, x1) or x1
+                        maxX = maxX and math.max(maxX, x2) or x2
+                        maxY = maxY and math.max(maxY, y2) or y2
+                        minZ = minZ and math.min(minZ, z1) or z1
+                        maxZ = maxZ and math.max(maxZ, z2) or z2
+                        found = true
+                    end
+                end
+                if found then
+                    return Vector3.new((minX + maxX) * 0.5, maxY + 5, (minZ + maxZ) * 0.5)
+                end
+            end
+
+            local map = workspace:FindFirstChild("__MAP")
+            if not map then return nil end
+
+            local pads = map:FindFirstChild("Teleports")
+            local pad = pads and pads:FindFirstChild(areaName)
+            if pad then
+                local okPad, padCf, padSize = pcall(function() return pad:GetBoundingBox() end)
+                if okPad and typeof(padCf) == "CFrame" and typeof(padSize) == "Vector3" then
+                    local p = padCf.Position
+                    return Vector3.new(p.X, p.Y + padSize.Y * 0.5 + 5, p.Z)
+                end
+            end
+
+            local areas = map:FindFirstChild("Areas")
+            local areaFolder = areas and areas:FindFirstChild(areaName)
+            if areaFolder then
+                local minX, maxX, minY, minZ, maxZ
+                local found = false
+                for _, part in ipairs(areaFolder:GetDescendants()) do
+                    if part:IsA("BasePart") then
+                        local p = part.Position
+                        minX = minX and math.min(minX, p.X) or p.X
+                        maxX = maxX and math.max(maxX, p.X) or p.X
+                        minY = minY and math.min(minY, p.Y) or p.Y
+                        minZ = minZ and math.min(minZ, p.Z) or p.Z
+                        maxZ = maxZ and math.max(maxZ, p.Z) or p.Z
+                        found = true
+                    end
+                end
+                if found then
+                    return Vector3.new((minX + maxX) * 0.5, minY + 5, (minZ + maxZ) * 0.5)
+                end
+            end
+
+            return nil
+        end
+
+        -- WorldCmds.Load sends "Request World" through Network.Invoke, which is
+        -- hard-coded to ignore executor callers. Only that single upvalue inside
+        -- loadWorldInner gets swapped for a proxy that calls the raw RemoteFunction,
+        -- then it is put straight back. Nothing global is touched.
+        local function loadWorldSafely(worldName)
+            if type(executorGetUpvalues) ~= "function" or type(executorSetupValue) ~= "function" then
+                return false
+            end
+
+            local okInner, inner = pcall(function()
+                return executorGetUpvalues(Library.WorldCmds.Load)[1]
+            end)
+            if not okInner or type(inner) ~= "function" then
+                return false
+            end
+
+            local okNet, networkTable = pcall(function()
+                return executorGetUpvalues(inner)[10]
+            end)
+            if not okNet or type(networkTable) ~= "table" then
+                return false
+            end
+
+            local originalInvoke = networkTable.Invoke
+            if type(originalInvoke) ~= "function" then
+                return false
+            end
+
+            local proxy = setmetatable({}, {
+                __index = function(_, key)
+                    if key == "Invoke" then
+                        return function(name, argument)
+                            if name ~= "Request World" then
+                                return originalInvoke(name, argument)
+                            end
+                            local okRemote, remote = pcall(function()
+                                return executorGetUpvalues(originalInvoke)[2](name)
+                            end)
+                            if not okRemote or typeof(remote) ~= "Instance" then
+                                return false
+                            end
+                            local okCall, result = pcall(function()
+                                return remote:InvokeServer(argument)
+                            end)
+                            if not okCall then return false end
+                            return result
+                        end
+                    end
+                    return networkTable[key]
+                end,
+            })
+
+            local patched = pcall(executorSetupValue, inner, 10, proxy)
+            local okLoad, result = pcall(Library.WorldCmds.Load, worldName)
+            if patched then
+                pcall(executorSetupValue, inner, 10, networkTable)
+            end
+
+            if not okLoad then
+                return false
+            end
+            return result == true
+        end
+
+        local teleportBusy = false
+
+        local function waitForAreaCenter(areaName, timeout)
+            local deadline = os.clock() + (timeout or 10)
+            while os.clock() < deadline do
+                local center = getAreaCenter(areaName)
+                if center then return center end
+                task.wait(0.25)
+            end
+            return nil
+        end
+
+        local function teleportToArea(areaName)
+            if teleportBusy then
+                setTeleportStatus("A teleport is already running...", TP_WARN_COLOR)
+                return
+            end
+
+            local areaData = Library.Directory.Areas and Library.Directory.Areas[areaName]
+            local targetWorld = type(areaData) == "table" and areaData.world or nil
+            local currentWorld = nil
+            pcall(function() currentWorld = Library.WorldCmds.Get() end)
+
+            local _, root = getCharacterRoot()
+            if not root then
+                setTeleportStatus("Character is not loaded yet.", TP_WARN_COLOR)
+                return
+            end
+
+            -- Same world: just move, the map is already streamed in.
+            if not targetWorld or targetWorld == currentWorld then
+                local center = getAreaCenter(areaName)
+                if not center then
+                    setTeleportStatus("Could not locate " .. areaName .. " in this world.", TP_WARN_COLOR)
+                    return
+                end
+                pcall(function() root.CFrame = CFrame.new(center) end)
+                setTeleportStatus("Teleported to " .. areaName .. ".", TP_OK_COLOR)
+                return
+            end
+
+            -- Loading a disabled world would silently dump the player into Spawn,
+            -- so refuse up front instead of yanking them across the map.
+            local worldData = Library.Directory.Worlds and Library.Directory.Worlds[targetWorld]
+            if type(worldData) ~= "table" or worldData.disabled == true or worldData.releasedToPlayers == false then
+                setTeleportStatus(tostring(targetWorld) .. " is disabled in-game right now.", TP_WARN_COLOR)
+                return
+            end
+
+            teleportBusy = true
+            setTeleportStatus("Loading " .. tostring(targetWorld) .. " for " .. areaName .. "...", activeTheme.accent)
+
+            task.spawn(function()
+                local okRun, runError = pcall(function()
+                    local loaded = loadWorldSafely(targetWorld)
+                    local landedWorld = nil
+                    pcall(function() landedWorld = Library.WorldCmds.Get() end)
+
+                    if not loaded or landedWorld ~= targetWorld then
+                        teleportBusy = false
+                        setTeleportStatus(tostring(targetWorld) .. " is not available right now.", TP_WARN_COLOR)
+                        return
+                    end
+
+                    local center = waitForAreaCenter(areaName, 10)
+                    task.wait(0.35)
+
+                    local _, newRoot = getCharacterRoot()
+                    if not newRoot then
+                        teleportBusy = false
+                        setTeleportStatus("Character is still respawning. Try again.", TP_WARN_COLOR)
+                        return
+                    end
+
+                    if not center then
+                        teleportBusy = false
+                        setTeleportStatus("Loaded " .. tostring(targetWorld) .. ", but " .. areaName .. " has no spawn point.", TP_WARN_COLOR)
+                        return
+                    end
+
+                    pcall(function() newRoot.CFrame = CFrame.new(center) end)
+                    teleportBusy = false
+                    setTeleportStatus("Teleported to " .. areaName .. " in " .. tostring(targetWorld) .. ".", TP_OK_COLOR)
+                end)
+
+                -- Never leave the busy flag stuck if something upstream throws.
+                if not okRun then
+                    teleportBusy = false
+                    setTeleportStatus("Teleport failed: " .. tostring(runError), TP_WARN_COLOR)
+                end
+            end)
+        end
+
+        -- Build the world -> areas table straight from the game's directory so the
+        -- list is complete and stays correct if the game adds areas later.
+        local groupedAreas = {}
+        local sortedWorlds = {}
+        do
+            local directory = Library.Directory
+            local directoryAreas = directory and directory.Areas
+            if type(directoryAreas) == "table" then
+                for areaName, areaData in pairs(directoryAreas) do
+                    if type(areaName) == "string"
+                        and type(areaData) == "table"
+                        and type(areaData.world) == "string" then
+                        local list = groupedAreas[areaData.world]
+                        if not list then
+                            list = {}
+                            groupedAreas[areaData.world] = list
+                            table.insert(sortedWorlds, areaData.world)
+                        end
+                        table.insert(list, areaName)
+                    end
+                end
+            end
+
+            local function worldOrder(worldName)
+                local data = Library.Directory.Worlds and Library.Directory.Worlds[worldName]
+                local id = type(data) == "table" and tonumber(data.id) or nil
+                if id then return id end
+                return 999
+            end
+
+            local function areaOrder(areaName)
+                local data = directoryAreas[areaName]
+                local order = type(data) == "table" and tonumber(data.luckyOrder or data.id) or nil
+                if order then return order end
+                return 9999
+            end
+
+            table.sort(sortedWorlds, function(a, b)
+                local oa, ob = worldOrder(a), worldOrder(b)
+                if oa ~= ob then return oa < ob end
+                return a < b
+            end)
+
+            for _, worldName in ipairs(sortedWorlds) do
+                table.sort(groupedAreas[worldName], function(a, b)
+                    local oa, ob = areaOrder(a), areaOrder(b)
+                    if oa ~= ob then return oa < ob end
+                    return a < b
+                end)
+            end
+        end
+
+        local expandedWorld = nil
+        do
+            local okWorld, world = pcall(function() return Library.WorldCmds.Get() end)
+            if okWorld and type(world) == "string" then
+                expandedWorld = world
+            end
+        end
+
+        local function styleTeleportRow(row)
+            local corner = Instance.new("UICorner")
+            corner.CornerRadius = UDim.new(0, 6)
+            corner.Parent = row
+
+            local stroke = Instance.new("UIStroke")
+            stroke.Color = activeTheme.stroke
+            stroke.Thickness = 1
+            stroke.Transparency = 0.7
+            stroke.Parent = row
+
+            local baseColor = row.BackgroundColor3
+            local hoverColor = baseColor:Lerp(activeTheme.accent, 0.14)
+
+            row.MouseEnter:Connect(function()
+                if row:GetAttribute("RowActive") then return end
+                row.BackgroundColor3 = hoverColor
+            end)
+            row.MouseLeave:Connect(function()
+                if row:GetAttribute("RowActive") then return end
+                row.BackgroundColor3 = baseColor
+            end)
+
+            return stroke
+        end
+
+        -- Rebuilding the list on expand/collapse keeps the layout exact and avoids
+        -- invisible rows still taking up space.
+        local function renderTeleportList()
+            for _, child in ipairs(tpScroll:GetChildren()) do
+                if child ~= tpLayout and child ~= tpPadding then
+                    child:Destroy()
+                end
+            end
+
+            local order = 0
+            for _, worldName in ipairs(sortedWorlds) do
+                local areaNames = groupedAreas[worldName]
+                local isOpen = expandedWorld == worldName
+
+                order = order + 1
+
+                local header = Instance.new("TextButton")
+                header.Size = UDim2.new(1, -8, 0, 32)
+                header.BackgroundColor3 = isOpen and activeTheme.controlOn or activeTheme.surface
+                header.TextColor3 = Color3.fromRGB(255, 255, 255)
+                header.Text = (isOpen and "[-]  " or "[+]  ") .. worldName .. "   (" .. #areaNames .. " areas)"
+                header.Font = Enum.Font.GothamBold
+                header.TextSize = 13
+                header.TextXAlignment = Enum.TextXAlignment.Left
+                header.LayoutOrder = order
+                header:SetAttribute("RowActive", isOpen)
+                header.Parent = tpScroll
+
+                local headerPadding = Instance.new("UIPadding")
+                headerPadding.PaddingLeft = UDim.new(0, 10)
+                headerPadding.Parent = header
+
+                local headerStroke = styleTeleportRow(header)
+                if isOpen then
+                    headerStroke.Transparency = 0.3
+                end
+
+                header.MouseButton1Click:Connect(function()
+                    -- Clicking the open world again collapses it.
+                    if expandedWorld == worldName then
+                        expandedWorld = nil
+                    else
+                        expandedWorld = worldName
+                    end
+                    task.defer(renderTeleportList)
+                end)
+
+                if isOpen then
+                    for _, areaName in ipairs(areaNames) do
+                        order = order + 1
+
+                        local areaButton = Instance.new("TextButton")
+                        areaButton.Size = UDim2.new(1, -22, 0, 30)
+                        areaButton.BackgroundColor3 = activeTheme.surface
+                        areaButton.TextColor3 = Color3.fromRGB(225, 228, 235)
+                        areaButton.Text = areaName
+                        areaButton.TextXAlignment = Enum.TextXAlignment.Left
+                        areaButton.Font = Enum.Font.GothamSemibold
+                        areaButton.TextSize = 12
+                        areaButton.LayoutOrder = order
+                        areaButton.Parent = tpScroll
+
+                        local areaPadding = Instance.new("UIPadding")
+                        areaPadding.PaddingLeft = UDim.new(0, 14)
+                        areaPadding.Parent = areaButton
+
+                        styleTeleportRow(areaButton)
+
+                        areaButton.MouseButton1Click:Connect(function()
+                            teleportToArea(areaName)
+                        end)
+                    end
+                end
+            end
+
+            if #sortedWorlds == 0 then
+                local emptyLabel = Instance.new("TextLabel")
+                emptyLabel.Size = UDim2.new(1, -8, 0, 24)
+                emptyLabel.BackgroundTransparency = 1
+                emptyLabel.Text = "World list unavailable."
+                emptyLabel.TextColor3 = TP_WARN_COLOR
+                emptyLabel.Font = Enum.Font.GothamSemibold
+                emptyLabel.TextSize = 12
+                emptyLabel.TextXAlignment = Enum.TextXAlignment.Left
+                emptyLabel.Parent = tpScroll
+            end
+        end
+
+        renderTeleportList()
     end
 
-    local function createTeleportSection(parent, name)
-        local section = Instance.new("TextLabel")
-        section.Size = UDim2.new(1, -8, 0, 24)
-        section.BackgroundTransparency = 1
-        section.Text = name
-        section.TextColor3 = activeTheme.accent
-        section.Font = Enum.Font.GothamBold
-        section.TextSize = 13
-        section.TextXAlignment = Enum.TextXAlignment.Left
-        section.LayoutOrder = #parent:GetChildren() + 1
-        section.Parent = parent
-        return section
-    end
-
-    local function createTeleportButton(parent, name, coords)
-        local button = Instance.new("TextButton")
-        button.Size = UDim2.new(1, -8, 0, 34)
-        button.BackgroundColor3 = activeTheme.surface
-        button.Text = "Teleport to " .. name
-        button.TextColor3 = Color3.fromRGB(255, 255, 255)
-        button.Font = Enum.Font.GothamBold
-        button.TextSize = 13
-        button.TextScaled = false
-        button.LayoutOrder = #parent:GetChildren() + 1
-        button.Parent = parent
-
-        local btnCorner = Instance.new("UICorner")
-        btnCorner.CornerRadius = UDim.new(0, 6)
-        btnCorner.Parent = button
-
-        local btnStroke = Instance.new("UIStroke")
-        btnStroke.Color = activeTheme.stroke
-        btnStroke.Thickness = 1
-        btnStroke.Transparency = 0.7
-        btnStroke.Parent = button
-
-        button.MouseButton1Click:Connect(function()
-            teleportTo(coords[1], coords[2], coords[3])
-        end)
-    end
-
-    -- World 1
-    createTeleportSection(tpScroll, "World 1")
-    createTeleportButton(tpScroll, "World 1 Spawn", {267, 98, 238})
-    createTeleportButton(tpScroll, "World 1 Last Area", {-3691, 142, 232})
-
-    -- Fantasy World
-    createTeleportSection(tpScroll, "Fantasy World")
-    createTeleportButton(tpScroll, "Fantasy Spawn", {-7568, 558, -1683})
-    createTeleportButton(tpScroll, "Moon Egg", {-7765, 639, -1247})
-    createTeleportButton(tpScroll, "Crystal Chest", {-5283, 583, -2271})
-    createTeleportButton(tpScroll, "Fantasy Last Area", {-4857, 558, -1679})
-
-    -- Tech World
-    createTeleportSection(tpScroll, "Tech World")
-    createTeleportButton(tpScroll, "Tech Spawn", {-9977, 16, 9601})
-    createTeleportButton(tpScroll, "Tech Last Area", {-5328, 18, 9626})
+    buildTeleportTab()
 
     -- =====================================================================
     -- SETTINGS TAB UI & EXTENDED THEME SWITCHER
