@@ -1,6 +1,7 @@
 -- =====================================================================
 -- COMBINED AUTOMATION SCRIPT: UNIFIED UI + FIXED AUTO TOKENS + PET TRACKER
 -- HATCH LOGIC + EGG CHANCE VIEWER + AUTO FARM & PET TRACKER
+-- REAL EXECUTOR OPTIMIZED VERSION
 -- =====================================================================
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -14,18 +15,78 @@ local VirtualInputManager = game:GetService("VirtualInputManager")
 local localPlayer = Players.LocalPlayer
 local playerGui = localPlayer:WaitForChild("PlayerGui")
 
+-- =====================================================================
+-- REAL EXECUTOR COMPATIBILITY & SAFETY FEATURES
+-- =====================================================================
+local isExecutorLoaded = false
+local scriptCleanupHandlers = {}
+
+local function registerCleanup(handler)
+    if type(handler) == "function" then
+        table.insert(scriptCleanupHandlers, handler)
+    end
+end
+
+local function runCleanup()
+    pcall(function()
+        for _, handler in ipairs(scriptCleanupHandlers) do
+            pcall(handler)
+        end
+    end)
+    scriptCleanupHandlers = {}
+end
+
+-- Signal for script unload (Real executor compatibility)
+-- BindToClose only exists on the server; calling it from a client script throws
+-- and would kill the whole script before the UI is ever built.
+pcall(function()
+    game:BindToClose(function()
+        runCleanup()
+    end)
+end)
+
+-- Handle script reload in executor environments
+local function setupExecutorSignals()
+    local signalPath = "PetDimensions_Signal"
+    local signal = ReplicatedStorage:FindFirstChild(signalPath)
+    if not signal then
+        signal = Instance.new("BindableEvent")
+        signal.Name = signalPath
+        signal.Parent = ReplicatedStorage
+    end
+    
+    local connection
+    connection = signal.Event:Connect(function(action)
+        if action == "Unload" or action == "Reset" then
+            runCleanup()
+            if connection then
+                connection:Disconnect()
+            end
+        end
+    end)
+    
+    registerCleanup(function()
+        if connection and connection.Connected then
+            connection:Disconnect()
+        end
+    end)
+end
+
+setupExecutorSignals()
+isExecutorLoaded = true
+
 local SettingsFile = "MultiRobloxAccounts_settings.json"
 local CurrentThemeName = "Default Dark"
 local CurrentKeyName = "LeftControl"
 local CurrentToggleStates = {}
 local PersistedSettings = {
-    selectedEgg = nil,
     webhook = {
         url = "",
         enabled = false,
         summaryEnabled = false,
         summaryMinutes = 30,
-        notify = { Huge = true, Secret = true, Titanic = true, Gargantuan = true }
+        notify = { Huge = true, Secret = true, Titanic = true, Gargantuan = true },
+        userId = ""
     },
     -- Free-form bag for every other setting (Anti-AFK interval, ...).
     -- Anything registered through SetSetting below is written
@@ -80,9 +141,8 @@ if SavedSettings.key then CurrentKeyName = SavedSettings.key end
 if type(SavedSettings.toggles) == "table" then
     CurrentToggleStates = SavedSettings.toggles
 end
-if SavedSettings.selectedEgg ~= nil then
-    PersistedSettings.selectedEgg = tostring(SavedSettings.selectedEgg)
-end
+-- AFK mode is session-only and must never be restored as ON after execution.
+CurrentToggleStates["AFK Mode"] = false
 if type(SavedSettings.extra) == "table" then
     for k, v in pairs(SavedSettings.extra) do
         PersistedSettings.extra[k] = v
@@ -96,6 +156,9 @@ if type(SavedSettings.webhook) == "table" then
     end
     if tonumber(SavedSettings.webhook.summaryMinutes) then
         PersistedSettings.webhook.summaryMinutes = math.clamp(tonumber(SavedSettings.webhook.summaryMinutes), 1, 1440)
+    end
+    if SavedSettings.webhook.userId ~= nil then
+        PersistedSettings.webhook.userId = tostring(SavedSettings.webhook.userId or "")
     end
     if type(SavedSettings.webhook.notify) == "table" then
         for _, key in ipairs({"Huge", "Secret", "Titanic", "Gargantuan"}) do
@@ -121,7 +184,6 @@ local function saveSettings()
                 theme = CurrentThemeName,
                 key = CurrentKeyName,
                 toggles = CurrentToggleStates,
-                selectedEgg = PersistedSettings.selectedEgg,
                 webhook = PersistedSettings.webhook,
                 extra = PersistedSettings.extra,
             }))
@@ -133,6 +195,91 @@ end
 local Library = require(ReplicatedStorage:WaitForChild("Framework"):WaitForChild("Library"))
 while not Library.Loaded do
     RunService.Heartbeat:Wait()
+end
+
+-- ---------------------------------------------------------------------
+-- Raw remote access
+--
+-- Library.Network.Invoke / Fire run caller checks (debug.info plus a
+-- getfenv sweep for getgenv) and hand back nil to anything injected. The
+-- wrappers below reuse the module's own hash/remote resolvers instead, so
+-- a call from this script reaches the server exactly like a game script.
+-- ---------------------------------------------------------------------
+local RawNet = {}
+
+do
+    local getup = (type(getgenv) == "function" and type(getgenv().getupvalues) == "function" and getgenv().getupvalues)
+        or (type(getupvalues) == "function" and getupvalues)
+        or nil
+
+    if getup then
+        local function findResolvers(fn)
+            local ok, upvalues = pcall(getup, fn)
+            if not ok or type(upvalues) ~= "table" then return nil end
+
+            for _, candidate in ipairs(upvalues) do
+                if type(candidate) == "function" then
+                    local ok2, inner = pcall(getup, candidate)
+                    if ok2 and type(inner) == "table"
+                        and type(inner[1]) == "function"
+                        and type(inner[2]) == "function" then
+                        local ok3, remoteTable = pcall(getup, inner[1])
+                        local ok4, hashTable = pcall(getup, inner[2])
+                        if ok3 and ok4
+                            and type(remoteTable) == "table" and type(hashTable) == "table"
+                            and type(remoteTable[1]) == "table"
+                            and type(hashTable[1]) == "table" then
+                            return inner[1], inner[2]
+                        end
+                    end
+                end
+            end
+
+            return nil
+        end
+
+        local getRemote, getHash
+
+        for _, method in ipairs({ "Invoke", "Fire" }) do
+            local ok, fn = pcall(function() return Library.Network[method] end)
+            if ok and type(fn) == "function" then
+                getRemote, getHash = findResolvers(fn)
+                if getHash then break end
+            end
+        end
+
+        if getRemote and getHash then
+            local cache = {}
+
+            local function resolve(kind, name)
+                local key = kind .. "\0" .. name
+                local remote = cache[key]
+                if remote and remote.Parent then return remote end
+
+                local ok, hash = pcall(getHash, kind, name)
+                if not ok or hash == nil then return nil end
+
+                local ok2, instance = pcall(getRemote, kind, hash)
+                if not ok2 or not instance then return nil end
+
+                cache[key] = instance
+                return instance
+            end
+
+            -- Returns ok, serverSuccess, serverValue / error text.
+            RawNet.invoke = function(name, ...)
+                local remote = resolve(2, name)
+                if not remote then return false, "remote unavailable" end
+                return pcall(remote.InvokeServer, remote, ...)
+            end
+
+            RawNet.fire = function(name, ...)
+                local remote = resolve(1, name)
+                if not remote then return false, "remote unavailable" end
+                return pcall(remote.FireServer, remote, ...)
+            end
+        end
+    end
 end
 
 local AutoFarmRobot = false
@@ -176,83 +323,84 @@ pcall(function()
 end)
 
 
-local PlayerPetModule = nil
-local FastPetSpeedHooked = false
-
 local function SetFastPetSpeed(enabled)
     FastPetSpeed = enabled
-
-    -- Load the PlayerPet module once (it is a singleton already running).
-    if not PlayerPetModule then
-        pcall(function()
-            PlayerPetModule = require(
-                ReplicatedStorage:WaitForChild("Library", 2)
-                    :WaitForChild("Client", 2)
-                    :WaitForChild("PlayerPet", 2)
-            )
-        end)
+    if not SaveModule or not SaveModule.Get then
+        return
     end
 
-    if not PlayerPetModule then return end
+    pcall(function()
+        local save = SaveModule.Get()
+        if not save then return end
+        save.Upgrades = save.Upgrades or {}
 
-    if enabled and not FastPetSpeedHooked then
-        FastPetSpeedHooked = true
-
-        -- Wrap the method on the prototype table so every existing and future
-        -- instance is affected without iterating the full pet list.
-        local original = PlayerPetModule.CalculateSpeedMultiplier
-        PlayerPetModule.CalculateSpeedMultiplier = function(self)
-            if FastPetSpeed then
-                return 9999
+        if enabled then
+            if not FastPetSpeedApplied then
+                PetWalkspeedUpgradeWasPresent = save.Upgrades["Pet Walkspeed"] ~= nil
+                OriginalPetWalkspeedUpgrade = save.Upgrades["Pet Walkspeed"]
+                FastPetSpeedApplied = true
             end
-            return original(self)
+            save.Upgrades["Pet Walkspeed"] = FastPetSpeedValue
+        else
+            if FastPetSpeedApplied then
+                if PetWalkspeedUpgradeWasPresent then
+                    save.Upgrades["Pet Walkspeed"] = OriginalPetWalkspeedUpgrade
+                else
+                    save.Upgrades["Pet Walkspeed"] = nil
+                end
+                FastPetSpeedApplied = false
+            end
         end
-
-        -- Immediately broadcast the new speedMult to all currently spawned pets.
-        pcall(function()
-            for _, playerPet in PlayerPetModule.GetByPlayer(localPlayer) do
-                local newMult = playerPet:CalculateSpeedMultiplier()
-                if newMult ~= playerPet.speedMult then
-                    playerPet.speedMult = newMult
-                    playerPet.cpet:Broadcast("petSpeedMult", newMult)
-                end
-            end
-        end)
-    elseif not enabled and FastPetSpeedHooked then
-        -- Restore normal speed on all running pets immediately.
-        pcall(function()
-            for _, playerPet in PlayerPetModule.GetByPlayer(localPlayer) do
-                local newMult = playerPet:CalculateSpeedMultiplier()   -- now returns real value
-                if newMult ~= playerPet.speedMult then
-                    playerPet.speedMult = newMult
-                    playerPet.cpet:Broadcast("petSpeedMult", newMult)
-                end
-            end
-        end)
-    end
+    end)
 end
 
--- Keep a background loop so pets that spawn after the toggle is turned on
--- also get the boost without waiting up to 1 second for the game's own
--- updatePetSpeedTask to run.
 task.spawn(function()
     while true do
-        if FastPetSpeed and PlayerPetModule then
+        if FastPetSpeed then
+            SetFastPetSpeed(true)
+            -- Directly apply walkspeed to pet models so pets move immediately,
+            -- not just when the save's upgrade stat is read by the server.
             pcall(function()
-                for _, playerPet in PlayerPetModule.GetByPlayer(localPlayer) do
-                    if playerPet.speedMult ~= 9999 then
-                        playerPet.speedMult = 9999
-                        playerPet.cpet:Broadcast("petSpeedMult", 9999)
+                local petLocations = {
+                    Workspace:FindFirstChild("__THINGS") and Workspace.__THINGS:FindFirstChild("Pets"),
+                    Workspace:FindFirstChild("Pets"),
+                    Workspace:FindFirstChild("__MAP") and Workspace.__MAP:FindFirstChild("Pets"),
+                }
+                for _, folder in ipairs(petLocations) do
+                    if folder then
+                        for _, pet in ipairs(folder:GetChildren()) do
+                            if pet:IsA("Model") then
+                                local hum = pet:FindFirstChildOfClass("Humanoid")
+                                if hum then
+                                    hum.WalkSpeed = FastPetSpeedValue
+                                end
+                                local primary = pet.PrimaryPart
+                                if primary then
+                                    primary.CustomPhysicalProperties = PhysicalProperties.new(0.01, 0, 0)
+                                end
+                            end
+                        end
+                    end
+                end
+                -- Also catch pets that stream in under __THINGS directly.
+                local things = Workspace:FindFirstChild("__THINGS")
+                if things then
+                    for _, obj in ipairs(things:GetDescendants()) do
+                        if obj:IsA("Model") and obj.Name:lower():find("pet") then
+                            local hum = obj:FindFirstChildOfClass("Humanoid")
+                            if hum then
+                                hum.WalkSpeed = FastPetSpeedValue
+                            end
+                        end
                     end
                 end
             end)
-            task.wait(0.5)
+            task.wait(0.3)
         else
             task.wait(1)
         end
     end
 end)
-
 
 local CurrentTarget = nil
 local CurrentTargetId = nil
@@ -1042,8 +1190,9 @@ end)
 -- Event-driven cleanup only. Do not scan the entire Camera/Lighting tree
 -- every frame, since that causes significant client-side lag.
 -- =====================================================================
+local eggOpenCleanupActive = true
 local function destroyEggAnimationObject(obj)
-    if not obj then return end
+    if not obj or not eggOpenCleanupActive then return end
     pcall(function()
         if obj.Name == "EggOpenAnim_Eggs" or obj.Name == "EggOpenDOF" then
             obj:Destroy()
@@ -1109,6 +1258,27 @@ end)
 -- scheduled - no TweenService work, no DepthOfFieldEffect, no preloaded assets,
 -- no EggOpenAnim instances - and costs nothing per frame.
 local EggOpenEnv = (type(getgenv) == "function" and getgenv()) or _G
+local eggOpenHookCleanup = {}
+
+-- Detect Real executor environment and adjust hooking strategy
+local function detectExecutorType()
+    local env = getgenv and getgenv() or _G
+    if env then
+        if env.ROC or env.RoC or env["RO-C"] or env["R_O_C"] then
+            return "Real"
+        elseif env.XX or env.XXC or env["XX-C"] then
+            return "XX"
+        elseif env.Delta or env["Delta-X"] then
+            return "Delta"
+        elseif env.Astro or env["Astro-Code"] then
+            return "Astro"
+        end
+    end
+    return "Unknown"
+end
+
+local executorType = detectExecutorType()
+local useDirectHook = executorType == "Real" or executorType == "Unknown"
 
 -- How the game plays the animation (read from the live scripts):
 --   server -> Network "Eggs_PlayOpenAnimation" -> Game.EggOpenHook
@@ -1140,11 +1310,15 @@ pcall(function()
         if previous.trigger and previous.callback then
             previous.trigger.Event:Connect(previous.callback)
         end
+        if previous.cleanup then
+            pcall(previous.cleanup)
+        end
     end
 end)
 EggOpenEnv.PD_EggOpenHook = nil
 
 local eggOpenDetached = false
+local eggOpenConnection
 task.spawn(function()
     local port = ReplicatedStorage:WaitForChild("EggOpenPort", 15)
     local trigger = port and port:WaitForChild("PlayTrigger", 15)
@@ -1164,8 +1338,14 @@ task.spawn(function()
                 trigger = trigger,
                 callback = callback,
                 replacement = signal:Connect(eggOpenBookkeeping),
+                cleanup = function()
+                    if eggOpenConnection and eggOpenConnection.Connected then
+                        eggOpenConnection:Disconnect()
+                    end
+                end,
             }
             eggOpenDetached = true
+            eggOpenConnection = EggOpenEnv.PD_EggOpenHook.replacement
         end
     end)
 
@@ -1186,6 +1366,18 @@ task.spawn(function()
                     return oldNamecall(self, ...)
                 end))
                 EggOpenEnv.PD_EggOpenNamecallHooked = true
+                
+                -- Register cleanup for namecall hook
+                EggOpenEnv.PD_EggOpenNamecallHookCleanup = function()
+                    if oldNamecall then
+                        hookmetamethod(game, "__namecall", oldNamecall)
+                    end
+                end
+                registerCleanup(function()
+                    if EggOpenEnv.PD_EggOpenNamecallHookCleanup then
+                        pcall(EggOpenEnv.PD_EggOpenNamecallHookCleanup)
+                    end
+                end)
             end
         end)
     end
@@ -1195,12 +1387,20 @@ end)
 -- With the listener detached nothing should ever be created, so this is a
 -- safety net for leftovers from an animation that was already in flight when
 -- the script loaded - not a per-frame tree scan.
-task.spawn(function()
+local eggCleanupTask
+eggCleanupTask = task.spawn(function()
     while true do
-        if AutoBuying then
+        if AutoBuying and eggOpenCleanupActive then
             cleanupEggOpeningEffects()
         end
         task.wait(2)
+    end
+end)
+
+registerCleanup(function()
+    eggOpenCleanupActive = false
+    if eggCleanupTask then
+        task.cancel(eggCleanupTask)
     end
 end)
 
@@ -1214,6 +1414,16 @@ local function destroyOldGui(name)
         old:Destroy()
     end
 end
+
+-- Clean up previous UI instances for Real executor reloads
+pcall(function()
+    if playerGui:FindFirstChild("CombinedAutomationUI") then
+        playerGui.CombinedAutomationUI:Destroy()
+    end
+    if playerGui:FindFirstChild("CombinedAutomationAfkUI") then
+        playerGui.CombinedAutomationAfkUI:Destroy()
+    end
+end)
 
 destroyOldGui("CombinedAutomationUI")
 
@@ -1355,9 +1565,11 @@ task.spawn(function()
     tracker.Draggable = true
     tracker.Parent = ui
 
-    local trackerCorner = Instance.new("UICorner")
-    trackerCorner.CornerRadius = UDim.new(0, 10)
-    trackerCorner.Parent = tracker
+    do
+        local trackerCorner = Instance.new("UICorner")
+        trackerCorner.CornerRadius = UDim.new(0, 10)
+        trackerCorner.Parent = tracker
+    end
 
     local trackerStroke = Instance.new("UIStroke")
     trackerStroke.Color = Color3.fromRGB(170, 170, 170)
@@ -1376,20 +1588,24 @@ task.spawn(function()
     trackerToggle.TextSize = 16
     trackerToggle.Parent = tracker
 
-    local trackerToggleCorner = Instance.new("UICorner")
-    trackerToggleCorner.CornerRadius = UDim.new(0, 6)
-    trackerToggleCorner.Parent = trackerToggle
+    do
+        local trackerToggleCorner = Instance.new("UICorner")
+        trackerToggleCorner.CornerRadius = UDim.new(0, 6)
+        trackerToggleCorner.Parent = trackerToggle
+    end
 
     local trackerContainer = Instance.new("Frame")
     trackerContainer.Size = UDim2.new(1, 0, 1, 0)
     trackerContainer.BackgroundTransparency = 1
     trackerContainer.Parent = tracker
 
-    local trackerLayout = Instance.new("UIListLayout")
-    trackerLayout.FillDirection = Enum.FillDirection.Horizontal
-    trackerLayout.Padding = UDim.new(0, 0)
-    trackerLayout.SortOrder = Enum.SortOrder.LayoutOrder
-    trackerLayout.Parent = trackerContainer
+    do
+        local trackerLayout = Instance.new("UIListLayout")
+        trackerLayout.FillDirection = Enum.FillDirection.Horizontal
+        trackerLayout.Padding = UDim.new(0, 0)
+        trackerLayout.SortOrder = Enum.SortOrder.LayoutOrder
+        trackerLayout.Parent = trackerContainer
+    end
 
     local function makeColumn(name, color, order)
         local col = Instance.new("Frame")
@@ -1411,24 +1627,28 @@ task.spawn(function()
         countText.TextXAlignment = Enum.TextXAlignment.Left
         countText.Parent = col
 
-        local topLine = Instance.new("Frame")
-        topLine.Size = UDim2.new(1, -12, 0, 1)
-        topLine.Position = UDim2.new(0, 6, 0, 50)
-        topLine.BackgroundColor3 = color
-        topLine.BackgroundTransparency = 0.7
-        topLine.BorderSizePixel = 0
-        topLine.Parent = col
+        do
+            local topLine = Instance.new("Frame")
+            topLine.Size = UDim2.new(1, -12, 0, 1)
+            topLine.Position = UDim2.new(0, 6, 0, 50)
+            topLine.BackgroundColor3 = color
+            topLine.BackgroundTransparency = 0.7
+            topLine.BorderSizePixel = 0
+            topLine.Parent = col
+        end
 
-        local recentText = Instance.new("TextLabel")
-        recentText.Size = UDim2.new(1, -12, 0, 20)
-        recentText.Position = UDim2.new(0, 6, 0, 56)
-        recentText.BackgroundTransparency = 1
-        recentText.Font = Enum.Font.GothamBold
-        recentText.TextColor3 = color
-        recentText.TextSize = 13
-        recentText.Text = "Recent " .. name .. "s:"
-        recentText.TextXAlignment = Enum.TextXAlignment.Left
-        recentText.Parent = col
+        do
+            local recentText = Instance.new("TextLabel")
+            recentText.Size = UDim2.new(1, -12, 0, 20)
+            recentText.Position = UDim2.new(0, 6, 0, 56)
+            recentText.BackgroundTransparency = 1
+            recentText.Font = Enum.Font.GothamBold
+            recentText.TextColor3 = color
+            recentText.TextSize = 13
+            recentText.Text = "Recent " .. name .. "s:"
+            recentText.TextXAlignment = Enum.TextXAlignment.Left
+            recentText.Parent = col
+        end
 
         local list = Instance.new("ScrollingFrame")
         list.Name = name .. "Recent"
@@ -1452,32 +1672,38 @@ task.spawn(function()
     local titanicLabel, titanicList = makeColumn("Titanic", Color3.fromRGB(80, 200, 255), 5)
     local gargantuanLabel, gargantuanList = makeColumn("Gargantuan", Color3.fromRGB(255, 100, 150), 7)
 
-    local div1 = Instance.new("Frame")
-    div1.BackgroundColor3 = Color3.fromRGB(180, 180, 180)
-    div1.BackgroundTransparency = 0.8
-    div1.BorderSizePixel = 0
-    div1.Size = UDim2.new(0, 1, 1, -16)
-    div1.Position = UDim2.new(0, 0, 0, 8)
-    div1.LayoutOrder = 2
-    div1.Parent = trackerContainer
+    do
+        local div1 = Instance.new("Frame")
+        div1.BackgroundColor3 = Color3.fromRGB(180, 180, 180)
+        div1.BackgroundTransparency = 0.8
+        div1.BorderSizePixel = 0
+        div1.Size = UDim2.new(0, 1, 1, -16)
+        div1.Position = UDim2.new(0, 0, 0, 8)
+        div1.LayoutOrder = 2
+        div1.Parent = trackerContainer
+    end
 
-    local div2 = Instance.new("Frame")
-    div2.BackgroundColor3 = Color3.fromRGB(180, 180, 180)
-    div2.BackgroundTransparency = 0.8
-    div2.BorderSizePixel = 0
-    div2.Size = UDim2.new(0, 1, 1, -16)
-    div2.Position = UDim2.new(0, 0, 0, 8)
-    div2.LayoutOrder = 4
-    div2.Parent = trackerContainer
+    do
+        local div2 = Instance.new("Frame")
+        div2.BackgroundColor3 = Color3.fromRGB(180, 180, 180)
+        div2.BackgroundTransparency = 0.8
+        div2.BorderSizePixel = 0
+        div2.Size = UDim2.new(0, 1, 1, -16)
+        div2.Position = UDim2.new(0, 0, 0, 8)
+        div2.LayoutOrder = 4
+        div2.Parent = trackerContainer
+    end
 
-    local div3 = Instance.new("Frame")
-    div3.BackgroundColor3 = Color3.fromRGB(180, 180, 180)
-    div3.BackgroundTransparency = 0.8
-    div3.BorderSizePixel = 0
-    div3.Size = UDim2.new(0, 1, 1, -16)
-    div3.Position = UDim2.new(0, 0, 0, 8)
-    div3.LayoutOrder = 6
-    div3.Parent = trackerContainer
+    do
+        local div3 = Instance.new("Frame")
+        div3.BackgroundColor3 = Color3.fromRGB(180, 180, 180)
+        div3.BackgroundTransparency = 0.8
+        div3.BorderSizePixel = 0
+        div3.Size = UDim2.new(0, 1, 1, -16)
+        div3.Position = UDim2.new(0, 0, 0, 8)
+        div3.LayoutOrder = 6
+        div3.Parent = trackerContainer
+    end
 
     local minimized = false
     local function updateTrackerState()
@@ -1725,48 +1951,8 @@ task.spawn(function()
         if afkRareLabels.Titanics then afkRareLabels.Titanics.Text = tostring(totalTitanic) end
         if afkRareLabels.Gargantuans then afkRareLabels.Gargantuans.Text = tostring(totalGargantuan) end
 
-        -- Variant totals: one line per tier that actually owns a variant pet.
-        -- Rendered dynamically so a tier with zero rainbows costs no label.
+        -- Keep Hatch stats variant chips updated cleanly without overlapping rows.
         pcall(updateHatchVariantOwned)
-        if statsContainer then
-            local order = { "Huges", "Titanics", "Gargantuans", "Secrets" }
-            local used = 0
-            for _, base in ipairs(order) do
-                local rb = variantCounts[base] or 0
-                local gd = variantCounts[base .. "Golden"] or 0
-                local sh = variantCounts[base .. "Shiny"] or 0
-                if rb > 0 or gd > 0 or sh > 0 then
-                    local key = base
-                    local label = variantLabels[key]
-                    local text = ("%s  R:%d  G:%d  S:%d"):format(base, rb, gd, sh)
-                    if not label then
-                        used += 1
-                        label = Instance.new("TextLabel")
-                        label.Size = UDim2.new(1, -20, 0, 20)
-                        label.Position = UDim2.new(0, 10, 0, 132 + (used - 1) * 22)
-                        label.BackgroundTransparency = 1
-                        label.TextColor3 = Color3.fromRGB(255, 120, 220)
-                        label.Font = Enum.Font.GothamBold
-                        label.TextSize = 12
-                        label.TextXAlignment = Enum.TextXAlignment.Left
-                        label:SetAttribute("ThemeLocked", true)
-                        label.Parent = statsContainer
-                        variantLabels[key] = label
-                    end
-                    label.Text = text
-                end
-            end
-            for key, label in pairs(variantLabels) do
-                local base = key
-                local rb = variantCounts[base] or 0
-                local gd = variantCounts[base .. "Golden"] or 0
-                local sh = variantCounts[base .. "Shiny"] or 0
-                if rb == 0 and gd == 0 and sh == 0 then
-                    label:Destroy()
-                    variantLabels[key] = nil
-                end
-            end
-        end
         if afkSessionActive then
             updateAfkSessionLabels()
         end
@@ -1843,7 +2029,7 @@ task.spawn(function()
         overlay.Position = UDim2.new(0, 0, 0, 0)
         overlay.BackgroundColor3 = Color3.fromRGB(5, 6, 10)
         overlay.BorderSizePixel = 0
-        overlay.Visible = true
+        overlay.Visible = false
         overlay.ZIndex = 100
         overlay.Parent = afkGui
 
@@ -1883,7 +2069,7 @@ task.spawn(function()
 
         local center = Instance.new("Frame")
         center.Name = "Center"
-        center.Size = UDim2.new(0.94, 0, 0.92, 0)
+        center.Size = UDim2.new(0.96, 0, 0.94, 0)
         center.AnchorPoint = Vector2.new(0.5, 0.5)
         center.Position = UDim2.new(0.5, 0, 0.5, 0)
         center.BackgroundTransparency = 1
@@ -1893,7 +2079,7 @@ task.spawn(function()
         -- HEADER -----------------------------------------------------------
         local header = Instance.new("Frame")
         header.Name = "Header"
-        header.Size = UDim2.new(1, 0, 0.14, 0)
+        header.Size = UDim2.new(1, 0, 0.16, 0)
         header.BackgroundTransparency = 1
         header.ZIndex = 102
         header.Parent = center
@@ -1920,7 +2106,11 @@ task.spawn(function()
 
         local pill = Instance.new("Frame")
         pill.Name = "StatusPill"
-        pill.Size = UDim2.new(0, 236, 0, 26)
+        pill.Size = UDim2.new(0.58, 0, 0, 26)
+        local pillSizeLimit = Instance.new("UISizeConstraint")
+        pillSizeLimit.MinSize = Vector2.new(180, 26)
+        pillSizeLimit.MaxSize = Vector2.new(236, 26)
+        pillSizeLimit.Parent = pill
         pill.AnchorPoint = Vector2.new(0.5, 0)
         pill.Position = UDim2.new(0.5, 0, 0.66, 0)
         pill.BackgroundColor3 = Color3.fromRGB(14, 24, 22)
@@ -1928,15 +2118,19 @@ task.spawn(function()
         pill.ZIndex = 103
         pill.Parent = header
 
-        local pillCorner = Instance.new("UICorner")
-        pillCorner.CornerRadius = UDim.new(1, 0)
-        pillCorner.Parent = pill
+        do
+            local pillCorner = Instance.new("UICorner")
+            pillCorner.CornerRadius = UDim.new(1, 0)
+            pillCorner.Parent = pill
+        end
 
-        local pillStroke = Instance.new("UIStroke")
-        pillStroke.Color = Style.green
-        pillStroke.Thickness = 1
-        pillStroke.Transparency = 0.55
-        pillStroke.Parent = pill
+        do
+            local pillStroke = Instance.new("UIStroke")
+            pillStroke.Color = Style.green
+            pillStroke.Thickness = 1
+            pillStroke.Transparency = 0.55
+            pillStroke.Parent = pill
+        end
 
         local dot = Instance.new("Frame")
         dot.Size = UDim2.new(0, 7, 0, 7)
@@ -1946,21 +2140,25 @@ task.spawn(function()
         dot.ZIndex = 104
         dot.Parent = pill
 
-        local dotCorner = Instance.new("UICorner")
-        dotCorner.CornerRadius = UDim.new(1, 0)
-        dotCorner.Parent = dot
+        do
+            local dotCorner = Instance.new("UICorner")
+            dotCorner.CornerRadius = UDim.new(1, 0)
+            dotCorner.Parent = dot
+        end
 
-        local pillText = Instance.new("TextLabel")
-        pillText.Size = UDim2.new(1, -28, 1, 0)
-        pillText.Position = UDim2.new(0, 26, 0, 0)
-        pillText.BackgroundTransparency = 1
-        pillText.Text = "LIVE  ·  PET DIMENSIONS HUB"
-        pillText.TextColor3 = Style.green
-        pillText.Font = Enum.Font.GothamBold
-        pillText.TextSize = 11
-        pillText.TextXAlignment = Enum.TextXAlignment.Left
-        pillText.ZIndex = 104
-        pillText.Parent = pill
+        do
+            local pillText = Instance.new("TextLabel")
+            pillText.Size = UDim2.new(1, -28, 1, 0)
+            pillText.Position = UDim2.new(0, 26, 0, 0)
+            pillText.BackgroundTransparency = 1
+            pillText.Text = "LIVE  ·  PET DIMENSIONS HUB"
+            pillText.TextColor3 = Style.green
+            pillText.Font = Enum.Font.GothamBold
+            pillText.TextSize = 11
+            pillText.TextXAlignment = Enum.TextXAlignment.Left
+            pillText.ZIndex = 104
+            pillText.Parent = pill
+        end
 
         task.spawn(function()
             local tweenService = game:GetService("TweenService")
@@ -1977,8 +2175,8 @@ task.spawn(function()
         -- SESSION STATS ----------------------------------------------------
         local statsRow = Instance.new("Frame")
         statsRow.Name = "SessionStats"
-        statsRow.Size = UDim2.new(1, 0, 0.11, 0)
-        statsRow.Position = UDim2.new(0, 0, 0.15, 0)
+        statsRow.Size = UDim2.new(1, 0, 0, 62)
+        statsRow.Position = UDim2.new(0, 0, 0.17, 0)
         statsRow.BackgroundTransparency = 1
         statsRow.ZIndex = 102
         statsRow.Parent = center
@@ -2002,21 +2200,23 @@ task.spawn(function()
             cardStroke.Transparency = 0.45
             cardStroke.Parent = card
 
-            local captionLabel = Instance.new("TextLabel")
-            captionLabel.Size = UDim2.new(1, -24, 0, 14)
-            captionLabel.Position = UDim2.new(0, 12, 0, 9)
-            captionLabel.BackgroundTransparency = 1
-            captionLabel.Text = caption
-            captionLabel.TextColor3 = Style.muted
-            captionLabel.Font = Enum.Font.GothamBold
-            captionLabel.TextSize = 11
-            captionLabel.TextXAlignment = Enum.TextXAlignment.Left
-            captionLabel.ZIndex = 104
-            captionLabel.Parent = card
+            do
+                local captionLabel = Instance.new("TextLabel")
+                captionLabel.Size = UDim2.new(1, -24, 0, 14)
+                captionLabel.Position = UDim2.new(0, 12, 0, 9)
+                captionLabel.BackgroundTransparency = 1
+                captionLabel.Text = caption
+                captionLabel.TextColor3 = Style.muted
+                captionLabel.Font = Enum.Font.GothamBold
+                captionLabel.TextSize = 10
+                captionLabel.TextXAlignment = Enum.TextXAlignment.Left
+                captionLabel.ZIndex = 104
+                captionLabel.Parent = card
+            end
 
             local valueLabel = Instance.new("TextLabel")
-            valueLabel.Size = UDim2.new(1, -24, 0, 28)
-            valueLabel.Position = UDim2.new(0, 12, 0, 23)
+            valueLabel.Size = UDim2.new(1, -24, 0, 26)
+            valueLabel.Position = UDim2.new(0, 12, 0, 24)
             valueLabel.BackgroundTransparency = 1
             valueLabel.Text = value
             valueLabel.TextColor3 = valueColor
@@ -2024,10 +2224,6 @@ task.spawn(function()
             valueLabel.TextScaled = true
             valueLabel.TextXAlignment = Enum.TextXAlignment.Left
             valueLabel.TextYAlignment = Enum.TextYAlignment.Center
-            local valueLimit = Instance.new("UITextSizeConstraint")
-            valueLimit.MinTextSize = 20
-            valueLimit.MaxTextSize = 30
-            valueLimit.Parent = valueLabel
             valueLabel.ZIndex = 104
             valueLabel.Parent = card
 
@@ -2038,73 +2234,75 @@ task.spawn(function()
         local statEggs = makeStat(2, "HATCHED THIS SESSION", "+0", Style.green)
         local statRares = makeStat(3, "RARES THIS SESSION", "+0", Style.violet)
 
--- Large lifetime totals in a dedicated, high-contrast row. Each card has
--- a clear title and a separate oversized number for quick readability.
-local function makeLifetimeStat(name, caption, color, xScale)
+-- Legacy labels the leaderstat hooks still write to. Now visible on the AFK screen.
+local totalStatsRow = Instance.new("Frame")
+totalStatsRow.Name = "TotalStatsRow"
+totalStatsRow.Size = UDim2.new(1, 0, 0, 60)
+totalStatsRow.AnchorPoint = Vector2.new(0, 0)
+totalStatsRow.Position = UDim2.new(0, 0, 0.265, 0)
+totalStatsRow.BackgroundTransparency = 1
+totalStatsRow.ZIndex = 103
+totalStatsRow.Parent = center
+
+local function makeTotalStat(caption, value, valueColor, isRight)
     local card = Instance.new("Frame")
-    card.Name = name .. "Card"
-    card.Size = UDim2.new(0.49, 0, 0.13, 0)
-    card.Position = UDim2.new(xScale, 0, 0.285, 0)
-    card.BackgroundColor3 = Color3.fromRGB(12, 16, 25)
-    card.BackgroundTransparency = 0.02
+    card.Size = UDim2.new(0.5, -8, 1, 0)
+    card.Position = isRight and UDim2.new(0.5, 4, 0, 0) or UDim2.new(0, 0, 0, 0)
+    card.BackgroundColor3 = Style.surfaceAlt
+    card.BackgroundTransparency = 0.1
     card.BorderSizePixel = 0
     card.ZIndex = 104
-    card.Parent = center
+    card.Parent = totalStatsRow
 
-    local corner = Instance.new("UICorner")
-    corner.CornerRadius = UDim.new(0, 16)
-    corner.Parent = card
+    local cardCorner = Instance.new("UICorner")
+    cardCorner.CornerRadius = UDim.new(0, 12)
+    cardCorner.Parent = card
 
-    local stroke = Instance.new("UIStroke")
-    stroke.Color = color
-    stroke.Thickness = 2
-    stroke.Transparency = 0.05
-    stroke.Parent = card
+    local cardStroke = Instance.new("UIStroke")
+    cardStroke.Color = Style.line
+    cardStroke.Transparency = 0.45
+    cardStroke.Parent = card
 
     local captionLabel = Instance.new("TextLabel")
-    captionLabel.Name = name .. "Caption"
-    captionLabel.Size = UDim2.new(1, -24, 0, 18)
-    captionLabel.Position = UDim2.new(0, 12, 0, 10)
+    captionLabel.Size = UDim2.new(1, -20, 0, 14)
+    captionLabel.Position = UDim2.new(0, 10, 0, 8)
     captionLabel.BackgroundTransparency = 1
     captionLabel.Text = caption
-    captionLabel.TextColor3 = color
-    captionLabel.Font = Enum.Font.GothamBlack
-    captionLabel.TextSize = 12
-    captionLabel.TextXAlignment = Enum.TextXAlignment.Center
+    captionLabel.TextColor3 = Style.muted
+    captionLabel.Font = Enum.Font.GothamBold
+    captionLabel.TextSize = 10
+    captionLabel.TextXAlignment = Enum.TextXAlignment.Left
     captionLabel.ZIndex = 105
     captionLabel.Parent = card
 
     local valueLabel = Instance.new("TextLabel")
-    valueLabel.Name = name .. "Value"
-    valueLabel.Size = UDim2.new(1, -24, 0, 44)
-    valueLabel.Position = UDim2.new(0, 12, 0, 31)
+    valueLabel.Size = UDim2.new(1, -20, 0, 28)
+    valueLabel.Position = UDim2.new(0, 10, 0, 22)
     valueLabel.BackgroundTransparency = 1
-    valueLabel.Text = "0"
-    valueLabel.TextColor3 = Color3.fromRGB(255, 255, 255)
+    valueLabel.Text = value
+    valueLabel.TextColor3 = valueColor
     valueLabel.Font = Enum.Font.GothamBlack
-    valueLabel.TextSize = 34
     valueLabel.TextScaled = true
-    valueLabel.TextXAlignment = Enum.TextXAlignment.Center
+    valueLabel.TextXAlignment = Enum.TextXAlignment.Left
     valueLabel.TextYAlignment = Enum.TextYAlignment.Center
     valueLabel.ZIndex = 105
     valueLabel.Parent = card
 
-    local sizeLimit = Instance.new("UITextSizeConstraint")
-    sizeLimit.MinTextSize = 24
-    sizeLimit.MaxTextSize = 36
-    sizeLimit.Parent = valueLabel
     return valueLabel
 end
 
-local eggsLegacy = makeLifetimeStat("AfkEggs", "TOTAL EGGS HATCHED", Color3.fromRGB(95, 245, 135), 0)
-local gemsLegacy = makeLifetimeStat("AfkGems", "TOTAL DIAMONDS", Color3.fromRGB(105, 190, 255), 0.51)
+local eggsLegacy = makeTotalStat("TOTAL EGGS", "0", Color3.fromRGB(80, 230, 80), false)
+eggsLegacy.Name = "AfkEggsLabel"
+
+local gemsLegacy = makeTotalStat("TOTAL DIAMONDS", "0", Color3.fromRGB(110, 185, 255), true)
+gemsLegacy.Name = "AfkGemsLabel"
 
         -- EXIT -------------------------------------------------------------
         local exitButton = Instance.new("TextButton")
         exitButton.Name = "ExitAFK"
-        exitButton.Size = UDim2.new(0, 380, 0, 52)
-        exitButton.AnchorPoint = Vector2.new(0.5, 0.5)
-        exitButton.Position = UDim2.new(0.5, 0, 0.965, 0)
+        exitButton.Size = UDim2.new(0.6, 0, 0, 48)
+        exitButton.AnchorPoint = Vector2.new(0.5, 1)
+        exitButton.Position = UDim2.new(0.5, 0, 0.985, 0)
         exitButton.BackgroundColor3 = Color3.fromRGB(38, 20, 26)
         exitButton.Text = "TURN OFF AFK MODE"
         exitButton.TextColor3 = Color3.fromRGB(255, 220, 225)
@@ -2113,14 +2311,18 @@ local gemsLegacy = makeLifetimeStat("AfkGems", "TOTAL DIAMONDS", Color3.fromRGB(
         exitButton.ZIndex = 103
         exitButton.Parent = center
 
-        local exitConstraint = Instance.new("UISizeConstraint")
-        exitConstraint.MaxSize = Vector2.new(420, 56)
-        exitConstraint.MinSize = Vector2.new(220, 44)
-        exitConstraint.Parent = exitButton
+        do
+            local exitConstraint = Instance.new("UISizeConstraint")
+            exitConstraint.MaxSize = Vector2.new(420, 56)
+            exitConstraint.MinSize = Vector2.new(220, 44)
+            exitConstraint.Parent = exitButton
+        end
 
-        local exitCorner = Instance.new("UICorner")
-        exitCorner.CornerRadius = UDim.new(0, 14)
-        exitCorner.Parent = exitButton
+        do
+            local exitCorner = Instance.new("UICorner")
+            exitCorner.CornerRadius = UDim.new(0, 14)
+            exitCorner.Parent = exitButton
+        end
 
         local exitStroke = Instance.new("UIStroke")
         exitStroke.Color = Color3.fromRGB(255, 92, 110)
@@ -2205,9 +2407,11 @@ local gemsLegacy = makeLifetimeStat("AfkGems", "TOTAL DIAMONDS", Color3.fromRGB(
         end
     end)
 
-    local autoHatchCorner = Instance.new("UICorner")
-    autoHatchCorner.CornerRadius = UDim.new(0, 18)
-    autoHatchCorner.Parent = autoHatchMain
+    do
+        local autoHatchCorner = Instance.new("UICorner")
+        autoHatchCorner.CornerRadius = UDim.new(0, 18)
+        autoHatchCorner.Parent = autoHatchMain
+    end
 
     local autoHatchShadow = Instance.new("UIStroke")
     autoHatchShadow.Color = Color3.fromRGB(60, 140, 220)
@@ -2228,9 +2432,11 @@ local gemsLegacy = makeLifetimeStat("AfkGems", "TOTAL DIAMONDS", Color3.fromRGB(
         halo.ZIndex = 0
         halo.Parent = autoHatchMain
 
-        local haloCorner = Instance.new("UICorner")
-        haloCorner.CornerRadius = UDim.new(0, 22)
-        haloCorner.Parent = halo
+        do
+            local haloCorner = Instance.new("UICorner")
+            haloCorner.CornerRadius = UDim.new(0, 22)
+            haloCorner.Parent = halo
+        end
 
         local headerGlow = Instance.new("Frame")
         headerGlow.Name = "HeaderGlow"
@@ -2274,16 +2480,18 @@ local gemsLegacy = makeLifetimeStat("AfkGems", "TOTAL DIAMONDS", Color3.fromRGB(
         accentCorner.CornerRadius = UDim.new(1, 0)
         accentCorner.Parent = accent
 
-        local autoSubtitle = Instance.new("TextLabel")
-        autoSubtitle.Size = UDim2.new(1, -64, 0, 16)
-        autoSubtitle.Position = UDim2.new(0, 30, 0, 44)
-        autoSubtitle.Text = "HATCH  ·  FARM  ·  DAYCARE  ·  TELEPORT"
-        autoSubtitle.TextColor3 = Color3.fromRGB(125, 135, 160)
-        autoSubtitle.Font = Enum.Font.Gotham
-        autoSubtitle.TextSize = 11
-        autoSubtitle.BackgroundTransparency = 1
-        autoSubtitle.TextXAlignment = Enum.TextXAlignment.Left
-        autoSubtitle.Parent = autoHatchMain
+        do
+            local autoSubtitle = Instance.new("TextLabel")
+            autoSubtitle.Size = UDim2.new(1, -64, 0, 16)
+            autoSubtitle.Position = UDim2.new(0, 30, 0, 44)
+            autoSubtitle.Text = "HATCH  ·  FARM  ·  DAYCARE  ·  TELEPORT"
+            autoSubtitle.TextColor3 = Color3.fromRGB(125, 135, 160)
+            autoSubtitle.Font = Enum.Font.Gotham
+            autoSubtitle.TextSize = 11
+            autoSubtitle.BackgroundTransparency = 1
+            autoSubtitle.TextXAlignment = Enum.TextXAlignment.Left
+            autoSubtitle.Parent = autoHatchMain
+        end
 
         local titleDivider = Instance.new("Frame")
         titleDivider.Name = "TitleDivider"
@@ -2309,7 +2517,7 @@ local gemsLegacy = makeLifetimeStat("AfkGems", "TOTAL DIAMONDS", Color3.fromRGB(
     tabBar.BackgroundTransparency = 1
     tabBar.Parent = autoHatchMain
 
-    local TAB_TOTAL = { count = 7 }
+    local TAB_TOTAL = { count = 8 }
     local function createTabButton(text, index)
         local btn = Instance.new("TextButton")
         btn.Size = UDim2.new(1 / TAB_TOTAL.count, -7, 1, 0)
@@ -2319,7 +2527,9 @@ local gemsLegacy = makeLifetimeStat("AfkGems", "TOTAL DIAMONDS", Color3.fromRGB(
         btn.BackgroundColor3 = Color3.fromRGB(32, 32, 42)
         btn.TextColor3 = Color3.fromRGB(160, 171, 193)
         btn.Font = Enum.Font.GothamBold
-        btn.TextSize = 12
+        btn.TextSize = 10
+        btn.TextTruncate = Enum.TextTruncate.AtEnd
+        btn.AutoButtonColor = false
         btn.Parent = tabBar
 
         local corner = Instance.new("UICorner")
@@ -2344,9 +2554,11 @@ local gemsLegacy = makeLifetimeStat("AfkGems", "TOTAL DIAMONDS", Color3.fromRGB(
         underline.ZIndex = 2
         underline.Parent = btn
 
-        local underlineCorner = Instance.new("UICorner")
-        underlineCorner.CornerRadius = UDim.new(1, 0)
-        underlineCorner.Parent = underline
+        do
+            local underlineCorner = Instance.new("UICorner")
+            underlineCorner.CornerRadius = UDim.new(1, 0)
+            underlineCorner.Parent = underline
+        end
 
         return btn
     end
@@ -2358,6 +2570,7 @@ local gemsLegacy = makeLifetimeStat("AfkGems", "TOTAL DIAMONDS", Color3.fromRGB(
     local farmTab = createTabButton("Farm", 5)
 TAB_TOTAL.tab = createTabButton("Daycare", 6)
 TAB_TOTAL.indexUI = { tab = createTabButton("Index", 7) }
+TAB_TOTAL.luckyWorld = createTabButton("Lucky World", 8)
 
     local hatchFrame = Instance.new("ScrollingFrame")
     hatchFrame.Size = UDim2.new(1, -40, 1, -136)
@@ -2488,6 +2701,14 @@ TAB_TOTAL.indexUI = { tab = createTabButton("Index", 7) }
 TAB_TOTAL.indexUI.padding = Instance.new("UIPadding")
 TAB_TOTAL.indexUI.padding.PaddingBottom = UDim.new(0, 12)
 TAB_TOTAL.indexUI.padding.Parent = TAB_TOTAL.indexUI.list
+
+TAB_TOTAL.luckyWorldFrame = Instance.new("Frame")
+TAB_TOTAL.luckyWorldFrame.Name = "LuckyWorldFrame"
+TAB_TOTAL.luckyWorldFrame.Size = UDim2.new(1, -40, 1, -136)
+TAB_TOTAL.luckyWorldFrame.Position = UDim2.new(0, 20, 0, 128)
+TAB_TOTAL.luckyWorldFrame.BackgroundTransparency = 1
+TAB_TOTAL.luckyWorldFrame.Visible = false
+TAB_TOTAL.luckyWorldFrame.Parent = autoHatchMain
 
 TAB_TOTAL.frame = Instance.new("ScrollingFrame")
     TAB_TOTAL.frame.Name = "DaycareScroll"
@@ -2782,7 +3003,7 @@ TAB_TOTAL.frame = Instance.new("ScrollingFrame")
             end
         end
 
-        for _, btn in ipairs({hatchTab, tpTab, settingsTab, eggTab, farmTab, TAB_TOTAL.tab, TAB_TOTAL.indexUI.tab}) do
+        for _, btn in ipairs({hatchTab, tpTab, settingsTab, eggTab, farmTab, TAB_TOTAL.tab, TAB_TOTAL.indexUI.tab, TAB_TOTAL.luckyWorld}) do
             local tabStroke = btn:FindFirstChildOfClass("UIStroke")
             local isActive = (btn == currentTabBtn)
             btn:SetAttribute("TabActive", isActive)
@@ -2847,8 +3068,9 @@ TAB_TOTAL.frame = Instance.new("ScrollingFrame")
     farmFrame.Visible = false
     TAB_TOTAL.frame.Visible = false
     TAB_TOTAL.indexUI.frame.Visible = false
+    TAB_TOTAL.luckyWorldFrame.Visible = false
 
-    for _, btn in ipairs({hatchTab, tpTab, settingsTab, eggTab, farmTab, TAB_TOTAL.tab, TAB_TOTAL.indexUI.tab}) do
+    for _, btn in ipairs({hatchTab, tpTab, settingsTab, eggTab, farmTab, TAB_TOTAL.tab, TAB_TOTAL.indexUI.tab, TAB_TOTAL.luckyWorld}) do
             local tabStroke = btn:FindFirstChildOfClass("UIStroke")
             btn:SetAttribute("TabActive", false)
             btn.BackgroundColor3 = activeTheme.surface
@@ -2882,7 +3104,7 @@ TAB_TOTAL.frame = Instance.new("ScrollingFrame")
 
     -- Tab hover: lifts the fill toward the accent without touching the active
     -- tab. Defined here because it needs activeTheme in scope.
-    for _, btn in ipairs({hatchTab, tpTab, settingsTab, eggTab, farmTab, TAB_TOTAL.tab, TAB_TOTAL.indexUI.tab}) do
+    for _, btn in ipairs({hatchTab, tpTab, settingsTab, eggTab, farmTab, TAB_TOTAL.tab, TAB_TOTAL.indexUI.tab, TAB_TOTAL.luckyWorld}) do
         local tabStroke = btn:FindFirstChildOfClass("UIStroke")
         btn.MouseEnter:Connect(function()
             if btn:GetAttribute("TabActive") then return end
@@ -2903,6 +3125,7 @@ TAB_TOTAL.frame = Instance.new("ScrollingFrame")
     farmTab.MouseButton1Click:Connect(function() switchTab(farmTab, farmFrame) end)
     TAB_TOTAL.tab.MouseButton1Click:Connect(function() switchTab(TAB_TOTAL.tab, TAB_TOTAL.frame) end)
 TAB_TOTAL.indexUI.tab.MouseButton1Click:Connect(function() switchTab(TAB_TOTAL.indexUI.tab, TAB_TOTAL.indexUI.frame) end)
+TAB_TOTAL.luckyWorld.MouseButton1Click:Connect(function() switchTab(TAB_TOTAL.luckyWorld, TAB_TOTAL.luckyWorldFrame) end)
 
 switchTab(hatchTab, hatchFrame)
 
@@ -2921,15 +3144,19 @@ switchTab(hatchTab, hatchFrame)
         btn.TextSize = 13
         btn.Parent = parent
 
-        local btnCorner = Instance.new("UICorner")
-        btnCorner.CornerRadius = UDim.new(0, 6)
-        btnCorner.Parent = btn
+        do
+            local btnCorner = Instance.new("UICorner")
+            btnCorner.CornerRadius = UDim.new(0, 6)
+            btnCorner.Parent = btn
+        end
 
-        local btnStroke = Instance.new("UIStroke")
-        btnStroke.Color = activeTheme.stroke
-        btnStroke.Thickness = 1
-        btnStroke.Transparency = 0.7
-        btnStroke.Parent = btn
+        do
+            local btnStroke = Instance.new("UIStroke")
+            btnStroke.Color = activeTheme.stroke
+            btnStroke.Thickness = 1
+            btnStroke.Transparency = 0.7
+            btnStroke.Parent = btn
+        end
 
         -- Toggles that must never come back ON from the saved config. AFK opens the
         -- full-screen overlay and hides the hub, so restoring it made every
@@ -2947,6 +3174,13 @@ switchTab(hatchTab, hatchFrame)
         end
         btn:SetAttribute("ToggleState", state)
         toggleCallbacks[text] = callback
+
+        -- A restored toggle used to show ON without actually running, so the
+        -- feature looked enabled until it was clicked twice. Replay the
+        -- callback once for restored settings (AFK Mode is excluded above).
+        if state and not NEVER_RESTORE[text] then
+            pcall(callback, true)
+        end
 
         local hovered = false
 
@@ -2997,16 +3231,18 @@ switchTab(hatchTab, hatchFrame)
     -- =====================================================================
     -- AUTO FARM TAB UI
     -- =====================================================================
-    local farmTitle = Instance.new("TextLabel")
-    farmTitle.Size = UDim2.new(1, 0, 0, 24)
-    farmTitle.Position = UDim2.new(0, 0, 0, 0)
-    farmTitle.BackgroundTransparency = 1
-    farmTitle.Text = "AUTO FARM CONTROLS"
-    farmTitle.TextColor3 = Color3.fromRGB(255, 255, 255)
-    farmTitle.Font = Enum.Font.GothamBold
-    farmTitle.TextSize = 14
-    farmTitle.TextXAlignment = Enum.TextXAlignment.Left
-    farmTitle.Parent = farmFrame
+    do
+        local farmTitle = Instance.new("TextLabel")
+        farmTitle.Size = UDim2.new(1, 0, 0, 24)
+        farmTitle.Position = UDim2.new(0, 0, 0, 0)
+        farmTitle.BackgroundTransparency = 1
+        farmTitle.Text = "AUTO FARM CONTROLS"
+        farmTitle.TextColor3 = Color3.fromRGB(255, 255, 255)
+        farmTitle.Font = Enum.Font.GothamBold
+        farmTitle.TextSize = 14
+        farmTitle.TextXAlignment = Enum.TextXAlignment.Left
+        farmTitle.Parent = farmFrame
+    end
 
     createUnifiedToggle(farmFrame, 32, "Robot Farm", false, function(state) AutoFarmRobot = state end)
     -- shared status-bar and damage branches still read it.
@@ -3058,16 +3294,18 @@ switchTab(hatchTab, hatchFrame)
         AntiAFK = state
     end)
 
-    local antiAfkLabel = Instance.new("TextLabel")
-    antiAfkLabel.Size = UDim2.new(0.58, 0, 0, 28)
-    antiAfkLabel.Position = UDim2.new(0, 0, 0, 452)
-    antiAfkLabel.BackgroundTransparency = 1
-    antiAfkLabel.Text = "Anti AFK interval (minutes)"
-    antiAfkLabel.TextColor3 = Color3.fromRGB(190, 190, 200)
-    antiAfkLabel.Font = Enum.Font.GothamBold
-    antiAfkLabel.TextSize = 12
-    antiAfkLabel.TextXAlignment = Enum.TextXAlignment.Left
-    antiAfkLabel.Parent = farmFrame
+    do
+        local antiAfkLabel = Instance.new("TextLabel")
+        antiAfkLabel.Size = UDim2.new(0.58, 0, 0, 28)
+        antiAfkLabel.Position = UDim2.new(0, 0, 0, 452)
+        antiAfkLabel.BackgroundTransparency = 1
+        antiAfkLabel.Text = "Anti AFK interval (minutes)"
+        antiAfkLabel.TextColor3 = Color3.fromRGB(190, 190, 200)
+        antiAfkLabel.Font = Enum.Font.GothamBold
+        antiAfkLabel.TextSize = 12
+        antiAfkLabel.TextXAlignment = Enum.TextXAlignment.Left
+        antiAfkLabel.Parent = farmFrame
+    end
 
     local antiAfkBox = Instance.new("TextBox")
     antiAfkBox.Size = UDim2.new(0.32, 0, 0, 28)
@@ -3084,9 +3322,11 @@ switchTab(hatchTab, hatchFrame)
     antiAfkBox.TextSize = 12
     antiAfkBox.Parent = farmFrame
 
-    local antiAfkCorner = Instance.new("UICorner")
-    antiAfkCorner.CornerRadius = UDim.new(0, 6)
-    antiAfkCorner.Parent = antiAfkBox
+    do
+        local antiAfkCorner = Instance.new("UICorner")
+        antiAfkCorner.CornerRadius = UDim.new(0, 6)
+        antiAfkCorner.Parent = antiAfkBox
+    end
 
     antiAfkBox.FocusLost:Connect(function()
         local value = tonumber(antiAfkBox.Text)
@@ -3145,6 +3385,328 @@ switchTab(hatchTab, hatchFrame)
                 farmStatus.TextColor3 = Color3.fromRGB(150, 150, 150)
             end
             task.wait(0.5)
+        end
+    end)
+
+    -- =====================================================================
+    -- LUCKY WORLD TAB
+    -- Tile upgrades, boost machine, lucky panel upgrades and boss attacks.
+    -- =====================================================================
+    local AutoTileUpgrade = false
+    local AutoBoostMachine = false
+    local AutoLuckyUpgrades = false
+    local AutoBossAttack = false
+
+    do
+        local luckyTitle = Instance.new("TextLabel")
+        luckyTitle.Size = UDim2.new(1, 0, 0, 24)
+        luckyTitle.Position = UDim2.new(0, 0, 0, 0)
+        luckyTitle.BackgroundTransparency = 1
+        luckyTitle.Text = "LUCKY WORLD"
+        luckyTitle.TextColor3 = Color3.fromRGB(255, 210, 80)
+        luckyTitle.Font = Enum.Font.GothamBold
+        luckyTitle.TextSize = 14
+        luckyTitle.TextXAlignment = Enum.TextXAlignment.Left
+        luckyTitle.Parent = TAB_TOTAL.luckyWorldFrame
+    end
+
+    do
+        local luckySub = Instance.new("TextLabel")
+        luckySub.Size = UDim2.new(1, 0, 0, 40)
+        luckySub.Position = UDim2.new(0, 0, 0, 26)
+        luckySub.BackgroundTransparency = 1
+        luckySub.Text = "Upgrade the tile you land on, keep the boost machine topped up, buy lucky upgrades and send pets at the Lucky Block Boss."
+        luckySub.TextColor3 = Color3.fromRGB(190, 190, 200)
+        luckySub.Font = Enum.Font.Gotham
+        luckySub.TextSize = 11
+        luckySub.TextWrapped = true
+        luckySub.TextXAlignment = Enum.TextXAlignment.Left
+        luckySub.Parent = TAB_TOTAL.luckyWorldFrame
+    end
+
+    local tileToggle = createUnifiedToggle(TAB_TOTAL.luckyWorldFrame, 70, "Auto Tile Upgrade", false, function(state)
+        AutoTileUpgrade = state
+    end)
+
+    local boostToggle = createUnifiedToggle(TAB_TOTAL.luckyWorldFrame, 110, "Auto Boost Machine", false, function(state)
+        AutoBoostMachine = state
+    end)
+
+    local panelToggle = createUnifiedToggle(TAB_TOTAL.luckyWorldFrame, 150, "Auto Lucky Upgrades", false, function(state)
+        AutoLuckyUpgrades = state
+    end)
+
+    local bossToggle = createUnifiedToggle(TAB_TOTAL.luckyWorldFrame, 190, "Auto Boss Attack (1 by 1)", false, function(state)
+        AutoBossAttack = state
+    end)
+
+    -- createUnifiedToggle restores the saved look without replaying the
+    -- callback, so pull the runtime flags back out of the buttons once.
+    AutoTileUpgrade = tileToggle:GetAttribute("ToggleState") == true
+    AutoBoostMachine = boostToggle:GetAttribute("ToggleState") == true
+    AutoLuckyUpgrades = panelToggle:GetAttribute("ToggleState") == true
+    AutoBossAttack = bossToggle:GetAttribute("ToggleState") == true
+
+    local luckyStatus = Instance.new("TextLabel")
+    luckyStatus.Size = UDim2.new(1, 0, 0, 24)
+    luckyStatus.Position = UDim2.new(0, 0, 0, 234)
+    luckyStatus.BackgroundTransparency = 1
+    luckyStatus.Text = "Status: Idle"
+    luckyStatus.TextColor3 = Color3.fromRGB(180, 180, 180)
+    luckyStatus.Font = Enum.Font.GothamBold
+    luckyStatus.TextSize = 12
+    luckyStatus.TextXAlignment = Enum.TextXAlignment.Left
+    luckyStatus.Parent = TAB_TOTAL.luckyWorldFrame
+
+    local luckyDetail = Instance.new("TextLabel")
+    luckyDetail.Size = UDim2.new(1, 0, 0, 22)
+    luckyDetail.Position = UDim2.new(0, 0, 0, 260)
+    luckyDetail.BackgroundTransparency = 1
+    luckyDetail.Text = "Tile upgrades cost Breakout Bucks - boosts cost Lucky Coins."
+    luckyDetail.TextColor3 = Color3.fromRGB(150, 160, 180)
+    luckyDetail.Font = Enum.Font.Gotham
+    luckyDetail.TextSize = 11
+    luckyDetail.TextXAlignment = Enum.TextXAlignment.Left
+    luckyDetail.Parent = TAB_TOTAL.luckyWorldFrame
+
+    -- Lucky World automation logic ----------------------------------------
+    local LuckyBoardData = Library.Shared and Library.Shared.LuckyBoard
+    local LuckyWorldData = Library.Shared and Library.Shared.LuckyWorld
+
+    local function readCurrency(key)
+        local ok, save = pcall(function() return Library.Save.Get() end)
+        if ok and type(save) == "table" then
+            return tonumber(save[key])
+        end
+        return nil
+    end
+
+    local function getLuckyInfo()
+        if not RawNet.invoke then return nil end
+        local ok, success, info = RawNet.invoke("Lucky World: Info")
+        if ok and success and type(info) == "table" then
+            return info
+        end
+        return nil
+    end
+
+    local function getBoardState()
+        if not RawNet.invoke then return nil end
+        local ok, success, state = RawNet.invoke("Lucky Board: Get")
+        if ok and success and type(state) == "table" then
+            return state
+        end
+        return nil
+    end
+
+    local function tileMaxTier(tileIndex)
+        if not (LuckyBoardData and LuckyBoardData.Layout and LuckyBoardData.Types) then
+            return 1
+        end
+        local typeName = LuckyBoardData.Layout[tileIndex]
+        local def = typeName and LuckyBoardData.Types[typeName]
+        return def and def.Tiers and #def.Tiers or 1
+    end
+
+    local function getLuckyBossCoin()
+        local attr
+        local ok = pcall(function() attr = ReplicatedStorage:GetAttribute("LuckyBossBlock") end)
+        if not ok or type(attr) ~= "string" or attr == "" then return nil end
+
+        local ok2, data = pcall(function() return HttpService:JSONDecode(attr) end)
+        if not ok2 or type(data) ~= "table" or data.id == nil then return nil end
+
+        local things = Workspace:FindFirstChild("__THINGS")
+        local coins = things and things:FindFirstChild("Coins")
+        local coin = coins and coins:FindFirstChild(tostring(data.id))
+        if coin and coin.Parent then
+            return coin
+        end
+        return nil
+    end
+
+    -- Tile: upgrade once per new tile the player lands on.
+    task.spawn(function()
+        local lastTile = nil
+        while TAB_TOTAL.luckyWorldFrame.Parent do
+            if AutoTileUpgrade and RawNet.invoke then
+                local state = getBoardState()
+                local tile = state and tonumber(state.t)
+                if tile and tile > 0 then
+                    local tier = tonumber(state.u and state.u[tostring(tile)]) or 0
+                    local maxTier = tileMaxTier(tile)
+
+                    if lastTile ~= tile then
+                        lastTile = tile
+
+                        if tier >= maxTier then
+                            luckyStatus.Text = ("Status: Tile %d is already maxed"):format(tile)
+                            luckyStatus.TextColor3 = Color3.fromRGB(160, 170, 190)
+                        else
+                            local ok, success, err = RawNet.invoke("Lucky Board: Upgrade", tile, tier + 1)
+                            if ok and success then
+                                luckyStatus.Text = ("Status: Tile %d upgraded to tier %d"):format(tile, tier + 1)
+                                luckyStatus.TextColor3 = Color3.fromRGB(120, 230, 140)
+                            elseif ok and type(err) == "string" and err:find("Breakout Bucks") then
+                                luckyStatus.Text = ("Status: Tile %d needs more Breakout Bucks"):format(tile)
+                                luckyStatus.TextColor3 = Color3.fromRGB(255, 190, 90)
+                            else
+                                luckyStatus.Text = ("Status: Tile %d upgrade rejected"):format(tile)
+                                luckyStatus.TextColor3 = Color3.fromRGB(255, 130, 130)
+                            end
+                        end
+                    end
+                end
+                task.wait(0.5)
+            else
+                lastTile = nil
+                task.wait(0.7)
+            end
+        end
+    end)
+
+    -- Boost machine: fill each rarity to MaxSeconds using the exact amount
+    -- the game's own purchase button would spend.
+    task.spawn(function()
+        while TAB_TOTAL.luckyWorldFrame.Parent do
+            local boost = LuckyWorldData and LuckyWorldData.Boost
+            if AutoBoostMachine and RawNet.invoke and boost then
+                local info = getLuckyInfo()
+                local coins = readCurrency("Lucky Coins") or 0
+                local maxSeconds = tonumber(boost.MaxSeconds) or 21600
+                local order = boost.Order or { "Gargantuan", "Titanic", "Huge" }
+                local bought = false
+
+                if info and type(info.b) == "table" then
+                    for _, rarity in ipairs(order) do
+                        local left = math.max(0, tonumber(info.b[rarity]) or 0)
+                        local toMax = tonumber(boost.CoinsToMax and boost.CoinsToMax[rarity]) or 0
+                        if toMax > 0 and left < maxSeconds - 1 then
+                            local cost = (maxSeconds - left) * toMax / maxSeconds
+                            local amount = math.floor(math.min(cost, coins))
+                            if amount >= 1 then
+                                local ok, success, err = RawNet.invoke("Lucky World: Boost", rarity, amount)
+                                if ok and success then
+                                    luckyStatus.Text = ("Status: Boosted %s with %d Lucky Coins"):format(rarity, amount)
+                                    luckyStatus.TextColor3 = Color3.fromRGB(120, 230, 140)
+                                else
+                                    luckyStatus.Text = ("Status: %s boost failed: %s"):format(rarity, tostring(err))
+                                    luckyStatus.TextColor3 = Color3.fromRGB(255, 130, 130)
+                                end
+                                bought = true
+                                break
+                            end
+                        end
+                    end
+                end
+
+                if not bought then
+                    luckyStatus.Text = "Status: Boost machine maxed"
+                    luckyStatus.TextColor3 = Color3.fromRGB(160, 170, 190)
+                end
+
+                task.wait(bought and 1.2 or 3)
+            else
+                task.wait(0.7)
+            end
+        end
+    end)
+
+    -- Lucky panel: buy the cheapest affordable upgrade in the game's own
+    -- suggested order (EggTier, Power, Coins, BlockLuck, luck tiers).
+    task.spawn(function()
+        while TAB_TOTAL.luckyWorldFrame.Parent do
+            local upgrades = LuckyWorldData and LuckyWorldData.Upgrades
+            if AutoLuckyUpgrades and RawNet.invoke and type(upgrades) == "table" then
+                local info = getLuckyInfo()
+                local bucks = readCurrency("Breakout Bucks") or 0
+                local bestId, bestCost = nil, math.huge
+
+                if info and type(info.u) == "table" then
+                    local order = info.o or {}
+                    for _, id in ipairs(order) do
+                        local def
+                        for _, entry in ipairs(upgrades) do
+                            if entry.Id == id then def = entry break end
+                        end
+                        if def then
+                            local tier = tonumber(info.u[id]) or 0
+                            local cost = def.Costs and tonumber(def.Costs[tier + 1])
+                            if cost and cost <= bucks and cost < bestCost then
+                                bestId, bestCost = id, cost
+                            end
+                        end
+                    end
+                end
+
+                if bestId then
+                    local ok, success = RawNet.invoke("Lucky World: Upgrade", bestId)
+                    if ok and success then
+                        luckyStatus.Text = ("Status: Bought %s upgrade for %d bucks"):format(bestId, bestCost)
+                        luckyStatus.TextColor3 = Color3.fromRGB(120, 230, 140)
+                    else
+                        luckyStatus.Text = ("Status: %s upgrade rejected"):format(bestId)
+                        luckyStatus.TextColor3 = Color3.fromRGB(255, 190, 90)
+                    end
+                    task.wait(1.2)
+                else
+                    luckyStatus.Text = "Status: No affordable Lucky Upgrade"
+                    luckyStatus.TextColor3 = Color3.fromRGB(160, 170, 190)
+                    task.wait(3)
+                end
+            else
+                task.wait(1)
+            end
+        end
+    end)
+
+    -- Boss: the game's Select Coin path assigns one pet per signal, which is
+    -- exactly the 1-by-1 pacing wanted. Keep firing while the boss exists.
+    task.spawn(function()
+        local lastBoss = nil
+        while TAB_TOTAL.luckyWorldFrame.Parent do
+            if AutoBossAttack then
+                local coin = getLuckyBossCoin()
+                if coin then
+                    local id = coin:GetAttribute("ID")
+                    if id ~= nil then
+                        if lastBoss ~= id then
+                            lastBoss = id
+                            luckyStatus.Text = "Status: Attacking Lucky Block Boss (1 by 1)"
+                            luckyStatus.TextColor3 = Color3.fromRGB(255, 210, 80)
+                        end
+                        pcall(function() Library.Signal.Fire("Select Coin", coin) end)
+                        task.wait(0.07)
+                    else
+                        task.wait(0.4)
+                    end
+                else
+                    if lastBoss ~= nil then
+                        luckyStatus.Text = "Status: Boss gone - waiting"
+                        luckyStatus.TextColor3 = Color3.fromRGB(160, 170, 190)
+                    end
+                    lastBoss = nil
+                    task.wait(0.5)
+                end
+            else
+                lastBoss = nil
+                task.wait(0.5)
+            end
+        end
+    end)
+
+    -- Currency readout for the tab.
+    task.spawn(function()
+        while TAB_TOTAL.luckyWorldFrame.Parent do
+            if TAB_TOTAL.luckyWorldFrame.Visible then
+                local bucks = readCurrency("Breakout Bucks")
+                local coins = readCurrency("Lucky Coins")
+                luckyDetail.Text = ("Bucks: %s   Lucky Coins: %s"):format(
+                    bucks and string.format("%.0f", bucks) or "?",
+                    coins and string.format("%.0f", coins) or "?"
+                )
+            end
+            task.wait(1)
         end
     end)
 
@@ -3367,15 +3929,19 @@ switchTab(hatchTab, hatchFrame)
     eggSearch.TextSize = 13
     eggSearch.Parent = eggFrame
 
-    local eggSearchCorner = Instance.new("UICorner")
-    eggSearchCorner.CornerRadius = UDim.new(0, 6)
-    eggSearchCorner.Parent = eggSearch
+    do
+        local eggSearchCorner = Instance.new("UICorner")
+        eggSearchCorner.CornerRadius = UDim.new(0, 6)
+        eggSearchCorner.Parent = eggSearch
+    end
 
-    local eggSearchStroke = Instance.new("UIStroke")
-    eggSearchStroke.Color = Color3.fromRGB(80, 80, 100)
-    eggSearchStroke.Thickness = 1
-    eggSearchStroke.Transparency = 0.7
-    eggSearchStroke.Parent = eggSearch
+    do
+        local eggSearchStroke = Instance.new("UIStroke")
+        eggSearchStroke.Color = Color3.fromRGB(80, 80, 100)
+        eggSearchStroke.Thickness = 1
+        eggSearchStroke.Transparency = 0.7
+        eggSearchStroke.Parent = eggSearch
+    end
 
     local eggSelect = Instance.new("TextButton")
     eggSelect.Size = UDim2.new(1, 0, 0, 32)
@@ -3387,15 +3953,19 @@ switchTab(hatchTab, hatchFrame)
     eggSelect.Text = "Select Egg Dropdown"
     eggSelect.Parent = eggFrame
 
-    local eggSelectCorner = Instance.new("UICorner")
-    eggSelectCorner.CornerRadius = UDim.new(0, 6)
-    eggSelectCorner.Parent = eggSelect
+    do
+        local eggSelectCorner = Instance.new("UICorner")
+        eggSelectCorner.CornerRadius = UDim.new(0, 6)
+        eggSelectCorner.Parent = eggSelect
+    end
 
-    local eggSelectStroke = Instance.new("UIStroke")
-    eggSelectStroke.Color = Color3.fromRGB(80, 80, 100)
-    eggSelectStroke.Thickness = 1
-    eggSelectStroke.Transparency = 0.7
-    eggSelectStroke.Parent = eggSelect
+    do
+        local eggSelectStroke = Instance.new("UIStroke")
+        eggSelectStroke.Color = Color3.fromRGB(80, 80, 100)
+        eggSelectStroke.Thickness = 1
+        eggSelectStroke.Transparency = 0.7
+        eggSelectStroke.Parent = eggSelect
+    end
 
     local eggOptions = Instance.new("ScrollingFrame")
     eggOptions.Size = UDim2.new(1, 0, 0, 140)
@@ -3404,24 +3974,30 @@ switchTab(hatchTab, hatchFrame)
     eggOptions.BorderSizePixel = 0
     eggOptions.ScrollBarThickness = 5
     eggOptions.AutomaticCanvasSize = Enum.AutomaticSize.Y
-    eggOptions.Visible = true
+    eggOptions.Visible = false
     eggOptions.ZIndex = 20
     eggOptions.Parent = eggFrame
 
-    local eggOptionsCorner = Instance.new("UICorner")
-    eggOptionsCorner.CornerRadius = UDim.new(0, 6)
-    eggOptionsCorner.Parent = eggOptions
+    do
+        local eggOptionsCorner = Instance.new("UICorner")
+        eggOptionsCorner.CornerRadius = UDim.new(0, 6)
+        eggOptionsCorner.Parent = eggOptions
+    end
 
-    local eggOptionsStroke = Instance.new("UIStroke")
-    eggOptionsStroke.Color = Color3.fromRGB(80, 80, 100)
-    eggOptionsStroke.Thickness = 1
-    eggOptionsStroke.Transparency = 0.6
-    eggOptionsStroke.Parent = eggOptions
+    do
+        local eggOptionsStroke = Instance.new("UIStroke")
+        eggOptionsStroke.Color = Color3.fromRGB(80, 80, 100)
+        eggOptionsStroke.Thickness = 1
+        eggOptionsStroke.Transparency = 0.6
+        eggOptionsStroke.Parent = eggOptions
+    end
 
-    local eggOptionsLayout = Instance.new("UIListLayout")
-    eggOptionsLayout.SortOrder = Enum.SortOrder.LayoutOrder
-    eggOptionsLayout.Padding = UDim.new(0, 2)
-    eggOptionsLayout.Parent = eggOptions
+    do
+        local eggOptionsLayout = Instance.new("UIListLayout")
+        eggOptionsLayout.SortOrder = Enum.SortOrder.LayoutOrder
+        eggOptionsLayout.Padding = UDim.new(0, 2)
+        eggOptionsLayout.Parent = eggOptions
+    end
 
     local eggResults = Instance.new("ScrollingFrame")
     eggResults.Name = "EggResults"
@@ -3433,13 +4009,17 @@ switchTab(hatchTab, hatchFrame)
     eggResults.ScrollBarThickness = 5
     eggResults.Parent = eggFrame
 
-    local eggResultsCorner = Instance.new("UICorner")
-    eggResultsCorner.CornerRadius = UDim.new(0, 8)
-    eggResultsCorner.Parent = eggResults
+    do
+        local eggResultsCorner = Instance.new("UICorner")
+        eggResultsCorner.CornerRadius = UDim.new(0, 8)
+        eggResultsCorner.Parent = eggResults
+    end
 
-    local eggResultsLayout = Instance.new("UIListLayout")
-    eggResultsLayout.Padding = UDim.new(0, 4)
-    eggResultsLayout.Parent = eggResults
+    do
+        local eggResultsLayout = Instance.new("UIListLayout")
+        eggResultsLayout.Padding = UDim.new(0, 4)
+        eggResultsLayout.Parent = eggResults
+    end
 
     local chanceEggs = collectEggChanceData()
     local function getEggBestChance(egg)
@@ -3521,42 +4101,48 @@ switchTab(hatchTab, hatchFrame)
         rowCorner.CornerRadius = UDim.new(0, 4)
         rowCorner.Parent = row
 
-        local petLabel = Instance.new("TextLabel")
-        petLabel.Size = UDim2.new(0.52, -8, 1, 0)
-        petLabel.Position = UDim2.new(0, 8, 0, 0)
-        petLabel.BackgroundTransparency = 1
-        petLabel.TextColor3 = Color3.fromRGB(255, 255, 255)
-        petLabel.Font = Enum.Font.GothamBold
-        petLabel.TextSize = 13
-        petLabel.TextWrapped = true
-        petLabel.TextXAlignment = Enum.TextXAlignment.Left
-        petLabel.Text = tostring(name)
-        petLabel.Parent = row
+        do
+            local petLabel = Instance.new("TextLabel")
+            petLabel.Size = UDim2.new(0.52, -8, 1, 0)
+            petLabel.Position = UDim2.new(0, 8, 0, 0)
+            petLabel.BackgroundTransparency = 1
+            petLabel.TextColor3 = Color3.fromRGB(255, 255, 255)
+            petLabel.Font = Enum.Font.GothamBold
+            petLabel.TextSize = 13
+            petLabel.TextWrapped = true
+            petLabel.TextXAlignment = Enum.TextXAlignment.Left
+            petLabel.Text = tostring(name)
+            petLabel.Parent = row
+        end
 
         local rarityName = category or "Normal"
-        local rarityLabel = Instance.new("TextLabel")
-        rarityLabel.Size = UDim2.new(0.18, -4, 1, 0)
-        rarityLabel.Position = UDim2.new(0.52, 0, 0, 0)
-        rarityLabel.BackgroundTransparency = 1
-        rarityLabel.TextColor3 = rarityColors[rarityName] or rarityColors.Normal
-        rarityLabel.Font = rarityName == "Secret" and Enum.Font.Fantasy or Enum.Font.GothamBold
-        rarityLabel.TextSize = 12
-        rarityLabel.Text = rarityName
-        rarityLabel.TextWrapped = true
-        rarityLabel.TextXAlignment = Enum.TextXAlignment.Left
-        rarityLabel.Parent = row
+        do
+            local rarityLabel = Instance.new("TextLabel")
+            rarityLabel.Size = UDim2.new(0.18, -4, 1, 0)
+            rarityLabel.Position = UDim2.new(0.52, 0, 0, 0)
+            rarityLabel.BackgroundTransparency = 1
+            rarityLabel.TextColor3 = rarityColors[rarityName] or rarityColors.Normal
+            rarityLabel.Font = rarityName == "Secret" and Enum.Font.Fantasy or Enum.Font.GothamBold
+            rarityLabel.TextSize = 12
+            rarityLabel.Text = rarityName
+            rarityLabel.TextWrapped = true
+            rarityLabel.TextXAlignment = Enum.TextXAlignment.Left
+            rarityLabel.Parent = row
+        end
 
-        local chanceLabel = Instance.new("TextLabel")
-        chanceLabel.Size = UDim2.new(0.30, -8, 1, 0)
-        chanceLabel.Position = UDim2.new(0.70, 0, 0, 0)
-        chanceLabel.BackgroundTransparency = 1
-        chanceLabel.TextColor3 = Color3.fromRGB(255, 255, 255)
-        chanceLabel.Font = Enum.Font.GothamBold
-        chanceLabel.TextSize = 12
-        chanceLabel.TextWrapped = true
-        chanceLabel.TextXAlignment = Enum.TextXAlignment.Right
-        chanceLabel.Text = formatOdds(chance)
-        chanceLabel.Parent = row
+        do
+            local chanceLabel = Instance.new("TextLabel")
+            chanceLabel.Size = UDim2.new(0.30, -8, 1, 0)
+            chanceLabel.Position = UDim2.new(0.70, 0, 0, 0)
+            chanceLabel.BackgroundTransparency = 1
+            chanceLabel.TextColor3 = Color3.fromRGB(255, 255, 255)
+            chanceLabel.Font = Enum.Font.GothamBold
+            chanceLabel.TextSize = 12
+            chanceLabel.TextWrapped = true
+            chanceLabel.TextXAlignment = Enum.TextXAlignment.Right
+            chanceLabel.Text = formatOdds(chance)
+            chanceLabel.Parent = row
+        end
     end
 
     local function renderChanceResults()
@@ -3617,9 +4203,11 @@ switchTab(hatchTab, hatchFrame)
             bestOption.Text = string.format("Best chance: %s (%.4g%%)", bestEgg.Name, getEggBestChance(bestEgg))
             bestOption.Parent = eggOptions
 
-            local bestCorner = Instance.new("UICorner")
-            bestCorner.CornerRadius = UDim.new(0, 4)
-            bestCorner.Parent = bestOption
+            do
+                local bestCorner = Instance.new("UICorner")
+                bestCorner.CornerRadius = UDim.new(0, 4)
+                bestCorner.Parent = bestOption
+            end
 
             bestOption.MouseButton1Click:Connect(function()
                 showingEasiestPets = false
@@ -3651,7 +4239,7 @@ switchTab(hatchTab, hatchFrame)
                     showingEasiestPets = false
                     selectedChanceEgg = egg.Name
                     eggSelect.Text = "Egg: " .. egg.Name
-                    eggOptions.Visible = true
+                    eggOptions.Visible = false
                     chanceMode = "Eggs"
 
                     for modeKey, btnObj in pairs(subTabButtons) do
@@ -3677,9 +4265,9 @@ switchTab(hatchTab, hatchFrame)
         if mode == "Eggs" then
             eggSearch.Visible = true
             eggSelect.Visible = true
-            eggOptions.Visible = true
-            eggResults.Position = UDim2.new(0, 0, 0, 262)
-            eggResults.Size = UDim2.new(1, 0, 1, -262)
+            eggOptions.Visible = false
+            eggResults.Position = UDim2.new(0, 0, 0, 116)
+            eggResults.Size = UDim2.new(1, 0, 1, -116)
         else
             eggSearch.Visible = false
             eggSelect.Visible = false
@@ -3736,6 +4324,13 @@ switchTab(hatchTab, hatchFrame)
     eggSelect.MouseButton1Click:Connect(function()
         if chanceMode == "Eggs" then
             eggOptions.Visible = not eggOptions.Visible
+            if eggOptions.Visible then
+                eggResults.Position = UDim2.new(0, 0, 0, 262)
+                eggResults.Size = UDim2.new(1, 0, 1, -262)
+            else
+                eggResults.Position = UDim2.new(0, 0, 0, 116)
+                eggResults.Size = UDim2.new(1, 0, 1, -116)
+            end
         end
     end)
 
@@ -3768,36 +4363,44 @@ switchTab(hatchTab, hatchFrame)
     statsContainer.BackgroundColor3 = Color3.fromRGB(22, 24, 33)
     statsContainer.Parent = hatchFrame
 
-    local statsCorner = Instance.new("UICorner")
-    statsCorner.CornerRadius = UDim.new(0, 14)
-    statsCorner.Parent = statsContainer
+    do
+        local statsCorner = Instance.new("UICorner")
+        statsCorner.CornerRadius = UDim.new(0, 14)
+        statsCorner.Parent = statsContainer
+    end
 
-    local statsStroke = Instance.new("UIStroke")
-    statsStroke.Color = activeTheme.stroke
-    statsStroke.Transparency = 0.55
-    statsStroke.Parent = statsContainer
+    do
+        local statsStroke = Instance.new("UIStroke")
+        statsStroke.Color = activeTheme.stroke
+        statsStroke.Transparency = 0.55
+        statsStroke.Parent = statsContainer
+    end
 
-    local statsTitle = Instance.new("TextLabel")
-    statsTitle.Size = UDim2.new(1, -140, 0, 16)
-    statsTitle.Position = UDim2.new(0, 14, 0, 10)
-    statsTitle.BackgroundTransparency = 1
-    statsTitle.Text = "SESSION STATS"
-    statsTitle.TextColor3 = Color3.fromRGB(150, 160, 182)
-    statsTitle.Font = Enum.Font.GothamBold
-    statsTitle.TextSize = 10
-    statsTitle.TextXAlignment = Enum.TextXAlignment.Left
-    statsTitle.Parent = statsContainer
+    do
+        local statsTitle = Instance.new("TextLabel")
+        statsTitle.Size = UDim2.new(1, -140, 0, 16)
+        statsTitle.Position = UDim2.new(0, 14, 0, 10)
+        statsTitle.BackgroundTransparency = 1
+        statsTitle.Text = "SESSION STATS"
+        statsTitle.TextColor3 = Color3.fromRGB(150, 160, 182)
+        statsTitle.Font = Enum.Font.GothamBold
+        statsTitle.TextSize = 10
+        statsTitle.TextXAlignment = Enum.TextXAlignment.Left
+        statsTitle.Parent = statsContainer
+    end
 
-    local statsHint = Instance.new("TextLabel")
-    statsHint.Size = UDim2.new(0, 128, 0, 16)
-    statsHint.Position = UDim2.new(1, -142, 0, 10)
-    statsHint.BackgroundTransparency = 1
-    statsHint.Text = "live from save data"
-    statsHint.TextColor3 = Color3.fromRGB(110, 120, 140)
-    statsHint.Font = Enum.Font.Gotham
-    statsHint.TextSize = 10
-    statsHint.TextXAlignment = Enum.TextXAlignment.Right
-    statsHint.Parent = statsContainer
+    do
+        local statsHint = Instance.new("TextLabel")
+        statsHint.Size = UDim2.new(0, 128, 0, 16)
+        statsHint.Position = UDim2.new(1, -142, 0, 10)
+        statsHint.BackgroundTransparency = 1
+        statsHint.Text = "live from save data"
+        statsHint.TextColor3 = Color3.fromRGB(110, 120, 140)
+        statsHint.Font = Enum.Font.Gotham
+        statsHint.TextSize = 10
+        statsHint.TextXAlignment = Enum.TextXAlignment.Right
+        statsHint.Parent = statsContainer
+    end
 
     local EggsLabel = Instance.new("TextLabel")
     EggsLabel.Size = UDim2.new(0.5, -12, 0, 46)
@@ -3895,16 +4498,18 @@ switchTab(hatchTab, hatchFrame)
     -- Golden / Shiny. Counted in renderHatchRecent so they stay in sync
     -- with the recent list instead of drifting from it.
     do
-        local variantsTitle = Instance.new("TextLabel")
-        variantsTitle.Size = UDim2.new(1, -28, 0, 12)
-        variantsTitle.Position = UDim2.new(0, 14, 0, 140)
-        variantsTitle.BackgroundTransparency = 1
-        variantsTitle.Text = "VARIANTS OWNED"
-        variantsTitle.TextColor3 = Color3.fromRGB(150, 160, 182)
-        variantsTitle.Font = Enum.Font.GothamBold
-        variantsTitle.TextSize = 10
-        variantsTitle.TextXAlignment = Enum.TextXAlignment.Left
-        variantsTitle.Parent = statsContainer
+        do
+            local variantsTitle = Instance.new("TextLabel")
+            variantsTitle.Size = UDim2.new(1, -28, 0, 12)
+            variantsTitle.Position = UDim2.new(0, 14, 0, 140)
+            variantsTitle.BackgroundTransparency = 1
+            variantsTitle.Text = "VARIANTS OWNED"
+            variantsTitle.TextColor3 = Color3.fromRGB(150, 160, 182)
+            variantsTitle.Font = Enum.Font.GothamBold
+            variantsTitle.TextSize = 10
+            variantsTitle.TextXAlignment = Enum.TextXAlignment.Left
+            variantsTitle.Parent = statsContainer
+        end
 
         local variantDefs = {
             { key = "Rainbow", label = "RAINBOW", color = Color3.fromRGB(255, 120, 220) },
@@ -3968,141 +4573,8 @@ switchTab(hatchTab, hatchFrame)
         pcall(updateHatchVariantOwned)
     end
 
-    local SearchBox = Instance.new("TextBox")
-    SearchBox.Size = UDim2.new(1, 0, 0, 32)
-    SearchBox.Position = UDim2.new(0, 0, 0, 242)
-    SearchBox.PlaceholderText = "Search egg to hatch..."
-    SearchBox.Text = ""
-    SearchBox.BackgroundColor3 = Color3.fromRGB(30, 30, 40)
-    SearchBox.TextColor3 = Color3.fromRGB(255, 255, 255)
-    SearchBox.Font = Enum.Font.Gotham
-    SearchBox.TextSize = 13
-    SearchBox.Parent = hatchFrame
-
-    local searchCorner = Instance.new("UICorner")
-    searchCorner.CornerRadius = UDim.new(0, 6)
-    searchCorner.Parent = SearchBox
-
-    local searchStroke = Instance.new("UIStroke")
-    searchStroke.Color = Color3.fromRGB(80, 80, 100)
-    searchStroke.Thickness = 1
-    searchStroke.Transparency = 0.7
-    searchStroke.Parent = SearchBox
-
-    local SelectedEggLabel = Instance.new("TextLabel")
-    SelectedEggLabel.Size = UDim2.new(1, 0, 0, 20)
-    SelectedEggLabel.Position = UDim2.new(0, 0, 0, 280)
-    SelectedEggLabel.Text = "Selected: Spawn Egg"
-    SelectedEggLabel.TextColor3 = Color3.fromRGB(100, 225, 100)
-    SelectedEggLabel.Font = Enum.Font.GothamBold
-    SelectedEggLabel.TextSize = 12
-    SelectedEggLabel.BackgroundTransparency = 1
-    SelectedEggLabel.TextXAlignment = Enum.TextXAlignment.Left
-    SelectedEggLabel.Parent = hatchFrame
-
-    local DropdownFrame = Instance.new("ScrollingFrame")
-    DropdownFrame.Size = UDim2.new(1, 0, 0, 100)
-    DropdownFrame.Position = UDim2.new(0, 0, 0, 306)
-    DropdownFrame.BackgroundColor3 = Color3.fromRGB(25, 25, 35)
-    DropdownFrame.BorderSizePixel = 0
-    DropdownFrame.CanvasSize = UDim2.new(0, 0, 0, 0)
-    DropdownFrame.ScrollBarThickness = 5
-    DropdownFrame.Parent = hatchFrame
-
-    local dropdownCorner = Instance.new("UICorner")
-    dropdownCorner.CornerRadius = UDim.new(0, 6)
-    dropdownCorner.Parent = DropdownFrame
-
-    local dropdownStroke = Instance.new("UIStroke")
-    dropdownStroke.Color = Color3.fromRGB(80, 80, 100)
-    dropdownStroke.Thickness = 1
-    dropdownStroke.Transparency = 0.7
-    dropdownStroke.Parent = DropdownFrame
-
-    local dropdownLayout = Instance.new("UIListLayout")
-    dropdownLayout.Parent = DropdownFrame
-    dropdownLayout.SortOrder = Enum.SortOrder.LayoutOrder
-    dropdownLayout.Padding = UDim.new(0, 2)
-
-    local EggList = {
-        { ID = "Spawn Egg", Name = "Spawn Egg" },
-        { ID = "Fogbound Forest Egg", Name = "Fogbound Forest Egg" },
-    }
-
-    pcall(function()
-        local Lib = require(ReplicatedStorage.Framework.Library)
-        if Lib and Lib.Directory and Lib.Directory.Eggs then
-            local list = {}
-            for id, data in pairs(Lib.Directory.Eggs) do
-                if type(data) == "table" then
-                    table.insert(list, { ID = id, Name = data.displayName or id })
-                end
-            end
-            table.sort(list, function(a, b)
-                return (a.Name or ""):lower() < (b.Name or ""):lower()
-            end)
-            EggList = list
-        end
-    end)
-
-    local SelectedEggId = EggList[1] and EggList[1].ID or "Spawn Egg"
-    if PersistedSettings.selectedEgg then
-        for _, egg in ipairs(EggList) do
-            if tostring(egg.ID) == PersistedSettings.selectedEgg then
-                SelectedEggId = egg.ID
-                break
-            end
-        end
-    end
-    local function updateDropdown(filter)
-        for _, child in ipairs(DropdownFrame:GetChildren()) do
-            if child:IsA("TextButton") then child:Destroy() end
-        end
-        local query = filter:lower()
-        local count = 0
-        for _, egg in ipairs(EggList) do
-            if query == "" or (egg.Name or ""):lower():find(query, 1, true) then
-                count += 1
-                local button = Instance.new("TextButton")
-                button.Size = UDim2.new(1, -6, 0, 24)
-                button.BackgroundColor3 = activeTheme.surface
-                button.Text = "  " .. egg.Name
-                button.TextColor3 = Color3.fromRGB(255, 255, 255)
-                button.Font = Enum.Font.Gotham
-                button.TextSize = 12
-                button.TextXAlignment = Enum.TextXAlignment.Left
-                button.Parent = DropdownFrame
-
-                local optCorner = Instance.new("UICorner")
-                optCorner.CornerRadius = UDim.new(0, 4)
-                optCorner.Parent = button
-
-                button.MouseButton1Click:Connect(function()
-                    SelectedEggId = egg.ID
-                    PersistedSettings.selectedEgg = tostring(SelectedEggId)
-                    saveSettings()
-                    SelectedEggLabel.Text = "Selected: " .. egg.Name
-                end)
-            end
-        end
-        DropdownFrame.CanvasSize = UDim2.new(0, 0, 0, math.max(count * 26, 0))
-    end
-
-    updateDropdown("")
-    local selectedEggName = "None"
-    for _, egg in ipairs(EggList) do
-        if tostring(egg.ID) == tostring(SelectedEggId) then
-            selectedEggName = egg.Name
-            break
-        end
-    end
-    SelectedEggLabel.Text = "Selected: " .. selectedEggName
-
-    SearchBox.Changed:Connect(function(prop)
-        if prop == "Text" then
-            updateDropdown(SearchBox.Text)
-        end
-    end)
+    -- Egg selection UI removed - auto-hatch uses closest egg automatically
+    -- The hatch frame now starts at y=242 instead of y=340 to fill the gap
 
     local ToggleKey = Enum.KeyCode[CurrentKeyName] or Enum.KeyCode.LeftControl
 
@@ -4146,14 +4618,6 @@ switchTab(hatchTab, hatchFrame)
                 label.Text = "+" .. tostring(startupCounts[key] or 0) .. " since launch"
             end
         end
-
-        -- Refresh the recent-hatch lists on the AFK screen every time the
-        -- session counts change. This is the fix for rare hatches not showing
-        -- in AFK mode – previously renderAfkRecent was only called once at
-        -- session start, so pets hatched after that never appeared.
-        if afkSessionActive then
-            pcall(renderAfkRecent)
-        end
     end
 
     local function resetAfkSessionCounts()
@@ -4169,14 +4633,27 @@ switchTab(hatchTab, hatchFrame)
         updateAfkSessionLabels()
     end
 
+    local afkToggleBtn = nil
+
+    local function updateAfkToggleVisual(enabled)
+        if not afkToggleBtn or not afkToggleBtn.Parent then return end
+        enabled = enabled == true
+        afkToggleBtn:SetAttribute("ToggleState", enabled)
+        afkToggleBtn.BackgroundColor3 = enabled and activeTheme.controlOn or activeTheme.surface
+        afkToggleBtn.Text = "AFK Mode: " .. (enabled and "ON" or "OFF")
+        afkToggleBtn.TextColor3 = enabled and Color3.fromRGB(255, 255, 255) or Color3.fromRGB(180, 180, 190)
+    end
+
     local function setAfkMode(enabled)
+        enabled = enabled == true
         pcall(function()
             afkSessionActive = enabled
+            CurrentToggleStates["AFK Mode"] = enabled
+            updateAfkToggleVisual(enabled)
+            saveSettings()
             resetAfkSessionCounts()
 
             if enabled then
-                -- The AFK overlay lives in its own ScreenGui. Enabling only
-                -- the Frame is not enough: a disabled ScreenGui never renders.
                 afkGui.Enabled = true
                 afkOverlay.Visible = true
                 autoHatchMain.Visible = false
@@ -4193,7 +4670,104 @@ switchTab(hatchTab, hatchFrame)
         end)
     end
 
-    createUnifiedToggle(hatchFrame, 416, "AFK Mode", false, function(value) setAfkMode(value) end)
+    -- Forward-declare the hatch setter before connecting the UI callback.
+    -- Without this, the earlier callback resolves setAutoHatchState as a
+    -- global (nil), because the local function is defined later in the file.
+    local setAutoHatchState
+
+    -- CONTROL SECTION --------------------------------------------------------
+    local controlPanel = Instance.new("Frame")
+    controlPanel.Name = "ControlPanel"
+    controlPanel.Size = UDim2.new(1, -6, 0, 90)
+    controlPanel.Position = UDim2.new(0, 3, 0, 242)
+    controlPanel.BackgroundColor3 = activeTheme.panel
+    controlPanel.BorderSizePixel = 0
+    controlPanel.Parent = hatchFrame
+
+    do
+        local controlCorner = Instance.new("UICorner")
+        controlCorner.CornerRadius = UDim.new(0, 12)
+        controlCorner.Parent = controlPanel
+    end
+
+    do
+        local controlStroke = Instance.new("UIStroke")
+        controlStroke.Color = activeTheme.stroke
+        controlStroke.Transparency = 0.4
+        controlStroke.Parent = controlPanel
+    end
+
+    do
+        local controlTitle = Instance.new("TextLabel")
+        controlTitle.Size = UDim2.new(1, -24, 0, 20)
+        controlTitle.Position = UDim2.new(0, 12, 0, 8)
+        controlTitle.BackgroundTransparency = 1
+        controlTitle.Text = "CONTROLS"
+        controlTitle.TextColor3 = Color3.fromRGB(167, 139, 250)
+        controlTitle.Font = Enum.Font.GothamBold
+        controlTitle.TextSize = 11
+        controlTitle.TextXAlignment = Enum.TextXAlignment.Left
+        controlTitle.Parent = controlPanel
+    end
+
+    -- Create AFK Mode toggle inside control panel
+    afkToggleBtn = Instance.new("TextButton")
+    afkToggleBtn.Size = UDim2.new(0.5, -8, 0, 34)
+    afkToggleBtn.Position = UDim2.new(0, 8, 0, 36)
+    afkToggleBtn.BackgroundColor3 = false and activeTheme.controlOn or activeTheme.surface
+    afkToggleBtn.Text = "AFK Mode: OFF"
+    afkToggleBtn:SetAttribute("ToggleState", false)
+    afkToggleBtn.TextColor3 = Color3.fromRGB(180, 180, 190)
+    afkToggleBtn.Font = Enum.Font.GothamBold
+    afkToggleBtn.TextSize = 13
+    afkToggleBtn.Parent = controlPanel
+
+    do
+        local btnCorner = Instance.new("UICorner")
+        btnCorner.CornerRadius = UDim.new(0, 6)
+        btnCorner.Parent = afkToggleBtn
+    end
+
+    do
+        local btnStroke = Instance.new("UIStroke")
+        btnStroke.Color = activeTheme.stroke
+        btnStroke.Thickness = 1
+        btnStroke.Transparency = 0.7
+        btnStroke.Parent = afkToggleBtn
+    end
+
+    afkToggleBtn.MouseButton1Click:Connect(function()
+        setAfkMode(not afkSessionActive)
+    end)
+
+    -- Create Auto-Hatch Egg toggle inside control panel
+    local hatchToggleBtn = Instance.new("TextButton")
+    hatchToggleBtn.Size = UDim2.new(0.5, -8, 0, 34)
+    hatchToggleBtn.Position = UDim2.new(0.5, 0, 0, 36)
+    hatchToggleBtn.BackgroundColor3 = false and activeTheme.controlOn or activeTheme.surface
+    hatchToggleBtn.Text = "Auto-Hatch Egg: OFF"
+    hatchToggleBtn.TextColor3 = Color3.fromRGB(180, 180, 190)
+    hatchToggleBtn.Font = Enum.Font.GothamBold
+    hatchToggleBtn.TextSize = 13
+    hatchToggleBtn.Parent = controlPanel
+
+    do
+        local btnCorner = Instance.new("UICorner")
+        btnCorner.CornerRadius = UDim.new(0, 6)
+        btnCorner.Parent = hatchToggleBtn
+    end
+
+    do
+        local btnStroke = Instance.new("UIStroke")
+        btnStroke.Color = activeTheme.stroke
+        btnStroke.Thickness = 1
+        btnStroke.Transparency = 0.7
+        btnStroke.Parent = hatchToggleBtn
+    end
+
+    hatchToggleBtn.MouseButton1Click:Connect(function()
+        setAutoHatchState(not AutoBuying)
+    end)
 
     -- Wrapped in a block purely to keep its locals out of the UI thread's
     -- register budget (Luau caps a function at 200 registers).
@@ -4209,19 +4783,23 @@ switchTab(hatchTab, hatchFrame)
     local recentPanel = Instance.new("Frame")
     recentPanel.Name = "RecentHatchesPanel"
     recentPanel.Size = UDim2.new(1, -6, 0, 194)
-    recentPanel.Position = UDim2.new(0, 3, 0, 502)
+    recentPanel.Position = UDim2.new(0, 3, 0, 342)
     recentPanel.BackgroundColor3 = activeTheme.panel
     recentPanel.BorderSizePixel = 0
     recentPanel.Parent = hatchFrame
 
-    local recentPanelCorner = Instance.new("UICorner")
-    recentPanelCorner.CornerRadius = UDim.new(0, 12)
-    recentPanelCorner.Parent = recentPanel
+    do
+        local recentPanelCorner = Instance.new("UICorner")
+        recentPanelCorner.CornerRadius = UDim.new(0, 12)
+        recentPanelCorner.Parent = recentPanel
+    end
 
-    local recentPanelStroke = Instance.new("UIStroke")
-    recentPanelStroke.Color = activeTheme.stroke
-    recentPanelStroke.Transparency = 0.4
-    recentPanelStroke.Parent = recentPanel
+    do
+        local recentPanelStroke = Instance.new("UIStroke")
+        recentPanelStroke.Color = activeTheme.stroke
+        recentPanelStroke.Transparency = 0.4
+        recentPanelStroke.Parent = recentPanel
+    end
 
     local recentDot = Instance.new("Frame")
     recentDot.Size = UDim2.new(0, 6, 0, 6)
@@ -4230,31 +4808,37 @@ switchTab(hatchTab, hatchFrame)
     recentDot.BorderSizePixel = 0
     recentDot.Parent = recentPanel
 
-    local recentDotCorner = Instance.new("UICorner")
-    recentDotCorner.CornerRadius = UDim.new(1, 0)
-    recentDotCorner.Parent = recentDot
+    do
+        local recentDotCorner = Instance.new("UICorner")
+        recentDotCorner.CornerRadius = UDim.new(1, 0)
+        recentDotCorner.Parent = recentDot
+    end
 
-    local recentTitle = Instance.new("TextLabel")
-    recentTitle.Size = UDim2.new(1, -110, 0, 22)
-    recentTitle.Position = UDim2.new(0, 24, 0, 4)
-    recentTitle.BackgroundTransparency = 1
-    recentTitle.Text = "RECENT RARE HATCHES"
-    recentTitle.TextColor3 = Color3.fromRGB(255, 255, 255)
-    recentTitle.Font = Enum.Font.GothamBold
-    recentTitle.TextSize = 12
-    recentTitle.TextXAlignment = Enum.TextXAlignment.Left
-    recentTitle.Parent = recentPanel
+    do
+        local recentTitle = Instance.new("TextLabel")
+        recentTitle.Size = UDim2.new(1, -110, 0, 22)
+        recentTitle.Position = UDim2.new(0, 24, 0, 4)
+        recentTitle.BackgroundTransparency = 1
+        recentTitle.Text = "RECENT RARE HATCHES"
+        recentTitle.TextColor3 = Color3.fromRGB(255, 255, 255)
+        recentTitle.Font = Enum.Font.GothamBold
+        recentTitle.TextSize = 12
+        recentTitle.TextXAlignment = Enum.TextXAlignment.Left
+        recentTitle.Parent = recentPanel
+    end
 
-    local recentHint = Instance.new("TextLabel")
-    recentHint.Size = UDim2.new(0, 80, 0, 22)
-    recentHint.Position = UDim2.new(1, -88, 0, 4)
-    recentHint.BackgroundTransparency = 1
-    recentHint.Text = "live"
-    recentHint.TextColor3 = Color3.fromRGB(132, 142, 165)
-    recentHint.Font = Enum.Font.Gotham
-    recentHint.TextSize = 11
-    recentHint.TextXAlignment = Enum.TextXAlignment.Right
-    recentHint.Parent = recentPanel
+    do
+        local recentHint = Instance.new("TextLabel")
+        recentHint.Size = UDim2.new(0, 80, 0, 22)
+        recentHint.Position = UDim2.new(1, -88, 0, 4)
+        recentHint.BackgroundTransparency = 1
+        recentHint.Text = "live"
+        recentHint.TextColor3 = Color3.fromRGB(132, 142, 165)
+        recentHint.Font = Enum.Font.Gotham
+        recentHint.TextSize = 11
+        recentHint.TextXAlignment = Enum.TextXAlignment.Right
+        recentHint.Parent = recentPanel
+    end
     for index, category in ipairs(recentCategories) do
         local column = Instance.new("Frame")
         column.Size = UDim2.new(0.25, -8, 0, 102)
@@ -4264,9 +4848,11 @@ switchTab(hatchTab, hatchFrame)
         column.BorderSizePixel = 0
         column.Parent = recentPanel
 
-        local columnCorner = Instance.new("UICorner")
-        columnCorner.CornerRadius = UDim.new(0, 9)
-        columnCorner.Parent = column
+        do
+            local columnCorner = Instance.new("UICorner")
+            columnCorner.CornerRadius = UDim.new(0, 9)
+            columnCorner.Parent = column
+        end
 
         local columnDot = Instance.new("Frame")
         columnDot.Size = UDim2.new(0, 5, 0, 5)
@@ -4275,9 +4861,11 @@ switchTab(hatchTab, hatchFrame)
         columnDot.BorderSizePixel = 0
         columnDot.Parent = column
 
-        local columnDotCorner = Instance.new("UICorner")
-        columnDotCorner.CornerRadius = UDim.new(1, 0)
-        columnDotCorner.Parent = columnDot
+        do
+            local columnDotCorner = Instance.new("UICorner")
+            columnDotCorner.CornerRadius = UDim.new(1, 0)
+            columnDotCorner.Parent = columnDot
+        end
 
         local header = Instance.new("TextLabel")
         header.Size = UDim2.new(1, -20, 0, 18)
@@ -4321,16 +4909,18 @@ switchTab(hatchTab, hatchFrame)
     recentHatchedSection.BackgroundTransparency = 1
     recentHatchedSection.Parent = recentPanel
 
-    local recentHatchedTitle = Instance.new("TextLabel")
-    recentHatchedTitle.Size = UDim2.new(1, 0, 0, 12)
-    recentHatchedTitle.Position = UDim2.new(0, 4, 0, 0)
-    recentHatchedTitle.BackgroundTransparency = 1
-    recentHatchedTitle.Text = "VARIANTS HATCHED (RECENT)"
-    recentHatchedTitle.TextColor3 = Color3.fromRGB(150, 160, 182)
-    recentHatchedTitle.Font = Enum.Font.GothamBold
-    recentHatchedTitle.TextSize = 9
-    recentHatchedTitle.TextXAlignment = Enum.TextXAlignment.Left
-    recentHatchedTitle.Parent = recentHatchedSection
+    do
+        local recentHatchedTitle = Instance.new("TextLabel")
+        recentHatchedTitle.Size = UDim2.new(1, 0, 0, 12)
+        recentHatchedTitle.Position = UDim2.new(0, 4, 0, 0)
+        recentHatchedTitle.BackgroundTransparency = 1
+        recentHatchedTitle.Text = "VARIANTS HATCHED (RECENT)"
+        recentHatchedTitle.TextColor3 = Color3.fromRGB(150, 160, 182)
+        recentHatchedTitle.Font = Enum.Font.GothamBold
+        recentHatchedTitle.TextSize = 9
+        recentHatchedTitle.TextXAlignment = Enum.TextXAlignment.Left
+        recentHatchedTitle.Parent = recentHatchedSection
+    end
 
     local recentHatchChips = {}
     local recentVariantDefs = {
@@ -4357,9 +4947,11 @@ switchTab(hatchTab, hatchFrame)
         chipCorner.CornerRadius = UDim.new(0, 6)
         chipCorner.Parent = chip
 
-        local chipPadding = Instance.new("UIPadding")
-        chipPadding.PaddingLeft = UDim.new(0, 8)
-        chipPadding.Parent = chip
+        do
+            local chipPadding = Instance.new("UIPadding")
+            chipPadding.PaddingLeft = UDim.new(0, 8)
+            chipPadding.Parent = chip
+        end
 
         local chipStroke = Instance.new("UIStroke")
         chipStroke.Color = def.color
@@ -4444,6 +5036,7 @@ switchTab(hatchTab, hatchFrame)
         local WebhookSummaryEnabled = PersistedSettings.webhook.summaryEnabled == true
         local WebhookSummaryMinutes = math.clamp(tonumber(PersistedSettings.webhook.summaryMinutes) or 30, 1, 1440)
         local WebhookSummaryLastSent = os.clock()
+        local WebhookUserId = PersistedSettings.webhook.userId or ""
 
         local function webhookRequest()
             local env = _G
@@ -4493,8 +5086,8 @@ switchTab(hatchTab, hatchFrame)
 
         local webhookPanel = Instance.new("Frame")
         webhookPanel.Name = "WebhookPanel"
-        webhookPanel.Size = UDim2.new(1, -16, 0, 290)
-        webhookPanel.Position = UDim2.new(0, 8, 0, 706)
+        webhookPanel.Size = UDim2.new(1, -6, 0, 344)
+        webhookPanel.Position = UDim2.new(0, 3, 0, 548)
         webhookPanel.BackgroundColor3 = activeTheme.panel
         webhookPanel.BorderSizePixel = 0
         webhookPanel.Parent = hatchFrame
@@ -4525,9 +5118,11 @@ switchTab(hatchTab, hatchFrame)
         box.Font = Enum.Font.Gotham
         box.TextSize = 11
         box.Parent = webhookPanel
-        local boxCorner = Instance.new("UICorner")
-        boxCorner.CornerRadius = UDim.new(0, 6)
-        boxCorner.Parent = box
+        do
+            local boxCorner = Instance.new("UICorner")
+            boxCorner.CornerRadius = UDim.new(0, 6)
+            boxCorner.Parent = box
+        end
 
         local status = Instance.new("TextLabel")
         status.Size = UDim2.new(1, -24, 0, 18)
@@ -4550,9 +5145,11 @@ switchTab(hatchTab, hatchFrame)
         enable.Font = Enum.Font.GothamBold
         enable.TextSize = 11
         enable.Parent = webhookPanel
-        local enableCorner = Instance.new("UICorner")
-        enableCorner.CornerRadius = UDim.new(0, 6)
-        enableCorner.Parent = enable
+        do
+            local enableCorner = Instance.new("UICorner")
+            enableCorner.CornerRadius = UDim.new(0, 6)
+            enableCorner.Parent = enable
+        end
 
         local function updateEnable()
             if WebhookEnabled then
@@ -4609,13 +5206,54 @@ switchTab(hatchTab, hatchFrame)
             end)
         end
         addToggle("Huges", "Huge", 0, 136)
-        addToggle("Secrets", "Secret", 0.53, 136)
+        addToggle("Secrets", "Secret", 0.5, 136)
         addToggle("Titanics", "Titanic", 0, 168)
-        addToggle("Gargantuans", "Gargantuan", 0.53, 168)
+        addToggle("Gargantuans", "Gargantuan", 0.5, 168)
+
+        -- User ID input
+        do
+            local userIdLabel = Instance.new("TextLabel")
+            userIdLabel.Size = UDim2.new(1, -24, 0, 18)
+            userIdLabel.Position = UDim2.new(0, 12, 0, 200)
+            userIdLabel.BackgroundTransparency = 1
+            userIdLabel.Text = "Your Discord User ID (for pings):"
+            userIdLabel.TextColor3 = activeTheme.muted
+            userIdLabel.Font = Enum.Font.Gotham
+            userIdLabel.TextSize = 10
+            userIdLabel.TextXAlignment = Enum.TextXAlignment.Left
+            userIdLabel.Parent = webhookPanel
+        end
+
+        local userIdBox = Instance.new("TextBox")
+        userIdBox.Size = UDim2.new(1, -24, 0, 30)
+        userIdBox.Position = UDim2.new(0, 12, 0, 220)
+        userIdBox.BackgroundColor3 = activeTheme.surface
+        userIdBox.BorderSizePixel = 0
+        userIdBox.ClearTextOnFocus = false
+        userIdBox.PlaceholderText = "123456789012345678"
+        userIdBox.Text = WebhookUserId
+        userIdBox.TextColor3 = Color3.fromRGB(255,255,255)
+        userIdBox.Font = Enum.Font.Gotham
+        userIdBox.TextSize = 11
+        userIdBox.Parent = webhookPanel
+        do
+            local userIdCorner = Instance.new("UICorner")
+            userIdCorner.CornerRadius = UDim.new(0, 6)
+            userIdCorner.Parent = userIdBox
+        end
+
+        userIdBox.FocusLost:Connect(function()
+            WebhookUserId = tostring(userIdBox.Text or ""):match("^%s*(.-)%s*$")
+            PersistedSettings.webhook.userId = WebhookUserId
+            PersistedSettings.webhook.url = WebhookURL
+            PersistedSettings.webhook.enabled = WebhookEnabled
+            PersistedSettings.webhook.notify = WebhookNotify
+            saveSettings()
+        end)
 
         local summaryToggle = Instance.new("TextButton")
-        summaryToggle.Size = UDim2.new(0.56, -12, 0, 26)
-        summaryToggle.Position = UDim2.new(0, 12, 0, 246)
+        summaryToggle.Size = UDim2.new(0.54, -12, 0, 26)
+        summaryToggle.Position = UDim2.new(0, 12, 0, 262)
         summaryToggle.BackgroundColor3 = activeTheme.surface
         summaryToggle.BorderSizePixel = 0
         summaryToggle.TextColor3 = Color3.fromRGB(255, 255, 255)
@@ -4630,7 +5268,7 @@ switchTab(hatchTab, hatchFrame)
 
         local summaryBox = Instance.new("TextBox")
         summaryBox.Size = UDim2.new(0.16, 0, 0, 26)
-        summaryBox.Position = UDim2.new(0.60, 0, 0, 246)
+        summaryBox.Position = UDim2.new(0.56, 0, 0, 262)
         summaryBox.BackgroundColor3 = activeTheme.surface
         summaryBox.BorderSizePixel = 0
         summaryBox.ClearTextOnFocus = false
@@ -4646,16 +5284,18 @@ switchTab(hatchTab, hatchFrame)
             c.Parent = summaryBox
         end
 
-        local summarySuffix = Instance.new("TextLabel")
-        summarySuffix.Size = UDim2.new(0.23, -6, 0, 26)
-        summarySuffix.Position = UDim2.new(0.77, 0, 0, 246)
-        summarySuffix.BackgroundTransparency = 1
-        summarySuffix.Text = "minutes"
-        summarySuffix.TextColor3 = activeTheme.muted
-        summarySuffix.Font = Enum.Font.Gotham
-        summarySuffix.TextSize = 10
-        summarySuffix.TextXAlignment = Enum.TextXAlignment.Left
-        summarySuffix.Parent = webhookPanel
+        do
+            local summarySuffix = Instance.new("TextLabel")
+            summarySuffix.Size = UDim2.new(0.23, -6, 0, 26)
+            summarySuffix.Position = UDim2.new(0.74, 0, 0, 262)
+            summarySuffix.BackgroundTransparency = 1
+            summarySuffix.Text = "minutes"
+            summarySuffix.TextColor3 = activeTheme.muted
+            summarySuffix.Font = Enum.Font.Gotham
+            summarySuffix.TextSize = 10
+            summarySuffix.TextXAlignment = Enum.TextXAlignment.Left
+            summarySuffix.Parent = webhookPanel
+        end
 
         local function updateSummary()
             summaryToggle.Text = WebhookSummaryEnabled and "Summary every: ON" or "Summary every: OFF"
@@ -4669,6 +5309,7 @@ switchTab(hatchTab, hatchFrame)
             PersistedSettings.webhook.notify = WebhookNotify
             PersistedSettings.webhook.summaryEnabled = WebhookSummaryEnabled
             PersistedSettings.webhook.summaryMinutes = WebhookSummaryMinutes
+            PersistedSettings.webhook.userId = WebhookUserId
             saveSettings()
         end
 
@@ -4690,8 +5331,8 @@ switchTab(hatchTab, hatchFrame)
         end)
 
         local test = Instance.new("TextButton")
-        test.Size = UDim2.new(1,-24,0,34)
-        test.Position = UDim2.new(0,12,0,206)
+        test.Size = UDim2.new(1,-24,0,32)
+        test.Position = UDim2.new(0,12,0,298)
         test.BackgroundColor3 = activeTheme.accent
         test.BorderSizePixel = 0
         test.Text = "Send Test Webhook"
@@ -4699,9 +5340,11 @@ switchTab(hatchTab, hatchFrame)
         test.Font = Enum.Font.GothamBold
         test.TextSize = 11
         test.Parent = webhookPanel
-        local testCorner = Instance.new("UICorner")
-        testCorner.CornerRadius = UDim.new(0,6)
-        testCorner.Parent = test
+        do
+            local testCorner = Instance.new("UICorner")
+            testCorner.CornerRadius = UDim.new(0,6)
+            testCorner.Parent = test
+        end
 
         local function numberText(v)
             return tostring(v or 0)
@@ -4841,8 +5484,15 @@ switchTab(hatchTab, hatchFrame)
             end
             desc = desc .. variantBlock
 
+            local content = ""
+            if WebhookUserId ~= "" then
+                content = "<@" .. WebhookUserId .. "> "
+            end
+            
             return {
                 username="Pet Dimensions Hub",
+                content=content,
+                allowed_mentions={parse={"users"}},
                 embeds={{
                     title=testMessage and "Webhook Test" or ("New "..tostring(category).."!"),
                     description=desc,
@@ -4866,7 +5516,9 @@ switchTab(hatchTab, hatchFrame)
         test.MouseButton1Click:Connect(function()
             if WebhookSending then return end
             WebhookURL = tostring(box.Text or ""):match("^%s*(.-)%s*$")
+            WebhookUserId = tostring(userIdBox.Text or ""):match("^%s*(.-)%s*$")
             PersistedSettings.webhook.url = WebhookURL
+            PersistedSettings.webhook.userId = WebhookUserId
             saveSettings()
             if WebhookURL == "" then status.Text="Enter a webhook URL first" return end
             WebhookSending=true
@@ -5276,16 +5928,18 @@ switchTab(hatchTab, hatchFrame)
         -- ------------------------------------------------------------------
         -- UI
         -- ------------------------------------------------------------------
-        local title = Instance.new("TextLabel")
-        title.Size = UDim2.new(1, 0, 0, 24)
-        title.Position = UDim2.new(0, 0, 0, 0)
-        title.BackgroundTransparency = 1
-        title.Text = "DAYCARE AUTOMATION"
-        title.TextColor3 = Color3.fromRGB(255, 255, 255)
-        title.Font = Enum.Font.GothamBold
-        title.TextSize = 14
-        title.TextXAlignment = Enum.TextXAlignment.Left
-        title.Parent = daycareFrame
+        do
+            local title = Instance.new("TextLabel")
+            title.Size = UDim2.new(1, 0, 0, 24)
+            title.Position = UDim2.new(0, 0, 0, 0)
+            title.BackgroundTransparency = 1
+            title.Text = "DAYCARE AUTOMATION"
+            title.TextColor3 = Color3.fromRGB(255, 255, 255)
+            title.Font = Enum.Font.GothamBold
+            title.TextSize = 14
+            title.TextXAlignment = Enum.TextXAlignment.Left
+            title.Parent = daycareFrame
+        end
 
         createUnifiedToggle(daycareFrame, 32, "Auto Daycare", false, function(value)
             running = value
@@ -5374,16 +6028,18 @@ switchTab(hatchTab, hatchFrame)
             pendingClaim = true
         end)
 
-        local listTitle = Instance.new("TextLabel")
-        listTitle.Size = UDim2.new(1, 0, 0, 20)
-        listTitle.Position = UDim2.new(0, 0, 0, 320)
-        listTitle.BackgroundTransparency = 1
-        listTitle.Text = "PETS IN DAYCARE"
-        listTitle.TextColor3 = Color3.fromRGB(255, 255, 255)
-        listTitle.Font = Enum.Font.GothamBold
-        listTitle.TextSize = 13
-        listTitle.TextXAlignment = Enum.TextXAlignment.Left
-        listTitle.Parent = daycareFrame
+        do
+            local listTitle = Instance.new("TextLabel")
+            listTitle.Size = UDim2.new(1, 0, 0, 20)
+            listTitle.Position = UDim2.new(0, 0, 0, 320)
+            listTitle.BackgroundTransparency = 1
+            listTitle.Text = "PETS IN DAYCARE"
+            listTitle.TextColor3 = Color3.fromRGB(255, 255, 255)
+            listTitle.Font = Enum.Font.GothamBold
+            listTitle.TextSize = 13
+            listTitle.TextXAlignment = Enum.TextXAlignment.Left
+            listTitle.Parent = daycareFrame
+        end
 
         local list = Instance.new("ScrollingFrame")
         list.Size = UDim2.new(1, 0, 0, 240)
@@ -5396,9 +6052,11 @@ switchTab(hatchTab, hatchFrame)
         list.AutomaticCanvasSize = Enum.AutomaticSize.Y
         list.Parent = daycareFrame
         do
-            local c = Instance.new("UICorner")
-            c.CornerRadius = UDim.new(0, 8)
-            c.Parent = list
+            do
+                local c = Instance.new("UICorner")
+                c.CornerRadius = UDim.new(0, 8)
+                c.Parent = list
+            end
             local p = Instance.new("UIPadding")
             p.PaddingLeft = UDim.new(0, 8)
             p.PaddingRight = UDim.new(0, 8)
@@ -5584,12 +6242,8 @@ switchTab(hatchTab, hatchFrame)
     end
 
     afkExit.MouseButton1Click:Connect(function()
+        -- setAfkMode also resets the visible hatch-tab toggle and saved state.
         setAfkMode(false)
-        if toggleRegistry["AFK Mode"] then
-            for _, syncFunc in ipairs(toggleRegistry["AFK Mode"]) do
-                syncFunc(false)
-            end
-        end
     end)
 
     -- =====================================================================
@@ -5602,10 +6256,8 @@ switchTab(hatchTab, hatchFrame)
     do
         local panel = Instance.new("Frame")
         panel.Name = "AfkRarePanel"
-        -- Leave a dedicated, unobstructed row above for the large lifetime
-        -- Eggs and Diamonds cards.
-        panel.Size = UDim2.new(1, 0, 0.48, 0)
-        panel.Position = UDim2.new(0, 0, 0.44, 0)
+        panel.Size = UDim2.new(1, 0, 0.51, 0)
+        panel.Position = UDim2.new(0, 0, 0.365, 0)
         panel.BackgroundColor3 = Style.surfaceAlt
         panel.BackgroundTransparency = 0.12
         panel.BorderSizePixel = 0
@@ -5613,14 +6265,18 @@ switchTab(hatchTab, hatchFrame)
         panel.ZIndex = 103
         panel.Parent = afkCenter
 
-        local panelCorner = Instance.new("UICorner")
-        panelCorner.CornerRadius = UDim.new(0, 16)
-        panelCorner.Parent = panel
+        do
+            local panelCorner = Instance.new("UICorner")
+            panelCorner.CornerRadius = UDim.new(0, 16)
+            panelCorner.Parent = panel
+        end
 
-        local panelStroke = Instance.new("UIStroke")
-        panelStroke.Color = Style.line
-        panelStroke.Transparency = 0.25
-        panelStroke.Parent = panel
+        do
+            local panelStroke = Instance.new("UIStroke")
+            panelStroke.Color = Style.line
+            panelStroke.Transparency = 0.25
+            panelStroke.Parent = panel
+        end
 
         local header = Instance.new("Frame")
         header.Name = "Header"
@@ -5637,42 +6293,50 @@ switchTab(hatchTab, hatchFrame)
         headerDot.ZIndex = 105
         headerDot.Parent = header
 
-        local headerDotCorner = Instance.new("UICorner")
-        headerDotCorner.CornerRadius = UDim.new(1, 0)
-        headerDotCorner.Parent = headerDot
+        do
+            local headerDotCorner = Instance.new("UICorner")
+            headerDotCorner.CornerRadius = UDim.new(1, 0)
+            headerDotCorner.Parent = headerDot
+        end
 
-        local headerTitle = Instance.new("TextLabel")
-        headerTitle.Size = UDim2.new(1, -220, 1, 0)
-        headerTitle.Position = UDim2.new(0, 30, 0, 0)
-        headerTitle.BackgroundTransparency = 1
-        headerTitle.Text = "RECENT RARE HATCHES"
-        headerTitle.TextColor3 = Style.text
-        headerTitle.Font = Enum.Font.GothamBold
-        headerTitle.TextSize = 13
-        headerTitle.TextXAlignment = Enum.TextXAlignment.Left
-        headerTitle.ZIndex = 105
-        headerTitle.Parent = header
+        do
+            local headerTitle = Instance.new("TextLabel")
+            headerTitle.Size = UDim2.new(1, -220, 1, 0)
+            headerTitle.Position = UDim2.new(0, 30, 0, 0)
+            headerTitle.BackgroundTransparency = 1
+            headerTitle.Text = "RECENT RARE HATCHES"
+            headerTitle.TextColor3 = Style.text
+            headerTitle.Font = Enum.Font.GothamBold
+            headerTitle.TextSize = 13
+            headerTitle.TextXAlignment = Enum.TextXAlignment.Left
+            headerTitle.ZIndex = 105
+            headerTitle.Parent = header
+        end
 
-        local headerHint = Instance.new("TextLabel")
-        headerHint.Size = UDim2.new(0, 160, 1, 0)
-        headerHint.Position = UDim2.new(1, -176, 0, 0)
-        headerHint.BackgroundTransparency = 1
-        headerHint.Text = "this AFK session"
-        headerHint.TextColor3 = Style.muted
-        headerHint.Font = Enum.Font.Gotham
-        headerHint.TextSize = 11
-        headerHint.TextXAlignment = Enum.TextXAlignment.Right
-        headerHint.ZIndex = 105
-        headerHint.Parent = header
+        do
+            local headerHint = Instance.new("TextLabel")
+            headerHint.Size = UDim2.new(0, 160, 1, 0)
+            headerHint.Position = UDim2.new(1, -176, 0, 0)
+            headerHint.BackgroundTransparency = 1
+            headerHint.Text = "this AFK session"
+            headerHint.TextColor3 = Style.muted
+            headerHint.Font = Enum.Font.Gotham
+            headerHint.TextSize = 11
+            headerHint.TextXAlignment = Enum.TextXAlignment.Right
+            headerHint.ZIndex = 105
+            headerHint.Parent = header
+        end
 
-        local headerLine = Instance.new("Frame")
-        headerLine.Size = UDim2.new(1, -32, 0, 1)
-        headerLine.Position = UDim2.new(0, 16, 0, 40)
-        headerLine.BackgroundColor3 = Style.line
-        headerLine.BackgroundTransparency = 0.55
-        headerLine.BorderSizePixel = 0
-        headerLine.ZIndex = 104
-        headerLine.Parent = panel
+        do
+            local headerLine = Instance.new("Frame")
+            headerLine.Size = UDim2.new(1, -32, 0, 1)
+            headerLine.Position = UDim2.new(0, 16, 0, 40)
+            headerLine.BackgroundColor3 = Style.line
+            headerLine.BackgroundTransparency = 0.55
+            headerLine.BorderSizePixel = 0
+            headerLine.ZIndex = 104
+            headerLine.Parent = panel
+        end
 
         for index, category in ipairs(recentCategories) do
             local card = Instance.new("Frame")
@@ -5689,10 +6353,12 @@ switchTab(hatchTab, hatchFrame)
             cardCorner.CornerRadius = UDim.new(0, 12)
             cardCorner.Parent = card
 
-            local cardStroke = Instance.new("UIStroke")
-            cardStroke.Color = category.color
-            cardStroke.Transparency = 0.72
-            cardStroke.Parent = card
+            do
+                local cardStroke = Instance.new("UIStroke")
+                cardStroke.Color = category.color
+                cardStroke.Transparency = 0.72
+                cardStroke.Parent = card
+            end
 
             local accent = Instance.new("Frame")
             accent.Size = UDim2.new(1, -24, 0, 3)
@@ -5703,9 +6369,11 @@ switchTab(hatchTab, hatchFrame)
             accent.ZIndex = 105
             accent.Parent = card
 
-            local accentCorner = Instance.new("UICorner")
-            accentCorner.CornerRadius = UDim.new(1, 0)
-            accentCorner.Parent = accent
+            do
+                local accentCorner = Instance.new("UICorner")
+                accentCorner.CornerRadius = UDim.new(1, 0)
+                accentCorner.Parent = accent
+            end
 
             local nameLabel = Instance.new("TextLabel")
             nameLabel.Size = UDim2.new(1, -24, 0, 14)
@@ -5714,7 +6382,7 @@ switchTab(hatchTab, hatchFrame)
             nameLabel.Text = category.name:upper()
             nameLabel.TextColor3 = category.color
             nameLabel.Font = Enum.Font.GothamBold
-            nameLabel.TextSize = 12
+            nameLabel.TextSize = 11
             nameLabel.TextXAlignment = Enum.TextXAlignment.Left
             nameLabel.ZIndex = 105
             nameLabel.Parent = card
@@ -5726,7 +6394,7 @@ switchTab(hatchTab, hatchFrame)
             countLabel.Text = "0"
             countLabel.TextColor3 = Style.text
             countLabel.Font = Enum.Font.GothamBlack
-            countLabel.TextSize = 28
+            countLabel.TextSize = 30
             countLabel.TextXAlignment = Enum.TextXAlignment.Left
             countLabel.ZIndex = 105
             countLabel.Parent = card
@@ -5771,14 +6439,16 @@ switchTab(hatchTab, hatchFrame)
             startupLabel.Parent = card
             startupLabels[category.name .. "s"] = startupLabel
 
-            local divider = Instance.new("Frame")
-            divider.Size = UDim2.new(1, -24, 0, 1)
-            divider.Position = UDim2.new(0, 12, 0, 126)
-            divider.BackgroundColor3 = Style.line
-            divider.BackgroundTransparency = 0.45
-            divider.BorderSizePixel = 0
-            divider.ZIndex = 105
-            divider.Parent = card
+            do
+                local divider = Instance.new("Frame")
+                divider.Size = UDim2.new(1, -24, 0, 1)
+                divider.Position = UDim2.new(0, 12, 0, 126)
+                divider.BackgroundColor3 = Style.line
+                divider.BackgroundTransparency = 0.45
+                divider.BorderSizePixel = 0
+                divider.ZIndex = 105
+                divider.Parent = card
+            end
 
             local list = Instance.new("ScrollingFrame")
             list.Name = category.name .. "Recent"
@@ -5792,15 +6462,19 @@ switchTab(hatchTab, hatchFrame)
             list.ZIndex = 105
             list.Parent = card
 
-            local listPadding = Instance.new("UIPadding")
-            listPadding.PaddingLeft = UDim.new(0, 6)
-            listPadding.PaddingRight = UDim.new(0, 4)
-            listPadding.Parent = list
+            do
+                local listPadding = Instance.new("UIPadding")
+                listPadding.PaddingLeft = UDim.new(0, 6)
+                listPadding.PaddingRight = UDim.new(0, 4)
+                listPadding.Parent = list
+            end
 
-            local listLayout = Instance.new("UIListLayout")
-            listLayout.SortOrder = Enum.SortOrder.LayoutOrder
-            listLayout.Padding = UDim.new(0, 3)
-            listLayout.Parent = list
+            do
+                local listLayout = Instance.new("UIListLayout")
+                listLayout.SortOrder = Enum.SortOrder.LayoutOrder
+                listLayout.Padding = UDim.new(0, 3)
+                listLayout.Parent = list
+            end
 
             afkRecentLists[category.name] = { frame = list, entries = category.entries, color = category.color }
         end
@@ -5814,16 +6488,18 @@ switchTab(hatchTab, hatchFrame)
                     end
 
                     if #listData.entries == 0 then
-                        local empty = Instance.new("TextLabel")
-                        empty.Size = UDim2.new(1, 0, 0, 16)
-                        empty.BackgroundTransparency = 1
-                        empty.Text = "nothing hatched yet"
-                        empty.TextColor3 = Style.muted
-                        empty.Font = Enum.Font.Gotham
-                        empty.TextSize = 10
-                        empty.TextXAlignment = Enum.TextXAlignment.Left
-                        empty.TextTransparency = 0.4
-                        empty.Parent = listData.frame
+                        do
+                            local empty = Instance.new("TextLabel")
+                            empty.Size = UDim2.new(1, 0, 0, 16)
+                            empty.BackgroundTransparency = 1
+                            empty.Text = "nothing hatched yet"
+                            empty.TextColor3 = Style.muted
+                            empty.Font = Enum.Font.Gotham
+                            empty.TextSize = 10
+                            empty.TextXAlignment = Enum.TextXAlignment.Left
+                            empty.TextTransparency = 0.4
+                            empty.Parent = listData.frame
+                        end
                     end
 
                     for entryIndex, entryData in ipairs(listData.entries) do
@@ -5896,7 +6572,7 @@ switchTab(hatchTab, hatchFrame)
             afkEggs.Text = formatNumber(eggsStat.Value)
             eggsStat.Changed:Connect(function(value)
                 EggsLabel.Text = "Eggs: " .. formatNumber(value)
-                afkEggs.Text = formatNumber(value)
+                afkEggs.Text = "Total Eggs: " .. formatNumber(value)
             end)
         end
 
@@ -5906,7 +6582,7 @@ switchTab(hatchTab, hatchFrame)
             afkGems.Text = formatNumber(gemStat.Value)
             gemStat.Changed:Connect(function(value)
                 GemsLabel.Text = "Diamonds: " .. formatNumber(value)
-                afkGems.Text = formatNumber(value)
+                afkGems.Text = "Total Diamonds: " .. formatNumber(value)
             end)
         end
     end
@@ -5915,19 +6591,14 @@ switchTab(hatchTab, hatchFrame)
 -- AUTO-HATCH
 -- The game already ships a complete auto-hatch driver in
 -- `Scripts.Game.Auto Hatch`: it runs on a 0.1s tick, gates on
--- `Library.Variables.OpeningEgg <= 0`, keeps its own 0.8s cooldown and calls
--- `Library.Network.Invoke("BuyX Egg", eggId)` (NOT "Buy Egg"). The old version
--- of this script fired "Buy Egg" every 0.2s *and* set the same variables, so it
--- raced the game's own loop - two concurrent buy requests, "too quickly"
--- rejections, doubled egg-open FX and a frame-rate hit every hatch.
---
--- Now we drive the engine instead of duplicating it:
+-- `Library.Variables.OpeningEgg <= 0`. Now we drive the engine instead of
+-- duplicating it:
 --   * primary path  - set AutoHatchEnabled / AutoHatchEggId and let the game buy
 --   * fallback path - only when the account has no Auto Hatch gamepass, run a
---                     "BuyX Egg" loop with the game's own 0.8s cadence and the
---                     same OpeningEgg gate
+--                     "BuyX Egg" loop with a 0.25s server cooldown (tested safe)
 --   * watchdog      - re-asserts the variables if anything clears them, and
 --                     backs off instead of hammering on hard failures
+-- Auto-hatch uses closest egg only - no manual egg selection dropdown anymore.
 local function ownsAutoHatchGamepass()
     local ok, pass = pcall(function()
         local entry = Library.Directory.Gamepasses["Auto Hatch"]
@@ -5936,26 +6607,69 @@ local function ownsAutoHatchGamepass()
     return ok and pass == true
 end
 
+-- The map keeps every egg capsule under Workspace.__MAP.Eggs.<area>.Eggs as a
+-- "Egg Capsule" model with an `ID` attribute that already matches the
+-- directory egg id, so the closest egg can be picked without any name games.
+local function findClosestEggId()
+    local character = localPlayer.Character
+    local hrp = character and character:FindFirstChild("HumanoidRootPart")
+    if not hrp then return nil end
+
+    local map = Workspace:FindFirstChild("__MAP")
+    local eggsFolder = map and map:FindFirstChild("Eggs")
+    if not eggsFolder then return nil end
+
+    local bestId, bestDistance = nil, math.huge
+    for _, model in ipairs(eggsFolder:GetDescendants()) do
+        if model:IsA("Model") and model.Name == "Egg Capsule" then
+            local id = model:GetAttribute("ID")
+            local part = model.PrimaryPart or model:FindFirstChildWhichIsA("BasePart")
+            if id and part then
+                local distance = (hrp.Position - part.Position).Magnitude
+                if distance < bestDistance then
+                    bestDistance = distance
+                    bestId = tostring(id)
+                end
+            end
+        end
+    end
+
+    return bestId
+end
+
+-- Auto-hatch uses the closest egg only - no manual selection
+local function currentHatchEggId()
+    return findClosestEggId()
+end
+
 local function hatchViaBuyX()
     if os.clock() < HatchCooldownUntil then return end
     if (tonumber(Library.Variables.OpeningEgg) or 0) > 0 then return end
     local ok, canAct = pcall(function() return Library.WorldCmds.CanDoAction() end)
     if ok and canAct == false then return end
 
-    HatchCooldownUntil = os.clock() + 0.8
-    local invoked, result, err = pcall(function()
-        return Library.Network.Invoke("BuyX Egg", SelectedEggId)
-    end)
+    local eggId = currentHatchEggId()
+    if not eggId then return end
+    if not RawNet.invoke then
+        HatchWatchdogStatus = "network unavailable"
+        return
+    end
+
+    HatchCooldownUntil = os.clock() + 0.25
+    local invoked, result, err = RawNet.invoke("BuyX Egg", eggId)
 
     if not invoked then
         HatchFailures += 1
     elseif result == true then
         HatchFailures = 0
         HatchLastEgg = os.clock()
-        HatchWatchdogStatus = "hatching via BuyX Egg"
+        HatchWatchdogStatus = "hatching " .. tostring(eggId)
     elseif type(err) == "string" and err:find("too quickly") then
-        -- Expected back-pressure from the server. Silent, but back off a little
-        -- harder so a rejected request cannot snowball into a retry storm.
+        -- Expected back-pressure from the server. Back off a little harder so
+        -- a rejected request cannot snowball into a retry storm.
+        HatchCooldownUntil = os.clock() + 0.5
+    elseif type(err) == "string" and err:find("too far") then
+        HatchWatchdogStatus = "closest egg out of range"
         HatchCooldownUntil = os.clock() + 1.0
     else
         HatchFailures += 1
@@ -5963,14 +6677,15 @@ local function hatchViaBuyX()
     end
 
     if HatchFailures >= 5 then
-        HatchCooldownUntil = os.clock() + 10
+        HatchCooldownUntil = os.clock() + 5
         HatchFailures = 0
     end
 end
 
 local function pushHatchState()
+    local eggId = currentHatchEggId()
     pcall(function()
-        Library.Variables.AutoHatchEggId = SelectedEggId
+        Library.Variables.AutoHatchEggId = eggId
         Library.Variables.AutoHatchEnabled = true
     end)
 end
@@ -5986,20 +6701,32 @@ local ownsPassCached, ownsPassRefreshAt = false, 0
 task.spawn(function()
     local wasOn = false
     while true do
-        if AutoBuying and SelectedEggId then
+        if AutoBuying then
             wasOn = true
-            pushHatchState()
+
+            -- Repoint the engine at the closest egg every tick, so walking to
+            -- a different egg area retargets auto-hatch automatically.
+            local eggId = currentHatchEggId()
+            if eggId then
+                pcall(function()
+                    if Library.Variables.AutoHatchEggId ~= eggId then
+                        Library.Variables.AutoHatchEggId = eggId
+                    end
+                    Library.Variables.AutoHatchEnabled = true
+                end)
+            end
+
             if os.clock() >= ownsPassRefreshAt then
                 ownsPassCached = ownsAutoHatchGamepass()
                 ownsPassRefreshAt = os.clock() + 10
             end
+
             if ownsPassCached then
                 HatchWatchdogStatus = "auto hatch running (engine)"
                 task.wait(1)
             else
-                -- No gamepass: we are the driver. hatchViaBuyX enforces the
-                -- game's 0.8s server cooldown itself, so poll quickly instead
-                -- of sleeping a full second between attempts.
+                -- No gamepass: we drive it. hatchViaBuyX enforces a 0.25s
+                -- server cooldown (tested safe), so poll at 0.1s.
                 hatchViaBuyX()
                 task.wait(0.1)
             end
@@ -6016,61 +6743,66 @@ task.spawn(function()
     end
 end)
 
--- Keep the toggle in sync with the real engine state so the UI never lies.
-task.spawn(function()
-    while true do
-        if AutoBuying then
-            if Library.Variables.AutoHatchEggId ~= SelectedEggId
-                or Library.Variables.AutoHatchEnabled ~= true then
-                pushHatchState()
-            end
-        end
-        task.wait(3)
-    end
-end)
-
-local function setAutoHatchState(enabled)
+setAutoHatchState = function(enabled)
+    enabled = enabled == true
     AutoBuying = enabled
     if enabled then
         pushHatchState()
     else
         clearHatchState()
     end
+
+    -- Keep the visible control synchronized with the actual automation state.
+    if hatchToggleBtn and hatchToggleBtn.Parent then
+        hatchToggleBtn:SetAttribute("ToggleState", enabled)
+        hatchToggleBtn.BackgroundColor3 = enabled and activeTheme.controlOn or activeTheme.surface
+        hatchToggleBtn.Text = "Auto-Hatch Egg: " .. (enabled and "ON" or "OFF")
+        hatchToggleBtn.TextColor3 = enabled and Color3.fromRGB(255, 255, 255) or Color3.fromRGB(180, 180, 190)
+    end
 end
 
 
-    -- Rebind the toggle to the real hatch state instead of only changing the
-    -- custom AutoBuying flag.
-    createUnifiedToggle(hatchFrame, 458, "Auto-Hatch Egg", false, function(value)
-        setAutoHatchState(value)
-    end)
+    -- Auto-Hatch Egg toggle is already provided inside ControlPanel (hatchToggleBtn);
+    -- sync its state here and keep hatchFrame CanvasSize clear of overlaps.
+    if toggleRegistry["Auto-Hatch Egg"] then
+        table.insert(toggleRegistry["Auto-Hatch Egg"], function(value)
+            hatchToggleBtn.BackgroundColor3 = value and activeTheme.controlOn or activeTheme.surface
+            hatchToggleBtn.Text = "Auto-Hatch Egg: " .. (value and "ON" or "OFF")
+            hatchToggleBtn.TextColor3 = value and Color3.fromRGB(255, 255, 255) or Color3.fromRGB(180, 180, 190)
+        end)
+    end
+    hatchFrame.CanvasSize = UDim2.new(0, 0, 0, 920)
 
     -- =====================================================================
     -- TELEPORT TAB UI
     -- =====================================================================
-    local tpTitle = Instance.new("TextLabel")
-    tpTitle.Size = UDim2.new(1, 0, 0, 24)
-    tpTitle.Position = UDim2.new(0, 0, 0, 0)
-    tpTitle.BackgroundTransparency = 1
-    tpTitle.Text = "TELEPORT LOCATIONS"
-    tpTitle.TextColor3 = Color3.fromRGB(255, 255, 255)
-    tpTitle.Font = Enum.Font.GothamBold
-    tpTitle.TextSize = 14
-    tpTitle.TextXAlignment = Enum.TextXAlignment.Left
-    tpTitle.Parent = tpFrame
+    do
+        local tpTitle = Instance.new("TextLabel")
+        tpTitle.Size = UDim2.new(1, 0, 0, 24)
+        tpTitle.Position = UDim2.new(0, 0, 0, 0)
+        tpTitle.BackgroundTransparency = 1
+        tpTitle.Text = "TELEPORT LOCATIONS"
+        tpTitle.TextColor3 = Color3.fromRGB(255, 255, 255)
+        tpTitle.Font = Enum.Font.GothamBold
+        tpTitle.TextSize = 14
+        tpTitle.TextXAlignment = Enum.TextXAlignment.Left
+        tpTitle.Parent = tpFrame
+    end
 
-    local tpTip = Instance.new("TextLabel")
-    tpTip.Size = UDim2.new(1, 0, 0, 42)
-    tpTip.Position = UDim2.new(0, 0, 0, 24)
-    tpTip.BackgroundTransparency = 1
-    tpTip.Text = "Click a world to expand it. Every teleport drops you in the middle of the area, 5 studs above the ground."
-    tpTip.TextColor3 = Color3.fromRGB(255, 190, 80)
-    tpTip.Font = Enum.Font.GothamSemibold
-    tpTip.TextSize = 11
-    tpTip.TextWrapped = true
-    tpTip.TextXAlignment = Enum.TextXAlignment.Left
-    tpTip.TextYAlignment = Enum.TextYAlignment.Center
-    tpTip.Parent = tpFrame
+    do
+        local tpTip = Instance.new("TextLabel")
+        tpTip.Size = UDim2.new(1, 0, 0, 42)
+        tpTip.Position = UDim2.new(0, 0, 0, 24)
+        tpTip.BackgroundTransparency = 1
+        tpTip.Text = "Click a world to expand it. Every teleport drops you in the middle of the area, 5 studs above the ground."
+        tpTip.TextColor3 = Color3.fromRGB(255, 190, 80)
+        tpTip.Font = Enum.Font.GothamSemibold
+        tpTip.TextSize = 11
+        tpTip.TextWrapped = true
+        tpTip.TextXAlignment = Enum.TextXAlignment.Left
+        tpTip.TextYAlignment = Enum.TextYAlignment.Center
+        tpTip.Parent = tpFrame
+    end
 
     -- Scrolling keeps the teleport list usable on smaller resolutions.
     local tpScroll = Instance.new("ScrollingFrame")
@@ -6496,9 +7228,11 @@ end
                 header:SetAttribute("RowActive", isOpen)
                 header.Parent = tpScroll
 
-                local headerPadding = Instance.new("UIPadding")
-                headerPadding.PaddingLeft = UDim.new(0, 10)
-                headerPadding.Parent = header
+                do
+                    local headerPadding = Instance.new("UIPadding")
+                    headerPadding.PaddingLeft = UDim.new(0, 10)
+                    headerPadding.Parent = header
+                end
 
                 local headerStroke = styleTeleportRow(header)
                 if isOpen then
@@ -6530,9 +7264,11 @@ end
                         areaButton.LayoutOrder = order
                         areaButton.Parent = tpScroll
 
-                        local areaPadding = Instance.new("UIPadding")
-                        areaPadding.PaddingLeft = UDim.new(0, 14)
-                        areaPadding.Parent = areaButton
+                        do
+                            local areaPadding = Instance.new("UIPadding")
+                            areaPadding.PaddingLeft = UDim.new(0, 14)
+                            areaPadding.Parent = areaButton
+                        end
 
                         styleTeleportRow(areaButton)
 
@@ -6544,15 +7280,17 @@ end
             end
 
             if #sortedWorlds == 0 then
-                local emptyLabel = Instance.new("TextLabel")
-                emptyLabel.Size = UDim2.new(1, -8, 0, 24)
-                emptyLabel.BackgroundTransparency = 1
-                emptyLabel.Text = "World list unavailable."
-                emptyLabel.TextColor3 = TP_WARN_COLOR
-                emptyLabel.Font = Enum.Font.GothamSemibold
-                emptyLabel.TextSize = 12
-                emptyLabel.TextXAlignment = Enum.TextXAlignment.Left
-                emptyLabel.Parent = tpScroll
+                do
+                    local emptyLabel = Instance.new("TextLabel")
+                    emptyLabel.Size = UDim2.new(1, -8, 0, 24)
+                    emptyLabel.BackgroundTransparency = 1
+                    emptyLabel.Text = "World list unavailable."
+                    emptyLabel.TextColor3 = TP_WARN_COLOR
+                    emptyLabel.Font = Enum.Font.GothamSemibold
+                    emptyLabel.TextSize = 12
+                    emptyLabel.TextXAlignment = Enum.TextXAlignment.Left
+                    emptyLabel.Parent = tpScroll
+                end
             end
         end
 
@@ -6564,27 +7302,31 @@ end
     -- =====================================================================
     -- SETTINGS TAB UI & EXTENDED THEME SWITCHER
     -- =====================================================================
-    local settingsTitle = Instance.new("TextLabel")
-    settingsTitle.Size = UDim2.new(1, 0, 0, 24)
-    settingsTitle.Position = UDim2.new(0, 0, 0, 0)
-    settingsTitle.BackgroundTransparency = 1
-    settingsTitle.Text = "SETTINGS & KEYBINDS"
-    settingsTitle.TextColor3 = Color3.fromRGB(255, 255, 255)
-    settingsTitle.Font = Enum.Font.GothamBold
-    settingsTitle.TextSize = 14
-    settingsTitle.TextXAlignment = Enum.TextXAlignment.Left
-    settingsTitle.Parent = settingsFrame
+    do
+        local settingsTitle = Instance.new("TextLabel")
+        settingsTitle.Size = UDim2.new(1, 0, 0, 24)
+        settingsTitle.Position = UDim2.new(0, 0, 0, 0)
+        settingsTitle.BackgroundTransparency = 1
+        settingsTitle.Text = "SETTINGS & KEYBINDS"
+        settingsTitle.TextColor3 = Color3.fromRGB(255, 255, 255)
+        settingsTitle.Font = Enum.Font.GothamBold
+        settingsTitle.TextSize = 14
+        settingsTitle.TextXAlignment = Enum.TextXAlignment.Left
+        settingsTitle.Parent = settingsFrame
+    end
 
-    local keybindLabel = Instance.new("TextLabel")
-    keybindLabel.Size = UDim2.new(1, 0, 0, 20)
-    keybindLabel.Position = UDim2.new(0, 0, 0, 32)
-    keybindLabel.BackgroundTransparency = 1
-    keybindLabel.Text = "Toggle UI Keybind:"
-    keybindLabel.TextColor3 = Color3.fromRGB(200, 200, 200)
-    keybindLabel.Font = Enum.Font.GothamBold
-    keybindLabel.TextSize = 13
-    keybindLabel.TextXAlignment = Enum.TextXAlignment.Left
-    keybindLabel.Parent = settingsFrame
+    do
+        local keybindLabel = Instance.new("TextLabel")
+        keybindLabel.Size = UDim2.new(1, 0, 0, 20)
+        keybindLabel.Position = UDim2.new(0, 0, 0, 32)
+        keybindLabel.BackgroundTransparency = 1
+        keybindLabel.Text = "Toggle UI Keybind:"
+        keybindLabel.TextColor3 = Color3.fromRGB(200, 200, 200)
+        keybindLabel.Font = Enum.Font.GothamBold
+        keybindLabel.TextSize = 13
+        keybindLabel.TextXAlignment = Enum.TextXAlignment.Left
+        keybindLabel.Parent = settingsFrame
+    end
 
     local keybindBtn = Instance.new("TextButton")
     keybindBtn.Size = UDim2.new(1, 0, 0, 34)
@@ -6596,15 +7338,19 @@ end
     keybindBtn.TextSize = 13
     keybindBtn.Parent = settingsFrame
 
-    local keybindCorner = Instance.new("UICorner")
-    keybindCorner.CornerRadius = UDim.new(0, 6)
-    keybindCorner.Parent = keybindBtn
+    do
+        local keybindCorner = Instance.new("UICorner")
+        keybindCorner.CornerRadius = UDim.new(0, 6)
+        keybindCorner.Parent = keybindBtn
+    end
 
-    local keybindStroke = Instance.new("UIStroke")
-    keybindStroke.Color = activeTheme.stroke
-    keybindStroke.Thickness = 1
-    keybindStroke.Transparency = 0.7
-    keybindStroke.Parent = keybindBtn
+    do
+        local keybindStroke = Instance.new("UIStroke")
+        keybindStroke.Color = activeTheme.stroke
+        keybindStroke.Thickness = 1
+        keybindStroke.Transparency = 0.7
+        keybindStroke.Parent = keybindBtn
+    end
 
     -- MOBILE UI TOGGLE
     -- Phones do not have the configured keyboard key, so provide a large
@@ -6623,17 +7369,24 @@ end
     mobileToggle.AutoButtonColor = true
     mobileToggle.Parent = ui
 
-    local mobileToggleCorner = Instance.new("UICorner")
-    mobileToggleCorner.CornerRadius = UDim.new(1, 0)
-    mobileToggleCorner.Parent = mobileToggle
+    do
+        local mobileToggleCorner = Instance.new("UICorner")
+        mobileToggleCorner.CornerRadius = UDim.new(1, 0)
+        mobileToggleCorner.Parent = mobileToggle
+    end
 
-    local mobileToggleStroke = Instance.new("UIStroke")
-    mobileToggleStroke.Thickness = 2
-    mobileToggleStroke.Transparency = 0.25
-    mobileToggleStroke.Parent = mobileToggle
+    do
+        local mobileToggleStroke = Instance.new("UIStroke")
+        mobileToggleStroke.Thickness = 2
+        mobileToggleStroke.Transparency = 0.25
+        mobileToggleStroke.Parent = mobileToggle
+    end
 
     local function toggleMainUI()
-        if afkOverlay.Visible then
+        -- Only the active AFK screen should block the hotkey. Checking the
+        -- ScreenGui as well keeps a stale overlay property from swallowing
+        -- the very first keypress on a fresh execute.
+        if afkGui.Enabled and afkOverlay.Visible then
             return
         end
         autoHatchMain.Visible = not autoHatchMain.Visible
@@ -6663,7 +7416,9 @@ end
             ToggleKey = input.KeyCode
             keybindBtn.Text = "Current Key: " .. CurrentKeyName
             saveSettings()
-        elseif not gameProcessed and input.UserInputType == Enum.UserInputType.Keyboard and input.KeyCode == ToggleKey then
+        elseif input.UserInputType == Enum.UserInputType.Keyboard and input.KeyCode == ToggleKey then
+            -- Deliberately ignore gameProcessed here: games that sink a key
+            -- through ContextActionService would otherwise eat the hotkey.
             toggleMainUI()
         end
     end)
@@ -6710,14 +7465,18 @@ end
     themeScroll.AutomaticCanvasSize = Enum.AutomaticSize.Y
     themeScroll.Parent = settingsFrame
 
-    local themeScrollCorner = Instance.new("UICorner")
-    themeScrollCorner.CornerRadius = UDim.new(0, 6)
-    themeScrollCorner.Parent = themeScroll
+    do
+        local themeScrollCorner = Instance.new("UICorner")
+        themeScrollCorner.CornerRadius = UDim.new(0, 6)
+        themeScrollCorner.Parent = themeScroll
+    end
 
-    local themeScrollLayout = Instance.new("UIListLayout")
-    themeScrollLayout.SortOrder = Enum.SortOrder.LayoutOrder
-    themeScrollLayout.Padding = UDim.new(0, 4)
-    themeScrollLayout.Parent = themeScroll
+    do
+        local themeScrollLayout = Instance.new("UIListLayout")
+        themeScrollLayout.SortOrder = Enum.SortOrder.LayoutOrder
+        themeScrollLayout.Padding = UDim.new(0, 4)
+        themeScrollLayout.Parent = themeScroll
+    end
 
     -- Built as its own function, NOT inline at thread scope. The UI thread is
     -- already at Luau's 200-register cap; adding this loop's locals (row,
@@ -6740,9 +7499,11 @@ end
         row:SetAttribute("ThemeName", themeObj.name)
         row.Parent = themeScroll
 
-        local rowCorner = Instance.new("UICorner")
-        rowCorner.CornerRadius = UDim.new(0, 7)
-        rowCorner.Parent = row
+        do
+            local rowCorner = Instance.new("UICorner")
+            rowCorner.CornerRadius = UDim.new(0, 7)
+            rowCorner.Parent = row
+        end
 
         -- Each row is painted with the theme it represents: its own background,
         -- four real colour chips for the palette, and a border in the accent.
@@ -6758,14 +7519,18 @@ end
             chip.BackgroundColor3 = themeObj[key]
             chip.BorderSizePixel = 0
             chip.Parent = row
-            local chipCorner = Instance.new("UICorner")
-            chipCorner.CornerRadius = UDim.new(1, 0)
-            chipCorner.Parent = chip
-            local chipStroke = Instance.new("UIStroke")
-            chipStroke.Color = themeObj.stroke
-            chipStroke.Thickness = 1
-            chipStroke.Transparency = 0.45
-            chipStroke.Parent = chip
+            do
+                local chipCorner = Instance.new("UICorner")
+                chipCorner.CornerRadius = UDim.new(1, 0)
+                chipCorner.Parent = chip
+            end
+            do
+                local chipStroke = Instance.new("UIStroke")
+                chipStroke.Color = themeObj.stroke
+                chipStroke.Thickness = 1
+                chipStroke.Transparency = 0.45
+                chipStroke.Parent = chip
+            end
         end
 
         local tLabel = Instance.new("TextLabel")
@@ -6794,7 +7559,7 @@ end
         check.Size = UDim2.fromOffset(22, 22)
         check.Position = UDim2.new(1, -28, 0.5, -11)
         check.BackgroundTransparency = 1
-        check.Text = "âœ“"
+        check.Text = "✓"
         check.TextColor3 = themeObj.accent
         check.Font = Enum.Font.GothamBold
         check.TextSize = 15
@@ -6839,8 +7604,8 @@ end
             end
         end
         themeLabel.Text = (query == "")
-            and (("%d themes"):format(shown))
-            or (("%d / %d"):format(shown, #Themes))
+            and (("Select UI Theme (%d)"):format(shown))
+            or (("Select UI Theme (%d / %d)"):format(shown, #Themes))
     end
     themeSearch:GetPropertyChangedSignal("Text"):Connect(filterThemes)
     filterThemes()
@@ -6911,21 +7676,27 @@ end
         nearbyPanel.Visible = false
         nearbyPanel.ZIndex = 150
         nearbyPanel.Parent = ui
-        local nearbyPanelCorner = Instance.new("UICorner")
-        nearbyPanelCorner.CornerRadius = UDim.new(0, 10)
-        nearbyPanelCorner.Parent = nearbyPanel
-        local nearbyPanelStroke = Instance.new("UIStroke")
-        nearbyPanelStroke.Color = activeTheme.stroke
-        nearbyPanelStroke.Thickness = 1
-        nearbyPanelStroke.Transparency = 0.25
-        nearbyPanelStroke.Parent = nearbyPanel
+        do
+            local nearbyPanelCorner = Instance.new("UICorner")
+            nearbyPanelCorner.CornerRadius = UDim.new(0, 10)
+            nearbyPanelCorner.Parent = nearbyPanel
+        end
+        do
+            local nearbyPanelStroke = Instance.new("UIStroke")
+            nearbyPanelStroke.Color = activeTheme.stroke
+            nearbyPanelStroke.Thickness = 1
+            nearbyPanelStroke.Transparency = 0.25
+            nearbyPanelStroke.Parent = nearbyPanel
+        end
 
-        local nearbyPanelAccent = Instance.new("Frame")
-        nearbyPanelAccent.Size = UDim2.new(1, 0, 0, 3)
-        nearbyPanelAccent.BackgroundColor3 = activeTheme.accent
-        nearbyPanelAccent.BorderSizePixel = 0
-        nearbyPanelAccent.ZIndex = 151
-        nearbyPanelAccent.Parent = nearbyPanel
+        do
+            local nearbyPanelAccent = Instance.new("Frame")
+            nearbyPanelAccent.Size = UDim2.new(1, 0, 0, 3)
+            nearbyPanelAccent.BackgroundColor3 = activeTheme.accent
+            nearbyPanelAccent.BorderSizePixel = 0
+            nearbyPanelAccent.ZIndex = 151
+            nearbyPanelAccent.Parent = nearbyPanel
+        end
 
         local nearbyPanelTitle = Instance.new("TextLabel")
         nearbyPanelTitle.Position = UDim2.fromOffset(14, 14)
@@ -6951,13 +7722,15 @@ end
         nearbyPanelSub.ZIndex = 152
         nearbyPanelSub.Parent = nearbyPanel
 
-        local nearbyPanelDivider = Instance.new("Frame")
-        nearbyPanelDivider.Position = UDim2.fromOffset(14, 54)
-        nearbyPanelDivider.Size = UDim2.new(1, -28, 0, 1)
-        nearbyPanelDivider.BackgroundColor3 = activeTheme.stroke
-        nearbyPanelDivider.BorderSizePixel = 0
-        nearbyPanelDivider.ZIndex = 151
-        nearbyPanelDivider.Parent = nearbyPanel
+        do
+            local nearbyPanelDivider = Instance.new("Frame")
+            nearbyPanelDivider.Position = UDim2.fromOffset(14, 54)
+            nearbyPanelDivider.Size = UDim2.new(1, -28, 0, 1)
+            nearbyPanelDivider.BackgroundColor3 = activeTheme.stroke
+            nearbyPanelDivider.BorderSizePixel = 0
+            nearbyPanelDivider.ZIndex = 151
+            nearbyPanelDivider.Parent = nearbyPanel
+        end
 
         local nearbyPanelList = Instance.new("ScrollingFrame")
         nearbyPanelList.Position = UDim2.fromOffset(10, 62)
@@ -6970,10 +7743,12 @@ end
         nearbyPanelList.ScrollBarImageColor3 = activeTheme.stroke
         nearbyPanelList.ZIndex = 152
         nearbyPanelList.Parent = nearbyPanel
-        local nearbyPanelLayout = Instance.new("UIListLayout")
-        nearbyPanelLayout.Padding = UDim.new(0, 4)
-        nearbyPanelLayout.SortOrder = Enum.SortOrder.LayoutOrder
-        nearbyPanelLayout.Parent = nearbyPanelList
+        do
+            local nearbyPanelLayout = Instance.new("UIListLayout")
+            nearbyPanelLayout.Padding = UDim.new(0, 4)
+            nearbyPanelLayout.SortOrder = Enum.SortOrder.LayoutOrder
+            nearbyPanelLayout.Parent = nearbyPanelList
+        end
 
         local nearbyPanelEmpty = Instance.new("TextLabel")
         nearbyPanelEmpty.Name = "EmptyMessage"
@@ -7212,9 +7987,11 @@ end
             card.BackgroundTransparency = 0.35
             card.BorderSizePixel = 0
             card.ZIndex = 153
-            local cardCorner = Instance.new("UICorner")
-            cardCorner.CornerRadius = UDim.new(0, 6)
-            cardCorner.Parent = card
+            do
+                local cardCorner = Instance.new("UICorner")
+                cardCorner.CornerRadius = UDim.new(0, 6)
+                cardCorner.Parent = card
+            end
 
             local icon = Instance.new("ImageLabel")
             icon.Position = UDim2.fromOffset(5, 5)
@@ -7223,9 +8000,11 @@ end
             icon.BorderSizePixel = 0
             icon.ZIndex = 154
             icon.Parent = card
-            local iconCorner = Instance.new("UICorner")
-            iconCorner.CornerRadius = UDim.new(0, 5)
-            iconCorner.Parent = icon
+            do
+                local iconCorner = Instance.new("UICorner")
+                iconCorner.CornerRadius = UDim.new(0, 5)
+                iconCorner.Parent = icon
+            end
 
             local badge = Instance.new("TextLabel")
             badge.AnchorPoint = Vector2.new(1, 0.5)
@@ -7237,9 +8016,11 @@ end
             badge.TextColor3 = Color3.new(1, 1, 1)
             badge.ZIndex = 155
             badge.Parent = card
-            local badgeCorner = Instance.new("UICorner")
-            badgeCorner.CornerRadius = UDim.new(0, 4)
-            badgeCorner.Parent = badge
+            do
+                local badgeCorner = Instance.new("UICorner")
+                badgeCorner.CornerRadius = UDim.new(0, 4)
+                badgeCorner.Parent = badge
+            end
 
             local nameLabel = Instance.new("TextLabel")
             nameLabel.Position = UDim2.fromOffset(42, 3)
@@ -7613,13 +8394,17 @@ end
                     card.BackgroundColor3 = activeTheme.surface
                     card.BackgroundTransparency = 0.12
                     card.BorderSizePixel = 0
-                    local corner = Instance.new("UICorner")
-                    corner.CornerRadius = UDim.new(0, 7)
-                    corner.Parent = card
-                    local stroke = Instance.new("UIStroke")
-                    stroke.Color = activeTheme.stroke
-                    stroke.Transparency = 0.65
-                    stroke.Parent = card
+                    do
+                        local corner = Instance.new("UICorner")
+                        corner.CornerRadius = UDim.new(0, 7)
+                        corner.Parent = card
+                    end
+                    do
+                        local stroke = Instance.new("UIStroke")
+                        stroke.Color = activeTheme.stroke
+                        stroke.Transparency = 0.65
+                        stroke.Parent = card
+                    end
 
                     local nameLabel = Instance.new("TextLabel")
                     nameLabel.Position = UDim2.fromOffset(10, 5)
@@ -7650,9 +8435,11 @@ end
                     status.Font = Enum.Font.GothamBold
                     status.TextSize = 10
                     status.Parent = card
-                    local statusCorner = Instance.new("UICorner")
-                    statusCorner.CornerRadius = UDim.new(0, 5)
-                    statusCorner.Parent = status
+                    do
+                        local statusCorner = Instance.new("UICorner")
+                        statusCorner.CornerRadius = UDim.new(0, 5)
+                        statusCorner.Parent = status
+                    end
                     return { frame = card, name = nameLabel, detail = detail, status = status }
                 end
 
@@ -7864,6 +8651,83 @@ pcall(function()
         end
     end)
 end)
+
+-- =====================================================================
+-- REAL EXECUTOR COMPATIBILITY - CLEANUP & RELOAD HANDLING
+-- =====================================================================
+-- Add cleanup function to the cleanup handlers list
+registerCleanup(function()
+    -- Stop all background tasks
+    AutoFarmRobot = false
+    AutoTap = false
+    AutoTeleportClosestCoin = false
+    AntiAFK = false
+    AutoFarmHackerBoss = false
+    AutoTokens = false
+    PotatoMode = false
+    AutoCollectFreeGifts = false
+    AutoFarmComet = false
+    FastPetSpeed = false
+    FastAttackSpeed = false
+    AutoBuying = false
+    
+    -- Clean up UI elements
+    pcall(function()
+        if playerGui:FindFirstChild("CombinedAutomationUI") then
+            playerGui.CombinedAutomationUI:Destroy()
+        end
+        if playerGui:FindFirstChild("CombinedAutomationAfkUI") then
+            playerGui.CombinedAutomationAfkUI:Destroy()
+        end
+    end)
+    
+    -- Restore pet walkspeed upgrade
+    pcall(function()
+        if SaveModule and SaveModule.Get then
+            local save = SaveModule.Get()
+            if save and FastPetSpeedApplied then
+                if PetWalkspeedUpgradeWasPresent then
+                    save.Upgrades["Pet Walkspeed"] = OriginalPetWalkspeedUpgrade
+                else
+                    save.Upgrades["Pet Walkspeed"] = nil
+                end
+                FastPetSpeedApplied = false
+            end
+        end
+    end)
+    
+    -- Clean up egg open hook
+    pcall(function()
+        local previous = EggOpenEnv.PD_EggOpenHook
+        if previous then
+            if previous.replacement and previous.replacement.Connected then
+                previous.replacement:Disconnect()
+            end
+            if previous.trigger and previous.callback then
+                previous.trigger.Event:Connect(previous.callback)
+            end
+        end
+    end)
+    
+    -- Reset globals
+    EggOpenEnv.PD_EggOpenHook = nil
+    EggOpenEnv.PD_EggOpenNamecallHooked = nil
+    if EggOpenEnv.PD_EggOpenNamecallHookCleanup then
+        EggOpenEnv.PD_EggOpenNamecallHookCleanup = nil
+    end
+end)
+
+-- Script fully loaded indicator
+if getgenv then
+    getgenv().PetDimensionsLoaded = true
+    getgenv().PetDimensionsVersion = "RealExecutor_Optimized_v2"
+end
+
+return {
+    cleanup = runCleanup,
+    isLoaded = function() return isExecutorLoaded end,
+    executorType = executorType,
+}
 
 
 
