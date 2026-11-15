@@ -282,6 +282,23 @@ do
     end
 end
 
+-- BUGFIX (from v3): egg.drops may be a STRING chaining to another egg's
+-- drop list instead of a table. Follow the chain (with a loop guard) and
+-- return the resolved drop table, or nil if it cannot be resolved.
+local function resolveEggDrops(eggDirectory, egg)
+    if type(egg) ~= "table" then return nil end
+    local drops = egg.drops
+    local seen, guard = {}, 0
+    while type(drops) == "string" and guard < 10 do
+        guard += 1
+        if seen[drops] then return nil end
+        seen[drops] = true
+        local nextEgg = type(eggDirectory) == "table" and eggDirectory[drops] or nil
+        drops = nextEgg and nextEgg.drops or nil
+    end
+    return type(drops) == "table" and drops or nil
+end
+
 local AutoFarmRobot = false
 local AutoTap = false
 local AutoTeleportClosestCoin = false
@@ -292,14 +309,14 @@ local AutoTokens = false
 local PotatoMode = false
 local AutoCollectFreeGifts = false
 local AutoFarmComet = false
-local FastPetSpeed = false
 local FastAttackSpeed = false
-local FastPetSpeedApplied = false
-local OriginalPetWalkspeedUpgrade = nil
-local PetWalkspeedUpgradeWasPresent = false
-local FastPetSpeedValue = 100000
 local FastAttackInterval = 0.02
-local TokenRemote = nil
+local FastPetSpeed = false
+-- Forward declaration: the "Fast Pet Speed" toggle row is created inside the
+-- UI block, which runs BEFORE the Fast Pet Speed engine is defined further
+-- down the file. The toggle calls through this slot (nil-safe) so enabling
+-- applies instantly and disabling actually restores the real upgrade.
+local ApplyFastPetSpeedFn = nil
 
 -- Hatch state lives at the top level so every loop (including the egg-open
 -- cleanup poller, which is created long before the UI thread) reads the SAME
@@ -323,85 +340,15 @@ pcall(function()
 end)
 
 
-local function SetFastPetSpeed(enabled)
-    FastPetSpeed = enabled
-    if not SaveModule or not SaveModule.Get then
-        return
-    end
 
-    pcall(function()
-        local save = SaveModule.Get()
-        if not save then return end
-        save.Upgrades = save.Upgrades or {}
 
-        if enabled then
-            if not FastPetSpeedApplied then
-                PetWalkspeedUpgradeWasPresent = save.Upgrades["Pet Walkspeed"] ~= nil
-                OriginalPetWalkspeedUpgrade = save.Upgrades["Pet Walkspeed"]
-                FastPetSpeedApplied = true
-            end
-            save.Upgrades["Pet Walkspeed"] = FastPetSpeedValue
-        else
-            if FastPetSpeedApplied then
-                if PetWalkspeedUpgradeWasPresent then
-                    save.Upgrades["Pet Walkspeed"] = OriginalPetWalkspeedUpgrade
-                else
-                    save.Upgrades["Pet Walkspeed"] = nil
-                end
-                FastPetSpeedApplied = false
-            end
-        end
-    end)
-end
-
-task.spawn(function()
-    while true do
-        if FastPetSpeed then
-            SetFastPetSpeed(true)
-            -- Directly apply walkspeed to pet models so pets move immediately,
-            -- not just when the save's upgrade stat is read by the server.
-            pcall(function()
-                local petLocations = {
-                    Workspace:FindFirstChild("__THINGS") and Workspace.__THINGS:FindFirstChild("Pets"),
-                    Workspace:FindFirstChild("Pets"),
-                    Workspace:FindFirstChild("__MAP") and Workspace.__MAP:FindFirstChild("Pets"),
-                }
-                for _, folder in ipairs(petLocations) do
-                    if folder then
-                        for _, pet in ipairs(folder:GetChildren()) do
-                            if pet:IsA("Model") then
-                                local hum = pet:FindFirstChildOfClass("Humanoid")
-                                if hum then
-                                    hum.WalkSpeed = FastPetSpeedValue
-                                end
-                                local primary = pet.PrimaryPart
-                                if primary then
-                                    primary.CustomPhysicalProperties = PhysicalProperties.new(0.01, 0, 0)
-                                end
-                            end
-                        end
-                    end
-                end
-                -- Also catch pets that stream in under __THINGS directly.
-                local things = Workspace:FindFirstChild("__THINGS")
-                if things then
-                    for _, obj in ipairs(things:GetDescendants()) do
-                        if obj:IsA("Model") and obj.Name:lower():find("pet") then
-                            local hum = obj:FindFirstChildOfClass("Humanoid")
-                            if hum then
-                                hum.WalkSpeed = FastPetSpeedValue
-                            end
-                        end
-                    end
-                end
-            end)
-            task.wait(0.3)
-        else
-            task.wait(1)
-        end
-    end
-end)
-
+-- BUGFIX (from v3): every remote in this game is generically named
+-- (RemoteEvent/RemoteFunction) and resolved through Library.Network hash
+-- upvalues, so scanning ReplicatedStorage by NAME never finds the token
+-- remote and Auto Tokens silently did nothing. Tokens are now collected
+-- through the exact remote the game's own collector uses:
+--   Invoke "Ability Token: Collect" (tokenId, position)
+-- via the RawNet resolver below.
 local CurrentTarget = nil
 local CurrentTargetId = nil
 local LastPetSendTarget = nil
@@ -409,19 +356,6 @@ local CurrentCoinTarget = nil
 local CurrentCoinTargetId = nil
 local CurrentHackerBoss = nil
 local CurrentHackerBossId = nil
-local DamageRemote = ReplicatedStorage:GetChildren()[66]
-
--- Find token remote on init
-for _, obj in ipairs(ReplicatedStorage:GetChildren()) do
-    if obj:IsA("RemoteFunction") or obj:IsA("RemoteEvent") then
-        local name = obj.Name:lower()
-        if name:find("token") or name:find("ability") then
-            TokenRemote = obj
-            break
-        end
-    end
-end
-
 
 -- AUTO FARM FUNCTIONS
 local function GetAllEquippedPetUIDs()
@@ -726,9 +660,6 @@ task.spawn(function()
             local hrp = localPlayer.Character:FindFirstChild("HumanoidRootPart")
 
             if hrp and #tokens > 0 then
-                local savedPos = hrp.CFrame
-                local collectedAny = false
-
                 for _, token in ipairs(tokens) do
                     if not AutoTokens then break end
                     if not token or not token.Parent or ignoreTokens[token] then continue end
@@ -746,23 +677,16 @@ task.spawn(function()
                         ignoreTokens[token] = true
                         task.delay(4, function() ignoreTokens[token] = nil end)
 
-                        collectedAny = true
-                        local tokenCFrame = targetPart.CFrame
                         local tokenPos = targetPart.Position
                         local tokenId = tonumber(token.Name) or token.Name
 
-                        hrp.CFrame = tokenCFrame
-                        task.wait(0.08)
-
-                        if TokenRemote then
-                            pcall(function()
-                                if TokenRemote:IsA("RemoteFunction") then
-                                    TokenRemote:InvokeServer(tokenId, tokenPos)
-                                else
-                                    TokenRemote:FireServer(tokenId, tokenPos)
-                                end
-                            end)
-                        end
+                        -- Collect the orb without teleporting the character.
+                        -- BUGFIX (from v3): the token remote is resolved by
+                        -- Library.Network hash, not by name. Invoke the exact
+                        -- remote the game's own collector uses.
+                        pcall(function()
+                            RawNet.invoke("Ability Token: Collect", tokenId, tokenPos)
+                        end)
 
                         local waitCount = 0
                         while token.Parent and waitCount < 6 do
@@ -772,10 +696,6 @@ task.spawn(function()
                     end
                 end
 
-                if collectedAny and hrp and hrp.Parent then
-                    hrp.CFrame = savedPos
-                    task.wait(0.1)
-                end
             end
             task.wait(0.2)
         else
@@ -819,16 +739,14 @@ end)
 task.spawn(function()
     while true do
         if AutoFarmComet and CurrentCometId then
-            pcall(function()
-                if DamageRemote then
-                    DamageRemote:FireServer(CurrentCometId)
-                end
-            end)
-
+            -- BUGFIX (from v3): ReplicatedStorage:GetChildren()[66] resolved
+            -- to a RemoteFunction, not the Farm Coin RemoteEvent, so the
+            -- direct damage call never worked. All damage goes through
+            -- Fire "Farm Coin" per equipped pet.
             local pets = RefreshCachedEquippedPets(false)
             for _, petUid in ipairs(pets) do
                 pcall(function()
-                    Library.Network.Fire("Farm Coin", CurrentCometId, petUid)
+                    RawNet.fire("Farm Coin", CurrentCometId, petUid)
                 end)
             end
             task.wait(0.05)
@@ -854,16 +772,13 @@ task.spawn(function()
             end
 
             if targetId then
-                if DamageRemote then
-                    pcall(function()
-                        DamageRemote:FireServer(targetId)
-                    end)
-                end
-
+                -- BUGFIX (from v3): all damage goes through Fire "Farm Coin"
+                -- per equipped pet; the old DamageRemote call targeted the
+                -- wrong remote type and never did anything.
                 local pets = RefreshCachedEquippedPets(false)
                 for _, petUid in ipairs(pets) do
                     pcall(function()
-                        Library.Network.Fire("Farm Coin", targetId, petUid)
+                        RawNet.fire("Farm Coin", targetId, petUid)
                     end)
                 end
                 task.wait(FastAttackInterval)
@@ -929,10 +844,15 @@ end)
 -- Damage Spam Loop
 task.spawn(function()
     while true do
-        if CurrentTargetId and DamageRemote and AutoFarmRobot then
-            pcall(function()
-                DamageRemote:FireServer(CurrentTargetId)
-            end)
+        if CurrentTargetId and AutoFarmRobot then
+            -- BUGFIX (from v3): Fire "Farm Coin" per equipped pet instead of
+            -- the broken DamageRemote index hack.
+            local pets = RefreshCachedEquippedPets(false)
+            for _, petUid in ipairs(pets) do
+                pcall(function()
+                    RawNet.fire("Farm Coin", CurrentTargetId, petUid)
+                end)
+            end
             task.wait(0.05)
         else
             task.wait(0.3)
@@ -943,10 +863,15 @@ end)
 -- Hacker Boss damage loop
 task.spawn(function()
     while true do
-        if AutoFarmHackerBoss and CurrentHackerBossId and DamageRemote then
-            pcall(function()
-                DamageRemote:FireServer(CurrentHackerBossId)
-            end)
+        if AutoFarmHackerBoss and CurrentHackerBossId then
+            -- BUGFIX (from v3): Fire "Farm Coin" per equipped pet instead of
+            -- the broken DamageRemote index hack.
+            local pets = RefreshCachedEquippedPets(false)
+            for _, petUid in ipairs(pets) do
+                pcall(function()
+                    RawNet.fire("Farm Coin", CurrentHackerBossId, petUid)
+                end)
+            end
             task.wait(0.05)
         else
             task.wait(0.3)
@@ -1038,15 +963,11 @@ task.spawn(function()
             local targetId = CurrentCoinTargetId
             local pets = RefreshCachedEquippedPets(false)
 
-            if DamageRemote then
-                pcall(function()
-                    DamageRemote:FireServer(targetId)
-                end)
-            end
-
+            -- BUGFIX (from v3): Fire "Farm Coin" per equipped pet instead of
+            -- the broken DamageRemote index hack.
             for _, petUid in ipairs(pets) do
                 pcall(function()
-                    Library.Network.Fire("Farm Coin", targetId, petUid)
+                    RawNet.fire("Farm Coin", targetId, petUid)
                 end)
             end
             task.wait(ClosestCoinHitInterval)
@@ -2675,7 +2596,7 @@ TAB_TOTAL.luckyWorld = createTabButton("Lucky World", 8)
     TAB_TOTAL.indexUI.summary = Instance.new("TextLabel")
     TAB_TOTAL.indexUI.summary.Name = "IndexSummary"
     TAB_TOTAL.indexUI.summary.Size = UDim2.new(1, 0, 0, 22)
-    TAB_TOTAL.indexUI.summary.Position = UDim2.fromOffset(0, 42)
+    TAB_TOTAL.indexUI.summary.Position = UDim2.fromOffset(0, 76)
     TAB_TOTAL.indexUI.summary.BackgroundTransparency = 1
     TAB_TOTAL.indexUI.summary.TextColor3 = Color3.fromRGB(165, 174, 192)
     TAB_TOTAL.indexUI.summary.TextXAlignment = Enum.TextXAlignment.Left
@@ -2684,10 +2605,47 @@ TAB_TOTAL.luckyWorld = createTabButton("Lucky World", 8)
     TAB_TOTAL.indexUI.summary.Text = "Loading pet index..."
     TAB_TOTAL.indexUI.summary.Parent = TAB_TOTAL.indexUI.frame
 
+    -- Auto Index row: toggle button on the left, live driver status beside it.
+    TAB_TOTAL.indexUI.autoBtn = Instance.new("TextButton")
+    TAB_TOTAL.indexUI.autoBtn.Name = "AutoIndexToggle"
+    TAB_TOTAL.indexUI.autoBtn.Size = UDim2.new(0, 160, 0, 30)
+    TAB_TOTAL.indexUI.autoBtn.Position = UDim2.fromOffset(0, 40)
+    TAB_TOTAL.indexUI.autoBtn.BackgroundColor3 = Color3.fromRGB(55, 62, 76)
+    TAB_TOTAL.indexUI.autoBtn.TextColor3 = Color3.fromRGB(180, 180, 190)
+    TAB_TOTAL.indexUI.autoBtn.Text = "Auto Index: OFF"
+    TAB_TOTAL.indexUI.autoBtn.Font = Enum.Font.GothamBold
+    TAB_TOTAL.indexUI.autoBtn.TextSize = 12
+    TAB_TOTAL.indexUI.autoBtn.Parent = TAB_TOTAL.indexUI.frame
+    do
+        local autoBtnCorner = Instance.new("UICorner")
+        autoBtnCorner.CornerRadius = UDim.new(0, 6)
+        autoBtnCorner.Parent = TAB_TOTAL.indexUI.autoBtn
+    end
+    do
+        local autoBtnStroke = Instance.new("UIStroke")
+        autoBtnStroke.Color = Color3.fromRGB(80, 80, 100)
+        autoBtnStroke.Thickness = 1
+        autoBtnStroke.Transparency = 0.7
+        autoBtnStroke.Parent = TAB_TOTAL.indexUI.autoBtn
+    end
+
+    TAB_TOTAL.indexUI.autoStatus = Instance.new("TextLabel")
+    TAB_TOTAL.indexUI.autoStatus.Name = "AutoIndexStatus"
+    TAB_TOTAL.indexUI.autoStatus.Size = UDim2.new(1, -168, 0, 30)
+    TAB_TOTAL.indexUI.autoStatus.Position = UDim2.fromOffset(168, 40)
+    TAB_TOTAL.indexUI.autoStatus.BackgroundTransparency = 1
+    TAB_TOTAL.indexUI.autoStatus.TextColor3 = Color3.fromRGB(165, 174, 192)
+    TAB_TOTAL.indexUI.autoStatus.TextXAlignment = Enum.TextXAlignment.Left
+    TAB_TOTAL.indexUI.autoStatus.TextTruncate = Enum.TextTruncate.AtEnd
+    TAB_TOTAL.indexUI.autoStatus.Font = Enum.Font.GothamMedium
+    TAB_TOTAL.indexUI.autoStatus.TextSize = 11
+    TAB_TOTAL.indexUI.autoStatus.Text = "Idle"
+    TAB_TOTAL.indexUI.autoStatus.Parent = TAB_TOTAL.indexUI.frame
+
     TAB_TOTAL.indexUI.list = Instance.new("ScrollingFrame")
     TAB_TOTAL.indexUI.list.Name = "IndexPetList"
-    TAB_TOTAL.indexUI.list.Size = UDim2.new(1, 0, 1, -70)
-    TAB_TOTAL.indexUI.list.Position = UDim2.fromOffset(0, 68)
+    TAB_TOTAL.indexUI.list.Size = UDim2.new(1, 0, 1, -100)
+    TAB_TOTAL.indexUI.list.Position = UDim2.fromOffset(0, 98)
     TAB_TOTAL.indexUI.list.BackgroundTransparency = 1
     TAB_TOTAL.indexUI.list.BorderSizePixel = 0
     TAB_TOTAL.indexUI.list.ScrollBarThickness = 4
@@ -3257,8 +3215,14 @@ switchTab(hatchTab, hatchFrame)
         end
     end)
     createUnifiedToggle(farmFrame, 116, "Auto Tokens", false, function(state) AutoTokens = state end)
-    createUnifiedToggle(farmFrame, 158, "Fast Pet Speed", false, function(state) SetFastPetSpeed(state) end)
-    createUnifiedToggle(farmFrame, 200, "Fast Attack", false, function(state) FastAttackSpeed = state end)
+    createUnifiedToggle(farmFrame, 158, "Fast Attack", false, function(state) FastAttackSpeed = state end)
+    createUnifiedToggle(farmFrame, 200, "Fast Pet Speed", false, function(state)
+        FastPetSpeed = state
+        -- Apply immediately (and restore the real upgrade on OFF) instead of
+        -- waiting for the background loop. Nil-safe: the engine is defined
+        -- later in the file than this UI block.
+        if ApplyFastPetSpeedFn then pcall(ApplyFastPetSpeedFn, state) end
+    end)
 
     createUnifiedToggle(farmFrame, 242, "Hacker Boss Farm", false, function(state)
         AutoFarmHackerBoss = state
@@ -3396,6 +3360,7 @@ switchTab(hatchTab, hatchFrame)
     local AutoBoostMachine = false
     local AutoLuckyUpgrades = false
     local AutoBossAttack = false
+    local AutoMazeEnabled = false
 
     do
         local luckyTitle = Instance.new("TextLabel")
@@ -3440,6 +3405,10 @@ switchTab(hatchTab, hatchFrame)
         AutoBossAttack = state
     end)
 
+    local autoMazeToggle = createUnifiedToggle(TAB_TOTAL.luckyWorldFrame, 230, "Auto Maze (Lucky Time Trial)", false, function(state)
+        AutoMazeEnabled = state
+    end)
+
     -- createUnifiedToggle restores the saved look without replaying the
     -- callback, so pull the runtime flags back out of the buttons once.
     AutoTileUpgrade = tileToggle:GetAttribute("ToggleState") == true
@@ -3449,7 +3418,7 @@ switchTab(hatchTab, hatchFrame)
 
     local luckyStatus = Instance.new("TextLabel")
     luckyStatus.Size = UDim2.new(1, 0, 0, 24)
-    luckyStatus.Position = UDim2.new(0, 0, 0, 234)
+    luckyStatus.Position = UDim2.new(0, 0, 0, 274)
     luckyStatus.BackgroundTransparency = 1
     luckyStatus.Text = "Status: Idle"
     luckyStatus.TextColor3 = Color3.fromRGB(180, 180, 180)
@@ -3460,7 +3429,7 @@ switchTab(hatchTab, hatchFrame)
 
     local luckyDetail = Instance.new("TextLabel")
     luckyDetail.Size = UDim2.new(1, 0, 0, 22)
-    luckyDetail.Position = UDim2.new(0, 0, 0, 260)
+    luckyDetail.Position = UDim2.new(0, 0, 0, 300)
     luckyDetail.BackgroundTransparency = 1
     luckyDetail.Text = "Tile upgrades cost Breakout Bucks - boosts cost Lucky Coins."
     luckyDetail.TextColor3 = Color3.fromRGB(150, 160, 180)
@@ -3468,6 +3437,18 @@ switchTab(hatchTab, hatchFrame)
     luckyDetail.TextSize = 11
     luckyDetail.TextXAlignment = Enum.TextXAlignment.Left
     luckyDetail.Parent = TAB_TOTAL.luckyWorldFrame
+
+    local autoMazeStatus = Instance.new("TextLabel")
+    autoMazeStatus.Name = "AutoMazeStatus"
+    autoMazeStatus.Size = UDim2.new(1, 0, 0, 22)
+    autoMazeStatus.Position = UDim2.new(0, 0, 0, 326)
+    autoMazeStatus.BackgroundTransparency = 1
+    autoMazeStatus.Text = "Auto Maze: Off"
+    autoMazeStatus.TextColor3 = Color3.fromRGB(150, 160, 180)
+    autoMazeStatus.Font = Enum.Font.Gotham
+    autoMazeStatus.TextSize = 11
+    autoMazeStatus.TextXAlignment = Enum.TextXAlignment.Left
+    autoMazeStatus.Parent = TAB_TOTAL.luckyWorldFrame
 
     -- Lucky World automation logic ----------------------------------------
     local LuckyBoardData = Library.Shared and Library.Shared.LuckyBoard
@@ -3710,6 +3691,429 @@ switchTab(hatchTab, hatchFrame)
         end
     end)
 
+
+    -- =====================================================================
+    -- AUTO MAZE: Lucky Time Trial path runner
+    -- Uses the maze route logic from the standalone Auto Maze script.
+    -- The feature is controlled exclusively by the Lucky World tab toggle.
+    -- =====================================================================
+local MAZE_CONFIG = {
+    enabled = false,
+    driftTolerance = 0.5,     -- studs of drift before the character is re-seated
+    portalEnterDelay = 1.1,   -- wait 1.1 seconds before walking into the exit portal
+    portalWalkTimeout = 5,    -- hard cap on the walk into the portal
+    portalWalkStep = 0.05,    -- seconds between arrival-distance checks
+    portalWalkRadius = 1.5,   -- studs from the portal centre that count as arrived
+    portalWalkSpeed = 100,    -- temporary humanoid speed while entering the exit portal
+    portalRetryTimeout = 10,  -- seconds to wait for the next maze after the portal
+    statusInterval = 0.25,    -- seconds between status line rebuilds
+    verbose = true,
+}
+
+local MazeEnv = (type(getgenv) == "function" and getgenv()) or _G
+local MAZE = MazeEnv.__LuckyMazeState or {
+    enabled = false,
+    mazesDone = 0,
+    roomsCleared = 0,
+    status = "idle",
+    portalBusy = false,
+    currentEntrance = nil,
+}
+MazeEnv.__LuckyMazeState = MAZE
+
+local function mlog(fmt, ...)
+    if not MAZE_CONFIG.verbose then
+        return
+    end
+    local ok, line = pcall(string.format, "[AutoMaze] " .. fmt, ...)
+    print(ok and line or ("[AutoMaze] " .. fmt))
+end
+
+--==========================================================================
+-- Maze introspection
+--==========================================================================
+
+local function localCharacter()
+    local char = localPlayer.Character
+    if char then
+        local hrp = char:FindFirstChild("HumanoidRootPart")
+        if hrp and hrp:IsA("BasePart") then
+            return char, hrp
+        end
+    end
+    return nil, nil
+end
+
+local function inTrial()
+    return localPlayer:GetAttribute("InstanceId") == "LuckyTimeTrial"
+end
+
+local function mazeModel()
+    local things = workspace:FindFirstChild("__THINGS")
+    local container = things and things:FindFirstChild("__INSTANCE_CONTAINER")
+    local active = container and container:FindFirstChild("Active")
+    return active and active:FindFirstChild("LuckyTimeTrial") or nil
+end
+
+-- Only real rooms carry RoomRole. Previews and gate frames do not, so they drop
+-- out of this list without any extra filtering.
+local function builtRooms(model)
+    local folder = model and model:FindFirstChild("Rooms")
+    if not folder then
+        return {}
+    end
+
+    local list = {}
+    for _, inst in ipairs(folder:GetChildren()) do
+        local role = inst:GetAttribute("RoomRole")
+        if type(role) == "string" then
+            list[#list + 1] = {
+                model = inst,
+                role = role,
+                onPath = inst:GetAttribute("OnPath") == true,
+                number = tonumber(inst:GetAttribute("RoomNumber")) or 0,
+                cellX = tonumber(inst:GetAttribute("CellX")) or 0,
+                cellY = tonumber(inst:GetAttribute("CellY")) or 0,
+            }
+        end
+    end
+    return list
+end
+
+local function pathOrder(rooms)
+    local path = {}
+    for _, room in ipairs(rooms) do
+        if room.onPath then
+            path[#path + 1] = room
+        end
+    end
+    table.sort(path, function(a, b)
+        return a.number < b.number
+    end)
+    return path
+end
+
+-- Middle of the room's breakable square, lifted clear of the floor so the
+-- character never spawns inside the floor slab.
+local function roomSpot(room)
+    local model = room.model
+    local floor = model:FindFirstChild("Floor")
+    local floorTop = floor and floor:IsA("BasePart") and (floor.Position.Y + floor.Size.Y * 0.5) or nil
+
+    local zones = model:FindFirstChild("BREAK_ZONES")
+    local zone = zones and zones:FindFirstChild("Zone")
+    if zone and zone:IsA("BasePart") then
+        return Vector3.new(zone.Position.X, (floorTop or zone.Position.Y) + 3.5, zone.Position.Z)
+    end
+
+    if floor and floor:IsA("BasePart") then
+        return floor.Position + Vector3.new(0, floor.Size.Y * 0.5 + 3.5, 0)
+    end
+
+    return nil
+end
+
+local function teleportPart(room)
+    for _, inst in ipairs(room.model:GetDescendants()) do
+        if inst:IsA("BasePart") and inst.Name == "TeleportPart" then
+            return inst
+        end
+    end
+    return nil
+end
+
+local function breakablesIn(spot)
+    local things = workspace:FindFirstChild("__THINGS")
+    local coins = things and things:FindFirstChild("Coins")
+    if not coins or not spot then
+        return {}
+    end
+
+    local out = {}
+    for _, coin in ipairs(coins:GetChildren()) do
+        local name = coin:GetAttribute("Name")
+        if type(name) == "string" and name:sub(1, 5) == "Maze " then
+            local marker = coin:FindFirstChild("POS")
+            local pos = marker and marker.Position
+            if pos and math.abs(pos.X - spot.X) <= 33 and math.abs(pos.Z - spot.Z) <= 33 then
+                out[#out + 1] = coin
+            end
+        end
+    end
+    return out
+end
+
+--==========================================================================
+-- Teleport / portal
+--==========================================================================
+
+local function seat(hrp, position)
+    hrp.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
+    hrp.AssemblyAngularVelocity = Vector3.new(0, 0, 0)
+    hrp.CFrame = CFrame.new(position)
+end
+
+-- Poke the trigger directly. Executor-only helper, so this is just a backup for
+-- when the humanoid never manages to register a real overlap.
+local firetouchinterest = firetouchinterest
+
+local function portalTaken(part, entrance)
+    if not part.Parent then
+        return true
+    end
+    local path = pathOrder(builtRooms(mazeModel()))
+    return path[1] ~= nil and path[1].model ~= entrance
+end
+
+-- Plain humanoid walk. MoveTo is re-issued on a short interval because the
+-- humanoid clears its destination whenever it recomputes a path, and the
+-- portal trigger only fires once the character actually overlaps it.
+local function walkTo(hrp, position, radius, timeout, portalPart, entrance)
+    local char = hrp.Parent
+    local hum = char and char:FindFirstChildOfClass("Humanoid")
+    if not hum then
+        return false
+    end
+
+    local originalWalkSpeed = hum.WalkSpeed
+    local step = MAZE_CONFIG.portalWalkStep
+    local deadline = os.clock() + timeout
+    local lastPush = 0
+
+    -- Always cancel the old MoveTo and restore the player's normal speed.
+    -- This is especially important when the portal teleports us mid-walk.
+    local function stopWalk()
+        pcall(function()
+            if hum.Parent then
+                hum:MoveTo(hrp.Position)
+                hum.WalkSpeed = originalWalkSpeed
+            end
+        end)
+    end
+
+    hum.WalkSpeed = MAZE_CONFIG.portalWalkSpeed
+    hum:MoveTo(position)
+
+    while os.clock() < deadline do
+        if not hrp.Parent or not hum.Parent then
+            stopWalk()
+            return false
+        end
+
+        -- The portal has loaded the next maze (or the trial ended). Do not
+        -- keep issuing MoveTo toward the old portal in the newly loaded room.
+        if not inTrial() or not portalPart.Parent or portalTaken(portalPart, entrance) then
+            stopWalk()
+            return true
+        end
+
+        local flat = Vector3.new(hrp.Position.X - position.X, 0, hrp.Position.Z - position.Z)
+        if flat.Magnitude <= radius then
+            stopWalk()
+            return true
+        end
+
+        if os.clock() - lastPush >= 0.2 then
+            lastPush = os.clock()
+            hum:MoveTo(position)
+        end
+
+        task.wait(step)
+    end
+
+    stopWalk()
+    return false
+end
+
+-- Executor touch helper, used only when the walk never produces a real overlap.
+local function forceTouch(hrp, part)
+    if not hrp or not part.Parent or not firetouchinterest then
+        return
+    end
+    pcall(firetouchinterest, hrp, part, 0)
+    pcall(firetouchinterest, hrp, part, 1)
+end
+
+-- Enter the exit portal so the game's own trigger fires, then fall back to a
+-- forced touch if the trigger never registers.
+local function walkIntoPortal(room)
+    if MAZE.portalBusy then
+        return
+    end
+
+    local part = teleportPart(room)
+    if not part then
+        return
+    end
+
+    MAZE.portalBusy = true
+    MAZE.status = "holding at exit portal"
+
+    task.spawn(function()
+        local entrance = MAZE.currentEntrance
+        local enterAt = os.clock() + MAZE_CONFIG.portalEnterDelay
+
+        -- Hold in the portal room for a moment so the run doesn't look like an
+        -- instant snap into the exit.
+        while os.clock() < enterAt do
+            if not part.Parent or portalTaken(part, entrance) then
+                break
+            end
+            local left = enterAt - os.clock()
+            MAZE.status = ("portal in %.1fs"):format(math.max(0, left))
+            task.wait(0.05)
+        end
+
+        if part.Parent and not portalTaken(part, entrance) then
+            MAZE.status = "walking to portal"
+            local _, hrp = localCharacter()
+            if hrp then
+                walkTo(hrp, part.Position, MAZE_CONFIG.portalWalkRadius, MAZE_CONFIG.portalWalkTimeout, part, entrance)
+            end
+        end
+
+        -- The walk can still miss when the trigger needs a fresh overlap, so
+        -- poke it directly before giving up.
+        local tries = 0
+        while part.Parent and not portalTaken(part, entrance) and tries < 3 do
+            tries = tries + 1
+            MAZE.status = "forcing portal touch"
+            local _, hrp = localCharacter()
+            forceTouch(hrp, part)
+            task.wait(0.15)
+        end
+
+        local waitUntil = os.clock() + MAZE_CONFIG.portalRetryTimeout
+        while os.clock() < waitUntil do
+            if portalTaken(part, entrance) or not inTrial() then
+                break
+            end
+            task.wait(0.05)
+        end
+
+        -- Clear any lingering movement command after the portal transition.
+        local _, currentRoot = localCharacter()
+        local currentCharacter = currentRoot and currentRoot.Parent
+        local currentHumanoid = currentCharacter and currentCharacter:FindFirstChildOfClass("Humanoid")
+        if currentHumanoid and currentRoot then
+            pcall(function()
+                currentHumanoid:MoveTo(currentRoot.Position)
+            end)
+        end
+
+        MAZE.portalBusy = false
+    end)
+end
+
+--==========================================================================
+-- Step
+--==========================================================================
+
+local lastStatus = 0
+
+local function step()
+    if not MAZE.enabled then
+        return
+    end
+
+    if not inTrial() then
+        if MAZE.status ~= "idle" then
+            MAZE.status = "idle"
+            MAZE.currentEntrance = nil
+        end
+        return
+    end
+
+    local model = mazeModel()
+    if not model then
+        MAZE.status = "waiting for maze model"
+        return
+    end
+
+    local path = pathOrder(builtRooms(model))
+    if #path == 0 then
+        MAZE.status = "waiting for first room"
+        return
+    end
+
+    -- A fresh entrance instance means the portal took and a new maze is up.
+    local entrance = path[1]
+    if entrance.model ~= MAZE.currentEntrance then
+        if MAZE.currentEntrance ~= nil then
+            MAZE.mazesDone = MAZE.mazesDone + 1
+            mlog("maze %d -> maze %d", MAZE.mazesDone, MAZE.mazesDone + 1)
+        end
+        MAZE.currentEntrance = entrance.model
+        MAZE.roomsCleared = 0
+    end
+
+    MAZE.roomsCleared = math.max(0, #path - 2)
+
+    local target = path[#path]
+    if target.role == "entrance" then
+        MAZE.status = "waiting for first gate"
+        return
+    end
+
+    if target.role == "end" then
+        walkIntoPortal(target)
+        return
+    end
+
+    if MAZE.portalBusy then
+        return
+    end
+
+    local spot = roomSpot(target)
+    if not spot then
+        MAZE.status = ("room %d has no floor"):format(target.number)
+        return
+    end
+
+    local _, hrp = localCharacter()
+    if not hrp then
+        MAZE.status = "no character"
+        return
+    end
+
+    if (hrp.Position - spot).Magnitude > MAZE_CONFIG.driftTolerance then
+        seat(hrp, spot)
+    end
+
+    local now = os.clock()
+    if now - lastStatus >= MAZE_CONFIG.statusInterval then
+        lastStatus = now
+        MAZE.status = ("room %d - %d breakable(s) left"):format(target.number, #breakablesIn(spot))
+    end
+end
+
+    MAZE.enabled = AutoMazeEnabled
+    MAZE.status = AutoMazeEnabled and "armed" or "idle"
+
+    local autoMazeConnection
+    autoMazeConnection = RunService.Heartbeat:Connect(function()
+        MAZE.enabled = AutoMazeEnabled
+        local ok, err = pcall(step)
+        if not ok then
+            MAZE.status = "error: " .. tostring(err)
+        end
+
+        autoMazeStatus.Text = AutoMazeEnabled
+            and ("Auto Maze: " .. tostring(MAZE.status))
+            or "Auto Maze: Off"
+        autoMazeStatus.TextColor3 = AutoMazeEnabled
+            and Color3.fromRGB(120, 220, 150)
+            or Color3.fromRGB(150, 160, 180)
+    end)
+
+    registerCleanup(function()
+        if autoMazeConnection and autoMazeConnection.Connected then
+            autoMazeConnection:Disconnect()
+        end
+        MAZE.enabled = false
+        MAZE.portalBusy = false
+    end)
+
     -- =====================================================================
     -- EGG CHANCES TAB
     -- =====================================================================
@@ -3862,22 +4266,27 @@ switchTab(hatchTab, hatchFrame)
             end
             if not directory then return liveEggs end
 
+            -- BUGFIX (from v3): egg.drops may be a STRING chaining to another
+            -- egg's drop list, not a table. resolveEggDrops follows the chain.
             for eggName, egg in pairs(directory.Eggs) do
-                if type(egg) == "table" and type(egg.drops) == "table" and egg.currency and egg.hatchable ~= false then
-                    local label = tostring(egg.displayName or egg._id or eggName)
-                    local lowerLabel = label:lower()
-                    if not egg.isExclusive and not egg.isGift and not egg.isPremium and not lowerLabel:find("exclusive", 1, true) then
-                        local probabilityMap = probabilityGetter(eggName)
-                        local pets = {}
-                        for _, drop in ipairs(egg.drops) do
-                            if type(drop) == "table" and type(drop[1]) == "string" and tonumber(drop[2]) then
-                                local chance = tonumber(drop[2])
-                                local mapped = type(probabilityMap) == "table" and tonumber(probabilityMap[drop[1]])
-                                if mapped then chance = mapped * 100 end
-                                table.insert(pets, { Name = drop[1], Chance = chance, Category = classifyPet(directory.Pets[drop[1]]) })
+                if type(egg) == "table" and egg.currency and egg.hatchable ~= false then
+                    local drops = resolveEggDrops(directory.Eggs, egg)
+                    if type(drops) == "table" then
+                        local label = tostring(egg.displayName or egg._id or eggName)
+                        local lowerLabel = label:lower()
+                        if not egg.isExclusive and not egg.isGift and not egg.isPremium and not lowerLabel:find("exclusive", 1, true) then
+                            local probabilityMap = probabilityGetter(eggName)
+                            local pets = {}
+                            for _, drop in ipairs(drops) do
+                                if type(drop) == "table" and type(drop[1]) == "string" and tonumber(drop[2]) then
+                                    local chance = tonumber(drop[2])
+                                    local mapped = type(probabilityMap) == "table" and tonumber(probabilityMap[drop[1]])
+                                    if mapped then chance = mapped * 100 end
+                                    table.insert(pets, { Name = drop[1], Chance = chance, Category = classifyPet(directory.Pets[drop[1]]) })
+                                end
                             end
+                            if #pets > 0 then table.insert(liveEggs, { Name = label, Pets = pets }) end
                         end
-                        if #pets > 0 then table.insert(liveEggs, { Name = label, Pets = pets }) end
                     end
                 end
             end
@@ -6773,6 +7182,15 @@ end
     end
     hatchFrame.CanvasSize = UDim2.new(0, 0, 0, 920)
 
+    -- Shared teleport primitives. The Auto Index driver needs to move the
+    -- player to the area whose egg drops a missing pet, so the world-load and
+    -- area-center helpers live at this scope instead of inside the teleport
+    -- tab block only. Assigned by buildTeleportTab(); no-ops until then.
+    local sharedGetCharacterRoot = nil
+    local sharedGetAreaCenter = nil
+    local sharedLoadWorldSafely = nil
+    local sharedIsTeleportBusy = function() return false end
+
     -- =====================================================================
     -- TELEPORT TAB UI
     -- =====================================================================
@@ -6886,6 +7304,9 @@ end
             if not root then return character, nil end
             return character, root
         end
+
+        -- Exposed for the Auto Index driver (see sharedGetCharacterRoot above).
+        sharedGetCharacterRoot = getCharacterRoot
 
         -- Area centre resolution, in order of reliability:
         --   1. the game's own spawn regions (flat pads sitting on the walkable floor)
@@ -7021,7 +7442,12 @@ end
             return result == true
         end
 
+        -- Exposed for the Auto Index driver (see sharedLoadWorldSafely above).
+        sharedGetAreaCenter = getAreaCenter
+        sharedLoadWorldSafely = loadWorldSafely
+
         local teleportBusy = false
+        sharedIsTeleportBusy = function() return teleportBusy end
 
         local function waitForAreaCenter(areaName, timeout)
             local deadline = os.clock() + (timeout or 10)
@@ -7796,7 +8222,9 @@ end
                     end
                     local id = model and model:GetAttribute("ID")
                     local cfg = id and (eggDirectory[id] or eggDirectory[tostring(id)])
-                    if cfg and type(cfg.drops) == "table" and not seen[part] then
+                    -- BUGFIX (from v3): accept eggs whose drops are a string
+                    -- chain by resolving them before the table check.
+                    if cfg and type(resolveEggDrops(eggDirectory, cfg) or nil) == "table" and not seen[part] then
                         seen[part] = true
                         local ok, cf, size = pcall(function()
                             local boxCF, boxSize = model:GetBoundingBox()
@@ -7927,7 +8355,10 @@ end
                 }
             end
 
-            for _, drop in ipairs(cfg.drops) do
+            -- BUGFIX (from v3): drops may be a string chain to another egg;
+            -- resolve it before iterating.
+            local drops = resolveEggDrops(eggDirectory, cfg) or {}
+            for _, drop in ipairs(drops) do
                 local petId, chance
                 if type(drop) == "table" then
                     petId = drop.petName or drop[1]
@@ -8179,13 +8610,15 @@ end
                 if rawId ~= nil then
                     local id = tostring(rawId)
                     local entry = eggDirectory[rawId] or eggDirectory[id]
-                    if type(entry) == "table" and type(entry.drops) == "table" then
+                    -- BUGFIX (from v3): accept eggs whose drops are a string
+                    -- chain by resolving them before the table check.
+                    if type(entry) == "table" and type(resolveEggDrops(eggDirectory, entry) or nil) == "table" then
                         return id, entry
                     end
                     -- Also support physical egg models named by display name.
                     local lowered = id:lower()
                     for directoryId, candidate in pairs(eggDirectory) do
-                        if type(candidate) == "table" and type(candidate.drops) == "table" then
+                        if type(candidate) == "table" and type(resolveEggDrops(eggDirectory, candidate) or nil) == "table" then
                             local display = tostring(candidate.displayName or candidate.name or directoryId):lower()
                             if display == lowered then
                                 return tostring(directoryId), candidate
@@ -8234,7 +8667,10 @@ end
 
             if closestEntry then
                 local petIds = {}
-                for _, drop in ipairs(closestEntry.drops) do
+                -- BUGFIX (from v3): drops may be a string chain to another
+                -- egg; resolve it before iterating.
+                local drops = resolveEggDrops(eggDirectory, closestEntry) or {}
+                for _, drop in ipairs(drops) do
                     if type(drop) == "table" and drop[1] ~= nil then
                         petIds[tostring(drop[1])] = true
                     end
@@ -8258,12 +8694,14 @@ end
             end)
 
             -- Match the working standalone EggDex script: some game versions
-            -- expose the live save through getgc even when SaveModule.Get()
-            -- is unavailable or returns an incomplete table.
+            -- expose the live save through the GC even when SaveModule.Get()
+            -- is unavailable or returns an incomplete table. Scanned with
+            -- filtergc (native table matcher) instead of a full heap dump: a
+            -- full heap materialisation freezes the client's Luau VM.
             if type(save) ~= "table" or type(save.Collection) ~= "table" or next(save.Collection) == nil then
                 local stats = localPlayer:FindFirstChild("leaderstats")
                 local diamonds = stats and stats:FindFirstChild("Diamonds")
-                if diamonds and type(getgc) == "function" then
+                if diamonds and type(filtergc) == "function" then
                     local targetDiamonds = diamonds.Value
                     if type(cachedGcCollectionSave) == "table"
                         and type(cachedGcCollectionSave.Collection) == "table"
@@ -8272,15 +8710,18 @@ end
                     elseif os.clock() >= nextGcCollectionScanAt then
                         nextGcCollectionScanAt = os.clock() + 2
                         pcall(function()
-                            for _, candidate in pairs(getgc(true)) do
+                            local match = filtergc("table", function(candidate)
                                 if type(candidate) == "table"
                                     and type(candidate.Collection) == "table"
                                     and type(candidate.Diamonds) == "number"
                                     and candidate.Diamonds == targetDiamonds then
-                                    cachedGcCollectionSave = candidate
-                                    save = candidate
-                                    break
+                                    return true
                                 end
+                                return false
+                            end, true)
+                            if type(match) == "table" then
+                                cachedGcCollectionSave = match
+                                save = match
                             end
                         end)
                     end
@@ -8516,6 +8957,435 @@ end
         end)
         refreshIndex()
 
+        -- =================================================================
+        -- AUTO INDEX
+        --
+        -- Full auto-complete for the pet index:
+        --   1. diff the save's Collection against the collectable catalog
+        --      (Base/Golden/Rainbow variants all count as separate entries)
+        --   2. pick the missing variant with the best drop chance and locate
+        --      an egg that can hatch it
+        --   3. teleport to that egg's area (reusing the Teleport tab's
+        --      world-load primitives) and drive "BuyX Egg" until owned
+        --   4. replan and continue until every indexed variant is owned
+        -- =================================================================
+        local autoIndexRunning = false
+        local autoIndexTarget = nil          -- { petId, variantId, eggId, areaName }
+        local autoIndexOwnedSnapshot = nil
+        local autoIndexCooldownUntil = 0
+        local autoIndexFailures = 0
+        local autoIndexOwnedPollAt = 0
+        local autoIndexEggAreaCache = {}
+        local autoIndexCatalog = nil
+        local autoIndexNoProgressTries = 0
+
+        local function autoIndexSetStatus(text)
+            if TAB_TOTAL.indexUI.autoStatus and TAB_TOTAL.indexUI.autoStatus.Parent then
+                TAB_TOTAL.indexUI.autoStatus.Text = text
+            end
+        end
+
+        -- petId -> { { eggId, chance, variants = { [1]=true, ... } } }, built
+        -- from the same directory fields the Egg Chances tab filters on.
+        local function buildAutoIndexCatalog()
+            local eggDirectory = Library.Directory and Library.Directory.Eggs
+            if type(eggDirectory) ~= "table" then return nil end
+            local byPet = {}
+            for eggId, egg in pairs(eggDirectory) do
+                if type(egg) == "table"
+                    and egg.hatchable ~= false
+                    and not egg.isExclusive
+                    and not egg.isGift
+                    and not egg.isPremium then
+                    local drops = resolveEggDrops(eggDirectory, egg)
+                    if type(drops) == "table" then
+                        -- Same variant rules as buildNearbyPanelRows: golden
+                        -- eggs only yield golden/rainbow, disableModifiers
+                        -- eggs only base, everything else all three unless
+                        -- individually disabled.
+                        local variants = {}
+                        if egg.isGolden then
+                            variants[2] = true
+                            if not egg.disableRainbow then variants[3] = true end
+                        elseif egg.disableModifiers then
+                            variants[1] = true
+                        else
+                            variants[1] = true
+                            if not egg.disableGold then variants[2] = true end
+                            if not egg.disableRainbow then variants[3] = true end
+                        end
+                        for _, drop in ipairs(drops) do
+                            local petId, chance
+                            if type(drop) == "table" then
+                                petId = drop.petName or drop[1]
+                                chance = tonumber(drop.chance or drop[2]) or 0
+                            end
+                            if type(petId) == "string" then
+                                local list = byPet[petId]
+                                if not list then
+                                    list = {}
+                                    byPet[petId] = list
+                                end
+                                list[#list + 1] = {
+                                    eggId = tostring(eggId),
+                                    chance = chance,
+                                    variants = variants,
+                                }
+                            end
+                        end
+                    end
+                end
+            end
+            return byPet
+        end
+
+        -- Resolve which map area an egg lives in. Preferred source: the live
+        -- capsule hierarchy (Workspace.__MAP.Eggs.<area>.Eggs), which also
+        -- proves the egg is physically present in the loaded world. Directory
+        -- area/zone fields are used as a fallback for eggs in other worlds.
+        local function findEggArea(eggId, eggCfg)
+            if autoIndexEggAreaCache[eggId] ~= nil then
+                return autoIndexEggAreaCache[eggId]
+            end
+
+            local map = Workspace:FindFirstChild("__MAP")
+            local eggsRoot = map and map:FindFirstChild("Eggs")
+            if eggsRoot then
+                for _, areaFolder in ipairs(eggsRoot:GetChildren()) do
+                    for _, model in ipairs(areaFolder:GetDescendants()) do
+                        if model:IsA("Model") and model.Name == "Egg Capsule"
+                            and tostring(model:GetAttribute("ID")) == eggId then
+                            autoIndexEggAreaCache[eggId] = areaFolder.Name
+                            return areaFolder.Name
+                        end
+                    end
+                end
+            end
+
+            local areas = Library.Directory and Library.Directory.Areas
+            for _, field in ipairs({ "area", "zone", "Area", "Zone" }) do
+                local candidate = type(eggCfg) == "table" and eggCfg[field] or nil
+                if type(candidate) == "string" and type(areas) == "table" and areas[candidate] then
+                    autoIndexEggAreaCache[eggId] = candidate
+                    return candidate
+                end
+            end
+            return nil
+        end
+
+        -- Build the work list: every missing petId#variant with its best egg
+        -- (highest drop chance) and that egg's area, most obtainable first.
+        local function buildAutoIndexPlan(owned)
+            if not autoIndexCatalog then
+                autoIndexCatalog = buildAutoIndexCatalog()
+            end
+            if type(autoIndexCatalog) ~= "table" then return nil end
+
+            if not cachedIndexCollectables then
+                local ok, result = pcall(function()
+                    return Library.Shared.GetAllCollectablePets()
+                end)
+                if ok and type(result) == "table" then
+                    cachedIndexCollectables = result
+                end
+            end
+            if type(cachedIndexCollectables) ~= "table" then return nil end
+
+            local eggDirectory = Library.Directory and Library.Directory.Eggs
+            local plan, seen, skipped = {}, {}, 0
+            for _, entry in ipairs(cachedIndexCollectables) do
+                local petId = entry.petId
+                local variantId
+                if entry.isGolden then
+                    variantId = 2
+                elseif entry.isRainbow then
+                    variantId = 3
+                elseif not entry.isDarkMatter then
+                    variantId = 1
+                end
+                if petId ~= nil and variantId then
+                    local id = tostring(petId)
+                    local key = id .. "#" .. variantId
+                    if not seen[key] and owned[key] ~= true then
+                        seen[key] = true
+                        local best, bestChance = nil, -1
+                        for _, source in ipairs(autoIndexCatalog[id] or {}) do
+                            if source.variants[variantId] and source.chance > bestChance then
+                                best = source
+                                bestChance = source.chance
+                            end
+                        end
+                        if best then
+                            local eggCfg = type(eggDirectory) == "table" and (eggDirectory[best.eggId] or eggDirectory[tostring(best.eggId)]) or nil
+                            local areaName = findEggArea(best.eggId, eggCfg)
+                            if areaName then
+                                plan[#plan + 1] = {
+                                    petId = id,
+                                    variantId = variantId,
+                                    eggId = best.eggId,
+                                    areaName = areaName,
+                                    chance = bestChance,
+                                }
+                            else
+                                skipped += 1
+                            end
+                        else
+                            skipped += 1
+                        end
+                    end
+                end
+            end
+
+            table.sort(plan, function(a, b)
+                if a.chance ~= b.chance then return a.chance > b.chance end
+                if a.petId ~= b.petId then return a.petId < b.petId end
+                return a.variantId < b.variantId
+            end)
+            return plan, skipped
+        end
+
+        -- Same flow as the Teleport tab's teleportToArea, minus the UI status
+        -- writes: load the target world when needed, then drop onto the area
+        -- center once its geometry has streamed in.
+        local function autoIndexTeleportToArea(areaName)
+            local areaData = Library.Directory.Areas and Library.Directory.Areas[areaName]
+            local targetWorld = type(areaData) == "table" and areaData.world or nil
+            local currentWorld = nil
+            pcall(function() currentWorld = Library.WorldCmds.Get() end)
+
+            local _, root = sharedGetCharacterRoot()
+            if not root then return false, "character not loaded" end
+
+            if not targetWorld or targetWorld == currentWorld then
+                local center = sharedGetAreaCenter(areaName)
+                if not center then return false, areaName .. " not found in this world" end
+                pcall(function() root.CFrame = CFrame.new(center) end)
+                return true
+            end
+
+            local worldData = Library.Directory.Worlds and Library.Directory.Worlds[targetWorld]
+            if type(worldData) ~= "table" or worldData.disabled == true or worldData.releasedToPlayers == false then
+                return false, tostring(targetWorld) .. " is disabled in-game"
+            end
+
+            if not sharedLoadWorldSafely(targetWorld) then
+                return false, "failed to load " .. tostring(targetWorld)
+            end
+            local landedWorld = nil
+            pcall(function() landedWorld = Library.WorldCmds.Get() end)
+            if landedWorld ~= targetWorld then
+                return false, "failed to load " .. tostring(targetWorld)
+            end
+
+            local deadline = os.clock() + 10
+            local center = nil
+            while os.clock() < deadline do
+                center = sharedGetAreaCenter(areaName)
+                if center then break end
+                task.wait(0.25)
+            end
+            if not center then return false, areaName .. " has no spawn point" end
+            task.wait(0.35)
+
+            local _, newRoot = sharedGetCharacterRoot()
+            if not newRoot then return false, "character missing after world load" end
+            pcall(function() newRoot.CFrame = CFrame.new(center) end)
+            return true
+        end
+
+        local function setAutoIndexState(enabled)
+            enabled = enabled == true
+            autoIndexRunning = enabled
+            SetSetting("AutoIndexEnabled", enabled)
+            saveSettings()
+
+            local btn = TAB_TOTAL.indexUI.autoBtn
+            if btn and btn.Parent then
+                btn:SetAttribute("ToggleState", enabled)
+                btn.BackgroundColor3 = enabled and activeTheme.controlOn or activeTheme.surface
+                btn.Text = "Auto Index: " .. (enabled and "ON" or "OFF")
+                btn.TextColor3 = enabled and Color3.fromRGB(255, 255, 255) or Color3.fromRGB(180, 180, 190)
+            end
+            if not enabled then
+                autoIndexTarget = nil
+                autoIndexOwnedSnapshot = nil
+                autoIndexSetStatus("Stopped")
+            end
+        end
+
+        TAB_TOTAL.indexUI.autoBtn.MouseButton1Click:Connect(function()
+            setAutoIndexState(not autoIndexRunning)
+        end)
+
+        -- Restored setting: start the driver shortly after load, once the
+        -- teleport primitives from the Teleport tab are in place.
+        if GetSetting("AutoIndexEnabled", false) == true then
+            task.delay(2, function()
+                if ui.Parent then setAutoIndexState(true) end
+            end)
+        end
+
+        task.spawn(function()
+            while ui.Parent do
+                if not autoIndexRunning then
+                    task.wait(0.5)
+                elseif not RawNet.invoke then
+                    autoIndexSetStatus("Network unavailable.")
+                    task.wait(2)
+                elseif AutoBuying then
+                    -- The main Auto-Hatch toggle already drives "BuyX Egg";
+                    -- running both would double the remote traffic.
+                    autoIndexSetStatus("Waiting: Auto-Hatch Egg is active.")
+                    task.wait(1)
+                elseif sharedIsTeleportBusy() then
+                    autoIndexSetStatus("Waiting: manual teleport running.")
+                    task.wait(1)
+                else
+                    -- Refresh ownership at most once per second; hatching is
+                    -- the slow path, the save does not change faster usefully.
+                    local owned, hasSave
+                    if os.clock() >= autoIndexOwnedPollAt then
+                        autoIndexOwnedPollAt = os.clock() + 1
+                        owned, hasSave = readIndexOwned()
+                        autoIndexOwnedSnapshot = hasSave and owned or nil
+                    else
+                        owned = autoIndexOwnedSnapshot
+                    end
+
+                    if type(owned) ~= "table" then
+                        autoIndexSetStatus("Waiting for save data...")
+                        task.wait(1)
+                    else
+                        local needPlan = not autoIndexTarget
+                            or owned[autoIndexTarget.petId .. "#" .. autoIndexTarget.variantId] == true
+
+                        if needPlan then
+                            local plan, skipped = buildAutoIndexPlan(owned)
+                            local nextEntry = nil
+                            if type(plan) == "table" then
+                                for _, entry in ipairs(plan) do
+                                    nextEntry = entry
+                                    break
+                                end
+                            end
+
+                            if not nextEntry then
+                                if type(plan) == "table" then
+                                    -- Entries whose egg lives in an unloaded
+                                    -- world cannot be resolved to an area yet.
+                                    -- Retry periodically instead of declaring
+                                    -- victory, so world loads can unstick them.
+                                    if skipped > 0 and autoIndexNoProgressTries < 5 then
+                                        autoIndexNoProgressTries += 1
+                                        autoIndexSetStatus(("Waiting on %d unreachable variants (retry %d/5)..."):format(skipped, autoIndexNoProgressTries))
+                                        task.wait(6)
+                                    else
+                                        setAutoIndexState(false)
+                                        autoIndexSetStatus(skipped > 0
+                                            and ("Done: %d missing variants have no reachable egg."):format(skipped)
+                                            or "Index complete!")
+                                    end
+                                else
+                                    autoIndexSetStatus("Egg directory unavailable.")
+                                    task.wait(3)
+                                end
+                            else
+                                autoIndexNoProgressTries = 0
+                                autoIndexTarget = {
+                                    petId = nextEntry.petId,
+                                    variantId = nextEntry.variantId,
+                                    eggId = nextEntry.eggId,
+                                    areaName = nextEntry.areaName,
+                                }
+                                autoIndexFailures = 0
+                                autoIndexSetStatus("Next: " .. autoIndexTarget.petId
+                                    .. " (" .. variantNames[autoIndexTarget.variantId] .. ")")
+                            end
+                        elseif autoIndexTarget then
+                            -- Make sure we are standing in the target area, then
+                            -- hatch with the same 0.25s cooldown the Auto-Hatch
+                            -- fallback uses (tested safe against the server).
+                            local _, root = sharedGetCharacterRoot()
+                            local map = Workspace:FindFirstChild("__MAP")
+                            local eggsRoot = map and map:FindFirstChild("Eggs")
+                            local areaFolder = eggsRoot and eggsRoot:FindFirstChild(autoIndexTarget.areaName) or nil
+                            local capsuleInRange = false
+                            if areaFolder and root then
+                                for _, model in ipairs(areaFolder:GetDescendants()) do
+                                    if model:IsA("Model") and model.Name == "Egg Capsule"
+                                        and tostring(model:GetAttribute("ID")) == autoIndexTarget.eggId then
+                                        local part = model.PrimaryPart or model:FindFirstChildWhichIsA("BasePart")
+                                        if part and root.Position and (root.Position - part.Position).Magnitude < 40 then
+                                            capsuleInRange = true
+                                        end
+                                        break
+                                    end
+                                end
+                            end
+
+                            if not capsuleInRange then
+                                autoIndexSetStatus("Teleporting to " .. autoIndexTarget.areaName .. "...")
+                                local okMove, moveError = autoIndexTeleportToArea(autoIndexTarget.areaName)
+                                if not okMove then
+                                    autoIndexFailures += 1
+                                    autoIndexSetStatus("Teleport failed: " .. tostring(moveError))
+                                    -- Drop the unreachable target and replan so a
+                                    -- broken area cannot stall the whole run.
+                                    if autoIndexFailures >= 2 then
+                                        autoIndexTarget = nil
+                                        autoIndexFailures = 0
+                                    end
+                                    task.wait(2)
+                                else
+                                    task.wait(0.5)
+                                end
+                            elseif os.clock() < autoIndexCooldownUntil then
+                                task.wait(0.05)
+                            elseif (tonumber(Library.Variables.OpeningEgg) or 0) > 0 then
+                                task.wait(0.1)
+                            else
+                                local okAction, canAct = pcall(function() return Library.WorldCmds.CanDoAction() end)
+                                if okAction and canAct == false then
+                                    task.wait(0.25)
+                                else
+                                    autoIndexCooldownUntil = os.clock() + 0.25
+                                    local invoked, result, err = RawNet.invoke("BuyX Egg", autoIndexTarget.eggId)
+                                    local label = autoIndexTarget.petId .. " ("
+                                        .. variantNames[autoIndexTarget.variantId] .. ") ← "
+                                        .. autoIndexTarget.eggId
+                                    if not invoked then
+                                        autoIndexFailures += 1
+                                        autoIndexSetStatus("Hatching " .. label .. " (retrying)")
+                                    elseif result == true then
+                                        autoIndexFailures = 0
+                                        autoIndexSetStatus("Hatching " .. label)
+                                    elseif type(err) == "string" and err:find("too quickly") then
+                                        autoIndexCooldownUntil = os.clock() + 0.5
+                                    elseif type(err) == "string" and err:find("too far") then
+                                        -- Walked/pushed away from the capsule; move back.
+                                        autoIndexCooldownUntil = os.clock() + 1.0
+                                        local center = sharedGetAreaCenter(autoIndexTarget.areaName)
+                                        if center and root then
+                                            pcall(function() root.CFrame = CFrame.new(center) end)
+                                        end
+                                    else
+                                        autoIndexFailures += 1
+                                        autoIndexSetStatus("Buy failed: " .. tostring(err))
+                                    end
+
+                                    if autoIndexFailures >= 5 then
+                                        autoIndexCooldownUntil = os.clock() + 5
+                                        autoIndexFailures = 0
+                                    end
+                                end
+                            end
+                            task.wait(0.05)
+                        end
+                    end
+                end
+            end
+        end)
+
         -- Keep the floating missing-pets panel independent from the normal
         -- Index list. Ownership is polled every 0.60 seconds for near-real-time
         -- updates; the heavier egg hierarchy sweep runs only every 8 seconds.
@@ -8586,11 +9456,96 @@ end
 	end)
 
 
--- AUTO LOOTBAG + ORB PICKUP
--- Uses the existing game network API; loops remain isolated and guarded.
+-- =====================================================================
+-- FAST PET SPEED (speed-multiplier hook)
+--
+-- How pet speed actually works in this game (read from the live scripts):
+-- pets are NOT Humanoid-driven. PetRendering actors move each pet using
+--   speed = petSpeed * petSpeedMult
+-- where petSpeedMult comes from PlayerPet:CalculateSpeedMultiplier()
+-- (base 2, +0.2 per "Pet Walkspeed" upgrade tier while farming, plus
+-- Happy/Royalty/enchant/token buffs). PlayerPet has its own 1-second
+-- loop that recalculates every pet's multiplier and Broadcast()s it to
+-- the renderer, so hooking CalculateSpeedMultiplier is the single
+-- override point: the game then spreads the speed itself.
+--
+-- The previous approach (writing save.Upgrades["Pet Walkspeed"] and
+-- pushing Humanoid.WalkSpeed) did nothing: UpgradesPurchased is the
+-- table the game reads (tier booleans I..V), and pets have no usable
+-- Humanoid movement.
+-- =====================================================================
+-- Clamp: this is a speed MULTIPLIER (pets move at petSpeed * mult), not a
+-- WalkSpeed. Old sessions persisted 100000, which would fling pets.
+local FastPetSpeedValue = math.clamp(tonumber(GetSetting("FastPetSpeedValue", 50)) or 50, 1, 1000)
+local FastPetSpeedApplied = false
+local OriginalCalculateSpeedMultiplier = nil
+local PlayerPetModule = nil
+
+local function applyFastPetSpeed(enabled)
+    FastPetSpeed = enabled == true
+
+    if not enabled then
+        -- Restore the game's own function; its 1-second recalc loop then
+        -- puts every pet back on its real multiplier.
+        pcall(function()
+            if OriginalCalculateSpeedMultiplier and PlayerPetModule then
+                PlayerPetModule.CalculateSpeedMultiplier = OriginalCalculateSpeedMultiplier
+            end
+        end)
+        OriginalCalculateSpeedMultiplier = nil
+        FastPetSpeedApplied = false
+        return
+    end
+
+    pcall(function()
+        PlayerPetModule = PlayerPetModule or require(ReplicatedStorage.Library.Client.PlayerPet)
+        if type(PlayerPetModule) ~= "table" or type(PlayerPetModule.CalculateSpeedMultiplier) ~= "function" then
+            return
+        end
+
+        local minimum = math.max(1, tonumber(FastPetSpeedValue) or 50)
+
+        if not FastPetSpeedApplied then
+            OriginalCalculateSpeedMultiplier = PlayerPetModule.CalculateSpeedMultiplier
+            FastPetSpeedApplied = true
+        end
+
+        PlayerPetModule.CalculateSpeedMultiplier = function(self, ...)
+            local okMult, mult = pcall(OriginalCalculateSpeedMultiplier, self, ...)
+            if okMult and type(mult) == "number" then
+                return math.max(mult, minimum)
+            end
+            return minimum
+        end
+    end)
+end
+
+-- The toggle row lives in the UI block above, which runs before this engine
+-- is defined; publish the function through the forward slot so enable/disable
+-- applies instantly (and OFF restores the real upgrade + humanoid speeds).
+ApplyFastPetSpeedFn = applyFastPetSpeed
+
+SetSetting("FastPetSpeedValue", FastPetSpeedValue, function(v)
+    FastPetSpeedValue = tonumber(v) or 50
+    -- Re-apply immediately when the value changes while the feature is on.
+    if FastPetSpeed then
+        pcall(applyFastPetSpeed, true)
+    end
+end)
+
+registerCleanup(function()
+    -- Restore the game's own speed calculation on unload, even if the flag
+    -- was already cleared by the UI toggle.
+    if FastPetSpeed or FastPetSpeedApplied then
+        pcall(applyFastPetSpeed, false)
+        FastPetSpeed = false
+    end
+end)
+
+-- AUTO LOOTBAG PICKUP
+-- Uses the existing game network API; loop remains isolated and guarded.
 pcall(function()
     local AutoPickupLootbags = Library.Things:FindFirstChild("Lootbags")
-    local AutoPickupOrbs = Library.Things:FindFirstChild("Orbs")
     local AutoPickupLootbagSent = {}
 
     -- Lootbags: use the same network request as the game's Lootbags module.
@@ -8623,33 +9578,6 @@ pcall(function()
             end
         end
     end)
-
-    -- Orbs: send the visible orb IDs in the same batched request used by the
-    -- game. Orbs only change on world events, so a 1 Hz poll is plenty and the
-    -- old 0.25 s poll was pure overhead.
-    task.spawn(function()
-        local lastBatch = ""
-        while true do
-            if AutoPickupOrbs then
-                local ids, batch = {}, ""
-                for _, orb in ipairs(AutoPickupOrbs:GetChildren()) do
-                    if orb and orb.Parent and orb.Name ~= "" then
-                        table.insert(ids, orb.Name)
-                        batch ..= orb.Name .. ","
-                    end
-                end
-                if #ids > 0 and batch ~= lastBatch then
-                    lastBatch = batch
-                    pcall(function()
-                        Library.Network.Fire("Claim Orbs", ids)
-                    end)
-                end
-                task.wait(1)
-            else
-                task.wait(1)
-            end
-        end
-    end)
 end)
 
 -- =====================================================================
@@ -8667,8 +9595,8 @@ registerCleanup(function()
     PotatoMode = false
     AutoCollectFreeGifts = false
     AutoFarmComet = false
-    FastPetSpeed = false
     FastAttackSpeed = false
+    FastPetSpeed = false
     AutoBuying = false
     
     -- Clean up UI elements
@@ -8678,21 +9606,6 @@ registerCleanup(function()
         end
         if playerGui:FindFirstChild("CombinedAutomationAfkUI") then
             playerGui.CombinedAutomationAfkUI:Destroy()
-        end
-    end)
-    
-    -- Restore pet walkspeed upgrade
-    pcall(function()
-        if SaveModule and SaveModule.Get then
-            local save = SaveModule.Get()
-            if save and FastPetSpeedApplied then
-                if PetWalkspeedUpgradeWasPresent then
-                    save.Upgrades["Pet Walkspeed"] = OriginalPetWalkspeedUpgrade
-                else
-                    save.Upgrades["Pet Walkspeed"] = nil
-                end
-                FastPetSpeedApplied = false
-            end
         end
     end)
     
@@ -8720,7 +9633,7 @@ end)
 -- Script fully loaded indicator
 if getgenv then
     getgenv().PetDimensionsLoaded = true
-    getgenv().PetDimensionsVersion = "RealExecutor_Optimized_v2"
+    getgenv().PetDimensionsVersion = "RealExecutor_Optimized_v2+v3fixes"
 end
 
 return {
