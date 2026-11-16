@@ -312,11 +312,60 @@ local AutoFarmComet = false
 local FastAttackSpeed = false
 local FastAttackInterval = 0.02
 local FastPetSpeed = false
+-- Auto Diamond Packs state. Lives at the top level so the Farm tab toggle
+-- and the buy engine (defined further down) read the same variables.
+local AutoDiamondPacks = false
+local DiamondPackStatus = "Idle"
+local DiamondPackLastStock = -1
+local DiamondPackStockText = ""
 -- Forward declaration: the "Fast Pet Speed" toggle row is created inside the
 -- UI block, which runs BEFORE the Fast Pet Speed engine is defined further
 -- down the file. The toggle calls through this slot (nil-safe) so enabling
 -- applies instantly and disabling actually restores the real upgrade.
 local ApplyFastPetSpeedFn = nil
+
+-- AFK tab state. Kept at the top level because the toggle rows are built
+-- inside the UI task while the engines run from other threads; every reader
+-- must resolve the same variable.
+local AutoGroupRewards = false
+local AutoSpinnyWheels = false
+local AutoPotionUpgrade = false
+local AutoPotionUse = false
+local AutoQuests = false
+local AutoQuestsSide = false
+local AfkGroupStatus = "Idle"
+local AfkWheelStatus = "Idle"
+local AfkPotionStatus = "Idle"
+local AfkPotionUseStatus = "Idle"
+local AfkQuestStatus = "Idle"
+local AfkSideQuestStatus = "Idle"
+
+-- Quest driver outputs. The auto-farm coin selector reads QuestCoinFilter and
+-- the auto-hatch loop reads QuestTargetEggId, so the quest engine can steer the
+-- automation that already exists instead of duplicating it.
+--
+-- QuestAreaFarmWanted is the third output: the quest driver raises it for
+-- breakable objectives, and the quest auto-farm manager below responds by
+-- turning on the game's OWN Auto Farm (the same engine the Autofarm button in
+-- the Tools bar toggles). The player is only ever parked at the area centre -
+-- the game's engine walks the pets over every breakable itself.
+local QuestCoinFilter = nil
+local QuestFarmActive = false
+local QuestAreaFarmWanted = false
+-- The area the quest driver wants the game's Auto Farm to work. nil means
+-- "any area is fine" (the driver has not picked one yet). The manager loop
+-- compares it against the engine's own AutoFarmArea and forces a re-capture
+-- when they disagree, because the engine only re-captures after a world
+-- change - not when the player walks somewhere else.
+local QuestAreaFarmTarget = nil
+local QuestTargetEggId = nil
+local QuestTargetEggLabel = nil
+-- Set for hatch objectives that accept any egg ("hatch N eggs"). The steering
+-- block then parks the player on the closest egg capsule.
+local QuestHatchAnywhere = false
+-- True while the quest manager - not the player - is the reason the game's
+-- Auto Farm is on, so it is only ever turned back off by the same path.
+local QuestOwnedAutoFarm = false
 
 -- Hatch state lives at the top level so every loop (including the egg-open
 -- cleanup poller, which is created long before the UI thread) reads the SAME
@@ -326,6 +375,12 @@ local HatchWatchdogStatus = "Idle"
 local HatchLastEgg = 0
 local HatchCooldownUntil = 0
 local HatchFailures = 0
+-- Egg chosen by the Auto Farm tab; preferred by currentHatchEggId() when its
+-- capsule is in the current map. Stays nil when the tab is not being used.
+local AutoFarmTabTargetEgg = nil
+-- True while the Auto Farm tab is actively driving game auto-farm + hatch.
+-- Gates the tab's watchdog thread and currentHatchEggId's egg override.
+local AutoFarmTabActive = false
 
 -- Idle-aware waiting. Every automation loop in this script used to spin at its
 -- full attack rate even when its feature was switched off, which burned frame
@@ -431,7 +486,64 @@ end
 -- GENERIC CLOSEST-COIN TARGETING
 -- Finds any rendered coin under Workspace.__THINGS.Coins, regardless of
 -- coin type. The closest living coin to the player becomes the target.
+--
+-- When the quest driver is working a breakable objective it publishes a
+-- filter in QuestCoinFilter: `kind` matches the coin's directory masteryClass
+-- ("Chest", "Present", "Mob", ...), `kindPrefix` matches a masteryClass prefix
+-- (used for the family of Lucky * blocks), `name` matches the coin's own
+-- directory key, and `lowestHealth` picks the weakest match instead of the
+-- nearest one.
 -- =====================================================================
+local function coinMatchesQuestFilter(root)
+    local filter = QuestCoinFilter
+    if not filter then return true end
+
+    local attrName = root:GetAttribute("Name")
+    local key = attrName ~= nil and tostring(attrName) or nil
+
+    if filter.name and key ~= filter.name then
+        return false
+    end
+
+    if filter.kind or filter.kindPrefix then
+        local def = key and Library.Directory.Coins[key] or nil
+        local mc = type(def) == "table" and tostring(def.masteryClass) or ""
+        if filter.kind and mc ~= filter.kind then
+            return false
+        end
+        if filter.kindPrefix and mc:sub(1, #filter.kindPrefix) ~= filter.kindPrefix then
+            return false
+        end
+    end
+
+    return true
+end
+
+
+-- Kept at top level so the large Auto Quests/UI closure does not exceed
+-- Luau's 200-local-register limit.
+local function richestAreaForFilter(filter)
+    local things = Workspace:FindFirstChild("__THINGS")
+    local coinsFolder = things and things:FindFirstChild("Coins")
+    if not coinsFolder or not filter then return nil end
+    local counts = {}
+    for _, coin in ipairs(coinsFolder:GetChildren()) do
+        if coinMatchesQuestFilter(coin) then
+            local area = coin:GetAttribute("Area")
+            if area ~= nil then
+                area = tostring(area)
+                counts[area] = (counts[area] or 0) + 1
+            end
+        end
+    end
+    local bestArea, bestCount = nil, 0
+    for area, count in pairs(counts) do
+        if count > bestCount then bestArea, bestCount = area, count end
+    end
+    return bestArea
+end
+
+
 local function FindClosestCoin(previous)
     local things = Workspace:FindFirstChild("__THINGS")
     local coinsFolder = things and things:FindFirstChild("Coins")
@@ -441,56 +553,62 @@ local function FindClosestCoin(previous)
     local hrp = character and character:FindFirstChild("HumanoidRootPart")
     if not hrp then return nil end
 
+    local filter = QuestCoinFilter
     local closest, closestDistance = nil, math.huge
+    local weakest, weakestHealth = nil, math.huge
     local checked = {}
 
-    -- Normal coins are direct children of __THINGS.Coins, just like the
-    for _, coin in ipairs(coinsFolder:GetChildren()) do
-        if coin.Parent and not checked[coin] then
-            local root = coin:GetAttribute("ID") ~= nil and coin or GetCoinRootFromInstance(coin)
-            if root and root.Parent and not checked[root] then
-                checked[root] = true
-                local id = root:GetAttribute("ID")
-                local position = GetCoinPosition(root)
-                local health = tonumber(root:GetAttribute("Health"))
-                local coinPart = root:FindFirstChild("Coin", true)
-                local preventClick = coinPart and coinPart:GetAttribute("PreventClick")
+    local function consider(root)
+        if not root or not root.Parent or checked[root] then return end
+        checked[root] = true
 
-                if id ~= nil and position and not preventClick and (health == nil or health > 0) then
-                    local distance = (hrp.Position - position).Magnitude
-                    if distance < closestDistance then
-                        closestDistance = distance
-                        closest = root
-                    end
-                end
+        local id = root:GetAttribute("ID")
+        local position = GetCoinPosition(root)
+        local health = tonumber(root:GetAttribute("Health"))
+        local coinPart = root:FindFirstChild("Coin", true)
+        local preventClick = coinPart and coinPart:GetAttribute("PreventClick")
+
+        if id == nil or not position or preventClick or (health ~= nil and health <= 0) then
+            return
+        end
+        if filter and not coinMatchesQuestFilter(root) then
+            return
+        end
+
+        local distance = (hrp.Position - position).Magnitude
+        if distance < closestDistance then
+            closestDistance = distance
+            closest = root
+        end
+
+        if filter and filter.lowestHealth then
+            local value = health or math.huge
+            if value < weakestHealth then
+                weakestHealth = value
+                weakest = root
             end
         end
+    end
+
+    -- Normal coins are direct children of __THINGS.Coins.
+    for _, coin in ipairs(coinsFolder:GetChildren()) do
+        consider(coin:GetAttribute("ID") ~= nil and coin or GetCoinRootFromInstance(coin))
     end
 
     -- Fallback for coins nested under another container.
     if not closest then
         for _, instance in ipairs(coinsFolder:GetDescendants()) do
-            local root = GetCoinRootFromInstance(instance)
-            if root and root.Parent and not checked[root] then
-                checked[root] = true
-                local id = root:GetAttribute("ID")
-                local position = GetCoinPosition(root)
-                local health = tonumber(root:GetAttribute("Health"))
-                local coinPart = root:FindFirstChild("Coin", true)
-                local preventClick = coinPart and coinPart:GetAttribute("PreventClick")
-                if id ~= nil and position and not preventClick and (health == nil or health > 0) then
-                    local distance = (hrp.Position - position).Magnitude
-                    if distance < closestDistance then
-                        closestDistance = distance
-                        closest = root
-                    end
-                end
-            end
+            consider(GetCoinRootFromInstance(instance))
         end
     end
 
+    if filter and filter.lowestHealth and weakest then return weakest end
     if closest then return closest end
-    if previous and previous.Parent and previous:GetAttribute("ID") ~= nil then return previous end
+    if previous and previous.Parent and previous:GetAttribute("ID") ~= nil then
+        if not filter or coinMatchesQuestFilter(previous) then
+            return previous
+        end
+    end
     return nil
 end
 
@@ -890,7 +1008,7 @@ local LastCoinTeleportTarget = nil
 -- Find and select the target at a lower rate than the actual attack loop.
 task.spawn(function()
     while true do
-        if AutoTap or AutoTeleportClosestCoin then
+        if AutoTap or AutoTeleportClosestCoin or QuestFarmActive then
             local previous = CurrentCoinTarget
             local target = FindClosestCoin(previous)
 
@@ -911,7 +1029,7 @@ task.spawn(function()
                         end)
                         LastCoinInteractionTarget = target
 
-                        if AutoTap then
+                        if AutoTap or QuestFarmActive then
                             local pets = RefreshCachedEquippedPets(true)
                             if #pets > 0 then
                                 pcall(function()
@@ -929,10 +1047,10 @@ task.spawn(function()
 
                     -- Teleport only when the target changes instead of
                     -- repeatedly setting CFrame every frame.
-                    if AutoTeleportClosestCoin and (changed or LastCoinTeleportTarget ~= target) then
+                    if (AutoTeleportClosestCoin or QuestFarmActive) and (changed or LastCoinTeleportTarget ~= target) then
                         TeleportToClosestCoin(target)
                         LastCoinTeleportTarget = target
-                    elseif not AutoTeleportClosestCoin then
+                    elseif not (AutoTeleportClosestCoin or QuestFarmActive) then
                         LastCoinTeleportTarget = nil
                     end
                 else
@@ -951,7 +1069,7 @@ task.spawn(function()
             LastCoinTeleportTarget = nil
         end
 
-        task.wait((AutoTap or AutoTeleportClosestCoin) and ClosestCoinScanInterval or 0.4)
+        task.wait((AutoTap or AutoTeleportClosestCoin or QuestFarmActive) and ClosestCoinScanInterval or 0.4)
     end
 end)
 
@@ -959,7 +1077,7 @@ end)
 -- pet list on every hit.
 task.spawn(function()
     while true do
-        if AutoTap and CurrentCoinTargetId then
+        if (AutoTap or QuestFarmActive) and CurrentCoinTargetId then
             local targetId = CurrentCoinTargetId
             local pets = RefreshCachedEquippedPets(false)
 
@@ -1089,6 +1207,170 @@ task.spawn(function()
                 end
             end)
             task.wait(2)
+        else
+            task.wait(1)
+        end
+    end
+end)
+
+-- =====================================================================
+-- AUTO DIAMOND PACKS
+--
+-- Buys out every Diamond Pack tier in the Exclusive Shop, paying with each
+-- tier's own currency (Rainbow Coins). It reads stock from the same remote
+-- the shop UI uses:
+--   Invoke "Diamonds Packs: Stock"             -> { [tier] = stock }
+--   Invoke "Diamonds Packs", tier, count       -> true on any purchase
+-- The server clamps the requested count to both the remaining stock and
+-- what the player can afford, so asking for the whole stock in one call is
+-- safe and returns true even for a partial fill.
+--
+-- Behaviour: buys cheapest tier first (so a partial budget still buys the
+-- most packs), reports whether it had enough coins to clear everything,
+-- records the moment every tier hits 0, and re-buys the instant the daily
+-- restock brings stock back above zero.
+-- =====================================================================
+local function DiamondPackShort(value)
+    local shorten = Library.Functions and Library.Functions.NumberShorten
+    if type(shorten) == "function" then
+        local ok, text = pcall(shorten, value)
+        if ok and text ~= nil then return tostring(text) end
+    end
+    return tostring(math.floor(value))
+end
+
+task.spawn(function()
+    while true do
+        if AutoDiamondPacks then
+            local packs = Library.Shared and Library.Shared.DiamondPacks
+
+            if not RawNet.invoke then
+                DiamondPackStatus = "Network unavailable"
+            elseif type(packs) ~= "table" then
+                DiamondPackStatus = "Waiting for shop data..."
+            else
+                local okStock, stock = RawNet.invoke("Diamonds Packs: Stock")
+
+                if not okStock or type(stock) ~= "table" then
+                    DiamondPackStatus = "Stock unavailable"
+                else
+                    -- Snapshot the shop: stock, price and currency per tier.
+                    local entries, remaining, totalCost = {}, 0, 0
+                    local currency = nil
+
+                    for tier, info in pairs(packs) do
+                        if type(info) == "table" then
+                            local count = math.max(0, math.floor(tonumber(stock[tier]) or 0))
+                            local cost = math.max(0, tonumber(info.cost) or 0)
+                            currency = currency or info.currency
+                            entries[#entries + 1] = { tier = tier, count = count, cost = cost }
+                            remaining += count
+                            totalCost += count * cost
+                        end
+                    end
+
+                    -- Cheapest first so a partial budget clears the most packs.
+                    table.sort(entries, function(a, b) return a.cost < b.cost end)
+
+                    currency = currency or "Rainbow Coins"
+
+                    local function readCoins()
+                        local save = Library.Save and Library.Save.Get and Library.Save.Get()
+                        return math.max(0, tonumber(save and save[currency]) or 0)
+                    end
+
+                    -- Total packs the game has already recorded as bought today.
+                    local function readUsedToday()
+                        local save = Library.Save and Library.Save.Get and Library.Save.Get()
+                        local record = save and save.DiamondPackDailyStock
+                        local used = type(record) == "table" and record.UsedByPack
+                        if type(used) ~= "table" then return 0 end
+                        local total = 0
+                        for _, n in pairs(used) do total += math.max(0, tonumber(n) or 0) end
+                        return total
+                    end
+
+                    -- "Tiny 75  Medium 70  Large 75  ..." for the stock line.
+                    local function summarize(key)
+                        local parts = {}
+                        for _, entry in ipairs(entries) do
+                            parts[#parts + 1] = ("%s %d"):format((entry.tier:gsub(" Diamonds$", "")), entry[key] or 0)
+                        end
+                        return table.concat(parts, "  ")
+                    end
+
+                    DiamondPackStockText = summarize("count")
+
+                    -- Restock detection: stock was empty last pass and is not now.
+                    if DiamondPackLastStock == 0 and remaining > 0 then
+                        print(("[Auto Diamond Packs] Restocked: %d packs back on the shelf"):format(remaining))
+                    end
+                    DiamondPackLastStock = remaining
+
+                    if remaining <= 0 then
+                        local boughtToday = readUsedToday()
+                        DiamondPackStatus = boughtToday > 0
+                            and ("All packs bought today (%d) - resets daily"):format(boughtToday)
+                            or "No stock on the shelf - retrying"
+                    else
+                        local coinsAtStart = readCoins()
+                        local hadEnoughForAll = coinsAtStart >= totalCost
+
+                        for _, entry in ipairs(entries) do
+                            if not AutoDiamondPacks then break end
+                            if entry.count > 0 and readCoins() >= entry.cost then
+                                -- The server clamps the fill to what is affordable
+                                -- and to the remaining stock, and reports only
+                                -- success, so the real amount bought is read back
+                                -- from the stock table below.
+                                RawNet.invoke("Diamonds Packs", entry.tier, entry.count)
+                                task.wait(0.2)
+                            end
+                        end
+
+                        -- Re-read stock so the status reflects what actually landed.
+                        local okAfter, stockAfter = RawNet.invoke("Diamonds Packs: Stock")
+                        local left, missingCost, bought = 0, 0, 0
+
+                        for _, entry in ipairs(entries) do
+                            local after = entry.count
+                            if okAfter and type(stockAfter) == "table" then
+                                after = math.max(0, math.floor(tonumber(stockAfter[entry.tier]) or 0))
+                            end
+                            entry.after = after
+                            left += after
+                            missingCost += after * entry.cost
+                            bought += math.max(0, entry.count - after)
+                        end
+
+                        DiamondPackLastStock = left
+                        DiamondPackStockText = summarize("after")
+
+                        if left <= 0 then
+                            DiamondPackStatus = hadEnoughForAll
+                                and ("Bought out all packs - had enough " .. currency)
+                                or "Bought out all packs"
+                            print(("[Auto Diamond Packs] %s (%d packs)"):format(DiamondPackStatus, bought))
+                        elseif bought > 0 then
+                            local coins = readCoins()
+                            DiamondPackStatus = ("Bought %d - %d left, short %s %s")
+                                :format(bought, left, DiamondPackShort(math.max(0, missingCost - coins)), currency)
+                        else
+                            local coins = readCoins()
+                            DiamondPackStatus = ("%d left - short %s %s")
+                                :format(left, DiamondPackShort(math.max(0, missingCost - coins)), currency)
+                        end
+                    end
+                end
+            end
+        else
+            DiamondPackLastStock = -1
+        end
+
+        -- Poll quickly while there is still stock to chase, slowly while sold
+        -- out (restocks are daily) or while the feature is off.
+        if AutoDiamondPacks then
+            task.wait(DiamondPackLastStock > 0 and 2.5 or 5)
         else
             task.wait(1)
         end
@@ -1326,6 +1608,146 @@ registerCleanup(function()
 end)
 
 -- =====================================================================
+-- QUEST AUTO-FARM MANAGER (the game's own Auto Farm engine)
+--
+-- Breakable quest objectives used to teleport the player onto every single
+-- breakable through the hub's closest-coin farm. That is slow and looks
+-- nothing like how the game is meant to be played. The game already ships a
+-- full Auto Farm engine - the same one the "Autofarm" button in the Tools bar
+-- toggles - which captures the area the player is standing in and walks the
+-- equipped pets over every eligible breakable in it.
+--
+-- The engine is a plain client-side state machine around three things:
+--   Library.Variables.AutoFarmEnabled - the on/off switch
+--   Library.Variables.AutoFarmArea    - the captured area (set by CaptureArea)
+--   the Autofarm GUI button           - colour/animation only, never required
+--
+-- So the quest driver's whole breakable path is: park the player at the centre
+-- of the objective's area, then raise AutoFarmEnabled. CaptureArea() picks the
+-- area up on its next tick, and the pets do the rest. The engine turns itself
+-- off on world changes and storyline locks, so the manager re-asserts it every
+-- cycle while a breakable objective is active.
+--
+-- The hub's own closest-coin farm stays available for the manual Auto Tap /
+-- Auto Teleport toggles, but the quest driver never drives it anymore.
+-- =====================================================================
+
+-- Resolve the area an egg capsule stands in. Capsules live under
+-- Workspace.__MAP.Eggs.<area>.Eggs, so the parent chain already knows the
+-- answer - no position maths needed. Special eggs (Lucky, Storm, Chroma) are
+-- models named after themselves rather than "Egg Capsule", so the search
+-- matches on the ID attribute instead of the model name.
+local function questFindEggCapsule(eggId)
+    if not eggId then return nil end
+    local map = Workspace:FindFirstChild("__MAP")
+    local eggsFolder = map and map:FindFirstChild("Eggs")
+    if not eggsFolder then return nil end
+
+    local best, bestDistance = nil, math.huge
+    local character = localPlayer.Character
+    local hrp = character and character:FindFirstChild("HumanoidRootPart") or nil
+    for _, model in ipairs(eggsFolder:GetDescendants()) do
+        if model:IsA("Model") then
+            local id = model:GetAttribute("ID")
+            if id ~= nil and tostring(id) == eggId then
+                local part = model.PrimaryPart or model:FindFirstChildWhichIsA("BasePart")
+                if part then
+                    if hrp then
+                        local distance = (hrp.Position - part.Position).Magnitude
+                        if distance < bestDistance then
+                            bestDistance = distance
+                            best = model
+                        end
+                    else
+                        return model
+                    end
+                end
+            end
+        end
+    end
+    return best
+end
+
+-- Turn the game's own Auto Farm on or off. The GUI button is updated as well
+-- so the button's colour matches what the engine is actually doing, but the
+-- variable is the only thing the engine's Tick loop reads.
+local function questSetGameAutoFarm(enabled)
+    local ok = pcall(function()
+        Library.Variables.AutoFarmEnabled = enabled
+        if not enabled then
+            Library.Variables.AutoFarmArea = nil
+        end
+
+        local gui = Library.GUI
+            and Library.GUI.Main
+            and Library.GUI.Main.Left
+            and Library.GUI.Main.Left.Tools
+        local button = gui and gui:FindFirstChild("Autofarm")
+        if button then
+            button.BackgroundColor3 = enabled
+                and Color3.fromRGB(103, 255, 103)
+                or Color3.fromRGB(255, 255, 255)
+            local status = button:FindFirstChild("StatusDisabled")
+            if status then
+                local red = status:FindFirstChild("RedGradient")
+                local green = status:FindFirstChild("GreenGradient")
+                if red then red.Enabled = not enabled end
+                if green then green.Enabled = enabled end
+            end
+        end
+    end)
+    return ok
+end
+
+-- Manager loop. While a breakable objective is active it keeps the game's
+-- Auto Farm enabled and re-asserts it after every world change (the engine
+-- drops the capture on "World Changed" but leaves the flag on - only the
+-- captured area is lost, and CaptureArea() rebuilds it from wherever the
+-- player is standing).
+task.spawn(function()
+    local recaptureArmed = false
+    while true do
+        if QuestAreaFarmWanted and (AutoQuests or AutoQuestsSide) then
+            local ok, enabled = pcall(function()
+                return Library.Variables.AutoFarmEnabled
+            end)
+            local okArea, capturedArea = pcall(function()
+                return Library.Variables.AutoFarmArea
+            end)
+
+            if not ok or enabled ~= true then
+                questSetGameAutoFarm(true)
+                recaptureArmed = false
+            elseif QuestAreaFarmTarget
+                and okArea
+                and tostring(capturedArea or "") ~= QuestAreaFarmTarget then
+                -- The engine captured the wrong area (it snaps to wherever the
+                -- player was standing when it first enabled). Turn it off for
+                -- a tick so its Tick loop clears the capture, then back on -
+                -- it re-captures from wherever the player is standing now,
+                -- which the quest driver keeps parked at the target centre.
+                if not recaptureArmed then
+                    recaptureArmed = true
+                    questSetGameAutoFarm(false)
+                else
+                    recaptureArmed = false
+                    questSetGameAutoFarm(true)
+                end
+            else
+                recaptureArmed = false
+            end
+            task.wait(0.6)
+        else
+            if QuestOwnedAutoFarm then
+                QuestOwnedAutoFarm = false
+                questSetGameAutoFarm(false)
+            end
+            task.wait(0.5)
+        end
+    end
+end)
+
+-- =====================================================================
 -- UI, UNIFIED STYLING, HATCH LOGIC & EGG CHANCE VIEWER
 -- =====================================================================
 
@@ -1429,7 +1851,7 @@ task.spawn(function()
 
     -- =====================================================================
     -- RESPONSIVE / MOBILE UI SCALING
-    -- The hub is designed around a 680x720 canvas. Instead of using a
+    -- The hub is designed around a 1000x760 canvas. Instead of using a
     -- fixed 16:9 scale (which overflows on phones), scale from the actual
     -- viewport and leave a small safe margin on every side. This keeps the
     -- entire hub on-screen in portrait, landscape, tablets, laptops and
@@ -1452,8 +1874,8 @@ task.spawn(function()
         -- unnecessarily tiny while still guaranteeing it fits.
         local safeWidth = math.max(viewport.X - 16, 1)
         local safeHeight = math.max(viewport.Y - 16, 1)
-        local DESIGN_WIDTH = 680
-        local DESIGN_HEIGHT = 720
+        local DESIGN_WIDTH = 1000
+        local DESIGN_HEIGHT = 760
         local scaleX = safeWidth / DESIGN_WIDTH
         local scaleY = safeHeight / DESIGN_HEIGHT
         local scale = math.min(scaleX, scaleY, 1)
@@ -1718,6 +2140,7 @@ task.spawn(function()
         for i, entryData in ipairs(entries) do
             local label = Instance.new("TextLabel")
             label.BackgroundTransparency = 1
+            label:SetAttribute("ThemeKeepTextColor", true)
             label.Size = UDim2.new(1, -2, 0, 20)
             label.Font = Enum.Font.Gotham
             label.TextColor3 = color
@@ -1848,22 +2271,22 @@ task.spawn(function()
         if hatchRareLabels.Huges then
             hatchRareLabels.Huges.Text = hugeLabel.Text
             hatchRareLabels.Huges.TextColor3 = Color3.fromRGB(120, 205, 255)
-            hatchRareLabels.Huges:SetAttribute("ThemeLocked", true)
+            hatchRareLabels.Huges:SetAttribute("ThemeKeepTextColor", true)
         end
         if hatchRareLabels.Secrets then
             hatchRareLabels.Secrets.Text = secretLabel.Text
             hatchRareLabels.Secrets.TextColor3 = Color3.fromRGB(95, 45, 150)
-            hatchRareLabels.Secrets:SetAttribute("ThemeLocked", true)
+            hatchRareLabels.Secrets:SetAttribute("ThemeKeepTextColor", true)
         end
         if hatchRareLabels.Titanics then
             hatchRareLabels.Titanics.Text = titanicLabel.Text
             hatchRareLabels.Titanics.TextColor3 = Color3.fromRGB(255, 200, 60)
-            hatchRareLabels.Titanics:SetAttribute("ThemeLocked", true)
+            hatchRareLabels.Titanics:SetAttribute("ThemeKeepTextColor", true)
         end
         if hatchRareLabels.Gargantuans then
             hatchRareLabels.Gargantuans.Text = gargantuanLabel.Text
             hatchRareLabels.Gargantuans.TextColor3 = Color3.fromRGB(150, 35, 35)
-            hatchRareLabels.Gargantuans:SetAttribute("ThemeLocked", true)
+            hatchRareLabels.Gargantuans:SetAttribute("ThemeKeepTextColor", true)
         end
         -- The AFK cards show the raw number, not the hatch panel's
         -- "Huges: 12" string, and Gargantuans were never refreshed at all.
@@ -1919,8 +2342,8 @@ task.spawn(function()
     local Style = {
         surface    = Color3.fromRGB(23, 26, 37),
         surfaceAlt = Color3.fromRGB(17, 19, 28),
-        line       = Color3.fromRGB(48, 53, 70),
-        muted      = Color3.fromRGB(132, 142, 165),
+        line       = Color3.fromRGB(68, 82, 112),
+        muted      = Color3.fromRGB(166, 179, 202),
         text       = Color3.fromRGB(236, 240, 250),
         green      = Color3.fromRGB(52, 211, 153),
         violet     = Color3.fromRGB(167, 139, 250),
@@ -1994,6 +2417,7 @@ task.spawn(function()
         center.AnchorPoint = Vector2.new(0.5, 0.5)
         center.Position = UDim2.new(0.5, 0, 0.5, 0)
         center.BackgroundTransparency = 1
+        center.ClipsDescendants = true
         center.ZIndex = 102
         center.Parent = overlay
 
@@ -2010,7 +2434,7 @@ task.spawn(function()
         title.Size = UDim2.new(1, 0, 0.58, 0)
         title.BackgroundTransparency = 1
         title.Text = "AFK MODE"
-        title.TextColor3 = Color3.fromRGB(255, 255, 255)
+        title.TextColor3 = Color3.fromRGB(224, 229, 239)
         title.Font = Enum.Font.GothamBlack
         title.TextScaled = true
         title.ZIndex = 103
@@ -2019,7 +2443,7 @@ task.spawn(function()
         local titleGradient = Instance.new("UIGradient")
         titleGradient.Rotation = 0
         titleGradient.Color = ColorSequence.new({
-            ColorSequenceKeypoint.new(0, Color3.fromRGB(226, 232, 255)),
+            ColorSequenceKeypoint.new(0, Color3.fromRGB(205, 213, 229)),
             ColorSequenceKeypoint.new(0.55, Style.violet),
             ColorSequenceKeypoint.new(1, Style.cyan),
         })
@@ -2106,8 +2530,8 @@ task.spawn(function()
             local card = Instance.new("Frame")
             card.Size = UDim2.new(1 / 3, -8, 1, 0)
             card.Position = UDim2.new((index - 1) / 3, 4, 0, 0)
-            card.BackgroundColor3 = Style.surfaceAlt
-            card.BackgroundTransparency = 0.1
+            card.BackgroundColor3 = Color3.fromRGB(27, 33, 47)
+            card.BackgroundTransparency = 0.02
             card.BorderSizePixel = 0
             card.ZIndex = 103
             card.Parent = statsRow
@@ -2117,8 +2541,9 @@ task.spawn(function()
             cardCorner.Parent = card
 
             local cardStroke = Instance.new("UIStroke")
-            cardStroke.Color = Style.line
-            cardStroke.Transparency = 0.45
+            cardStroke.Color = Color3.fromRGB(91, 105, 128)
+            cardStroke.Transparency = 0.68
+            cardStroke.Thickness = 1
             cardStroke.Parent = card
 
             do
@@ -2140,8 +2565,9 @@ task.spawn(function()
             valueLabel.Position = UDim2.new(0, 12, 0, 24)
             valueLabel.BackgroundTransparency = 1
             valueLabel.Text = value
-            valueLabel.TextColor3 = valueColor
-            valueLabel.Font = Enum.Font.GothamBlack
+            valueLabel.TextColor3 = valueColor or Style.text
+            valueLabel:SetAttribute("ThemeKeepTextColor", valueColor ~= nil)
+            valueLabel.Font = Enum.Font.GothamBold
             valueLabel.TextScaled = true
             valueLabel.TextXAlignment = Enum.TextXAlignment.Left
             valueLabel.TextYAlignment = Enum.TextYAlignment.Center
@@ -2169,8 +2595,8 @@ local function makeTotalStat(caption, value, valueColor, isRight)
     local card = Instance.new("Frame")
     card.Size = UDim2.new(0.5, -8, 1, 0)
     card.Position = isRight and UDim2.new(0.5, 4, 0, 0) or UDim2.new(0, 0, 0, 0)
-    card.BackgroundColor3 = Style.surfaceAlt
-    card.BackgroundTransparency = 0.1
+    card.BackgroundColor3 = Color3.fromRGB(27, 33, 47)
+    card.BackgroundTransparency = 0.02
     card.BorderSizePixel = 0
     card.ZIndex = 104
     card.Parent = totalStatsRow
@@ -2180,8 +2606,9 @@ local function makeTotalStat(caption, value, valueColor, isRight)
     cardCorner.Parent = card
 
     local cardStroke = Instance.new("UIStroke")
-    cardStroke.Color = Style.line
-    cardStroke.Transparency = 0.45
+    cardStroke.Color = Color3.fromRGB(91, 105, 128)
+    cardStroke.Transparency = 0.68
+    cardStroke.Thickness = 1
     cardStroke.Parent = card
 
     local captionLabel = Instance.new("TextLabel")
@@ -2201,8 +2628,9 @@ local function makeTotalStat(caption, value, valueColor, isRight)
     valueLabel.Position = UDim2.new(0, 10, 0, 22)
     valueLabel.BackgroundTransparency = 1
     valueLabel.Text = value
-    valueLabel.TextColor3 = valueColor
-    valueLabel.Font = Enum.Font.GothamBlack
+    valueLabel.TextColor3 = valueColor or Style.text
+    valueLabel:SetAttribute("ThemeKeepTextColor", valueColor ~= nil)
+    valueLabel.Font = Enum.Font.GothamBold
     valueLabel.TextScaled = true
     valueLabel.TextXAlignment = Enum.TextXAlignment.Left
     valueLabel.TextYAlignment = Enum.TextYAlignment.Center
@@ -2214,16 +2642,18 @@ end
 
 local eggsLegacy = makeTotalStat("TOTAL EGGS", "0", Color3.fromRGB(80, 230, 80), false)
 eggsLegacy.Name = "AfkEggsLabel"
+eggsLegacy:SetAttribute("ThemeKeepTextColor", true)
 
 local gemsLegacy = makeTotalStat("TOTAL DIAMONDS", "0", Color3.fromRGB(110, 185, 255), true)
 gemsLegacy.Name = "AfkGemsLabel"
+gemsLegacy:SetAttribute("ThemeKeepTextColor", true)
 
         -- EXIT -------------------------------------------------------------
         local exitButton = Instance.new("TextButton")
         exitButton.Name = "ExitAFK"
-        exitButton.Size = UDim2.new(0.6, 0, 0, 48)
+        exitButton.Size = UDim2.new(0.48, 0, 0, 46)
         exitButton.AnchorPoint = Vector2.new(0.5, 1)
-        exitButton.Position = UDim2.new(0.5, 0, 0.985, 0)
+        exitButton.Position = UDim2.new(0.5, 0, 0.975, 0)
         exitButton.BackgroundColor3 = Color3.fromRGB(38, 20, 26)
         exitButton.Text = "TURN OFF AFK MODE"
         exitButton.TextColor3 = Color3.fromRGB(255, 220, 225)
@@ -2234,8 +2664,8 @@ gemsLegacy.Name = "AfkGemsLabel"
 
         do
             local exitConstraint = Instance.new("UISizeConstraint")
-            exitConstraint.MaxSize = Vector2.new(420, 56)
-            exitConstraint.MinSize = Vector2.new(220, 44)
+            exitConstraint.MaxSize = Vector2.new(380, 52)
+            exitConstraint.MinSize = Vector2.new(210, 42)
             exitConstraint.Parent = exitButton
         end
 
@@ -2308,14 +2738,42 @@ gemsLegacy.Name = "AfkGemsLabel"
     -- MAIN HUB WINDOW
     local autoHatchMain = Instance.new("Frame")
     autoHatchMain.Name = "AutoHatchMain"
-    autoHatchMain.Size = UDim2.new(0, 680, 0, 720)
-    autoHatchMain.Position = UDim2.new(0.5, -340, 0.5, -360)
-    autoHatchMain.BackgroundColor3 = Color3.fromRGB(17, 20, 29)
+    autoHatchMain.Size = UDim2.new(0, 1000, 0, 760)
+    autoHatchMain.Position = UDim2.new(0.5, -500, 0.5, -380)
+    autoHatchMain.BackgroundColor3 = Color3.fromRGB(16, 24, 40)
     autoHatchMain.BorderSizePixel = 0
     autoHatchMain.Active = true
     autoHatchMain.Draggable = true
     autoHatchMain.Visible = true
     autoHatchMain.Parent = ui
+
+    -- Responsive window sizing: preserve the designed 1000x760 proportions,
+    -- but scale the complete hub to the available viewport so headers, pages,
+    -- and bottom controls are not pushed off-screen on smaller displays.
+    local responsiveScale = Instance.new("UIScale")
+    responsiveScale.Name = "ResponsiveUIScale"
+    responsiveScale.Scale = 1
+    responsiveScale.Parent = autoHatchMain
+    local function updateResponsiveScale()
+        local camera = workspace.CurrentCamera
+        if not camera then return end
+        local viewport = camera.ViewportSize
+        local fitX = math.max(0.45, (viewport.X - 28) / 1000)
+        local fitY = math.max(0.45, (viewport.Y - 28) / 760)
+        responsiveScale.Scale = math.min(1, fitX, fitY)
+        autoHatchMain.Position = UDim2.new(0.5, -500, 0.5, -380)
+    end
+    local viewportConnection
+    local function bindViewportCamera()
+        if viewportConnection then viewportConnection:Disconnect() end
+        local camera = workspace.CurrentCamera
+        if camera then
+            viewportConnection = camera:GetPropertyChangedSignal("ViewportSize"):Connect(updateResponsiveScale)
+        end
+        updateResponsiveScale()
+    end
+    workspace:GetPropertyChangedSignal("CurrentCamera"):Connect(bindViewportCamera)
+    bindViewportCamera()
 
     -- The ScreenGui origin is above the screen while IgnoreGuiInset is on, so
     -- a freshly centred hub lands ~58 px high. Re-centre once the ScreenGui has
@@ -2323,21 +2781,21 @@ gemsLegacy.Name = "AfkGemsLabel"
     task.defer(function()
         local inset = math.max(0, -ui.AbsolutePosition.Y)
         if inset <= 0 then return end
-        if autoHatchMain.Position.Y.Offset == -360 then
-            autoHatchMain.Position = UDim2.new(0.5, -340, 0.5, -360 + inset)
+        if autoHatchMain.Position.Y.Offset == -380 then
+            autoHatchMain.Position = UDim2.new(0.5, -500, 0.5, -380 + inset)
         end
     end)
 
     do
         local autoHatchCorner = Instance.new("UICorner")
-        autoHatchCorner.CornerRadius = UDim.new(0, 18)
+        autoHatchCorner.CornerRadius = UDim.new(0, 22)
         autoHatchCorner.Parent = autoHatchMain
     end
 
     local autoHatchShadow = Instance.new("UIStroke")
-    autoHatchShadow.Color = Color3.fromRGB(60, 140, 220)
-    autoHatchShadow.Thickness = 1.2
-    autoHatchShadow.Transparency = 0.58
+    autoHatchShadow.Color = Color3.fromRGB(73, 190, 255)
+    autoHatchShadow.Thickness = 2
+    autoHatchShadow.Transparency = 0.28
     autoHatchShadow.Parent = autoHatchMain
 
     -- Soft accent halo + header wash. Both are children with ZIndex 0 so they
@@ -2377,158 +2835,211 @@ gemsLegacy.Name = "AfkGemsLabel"
         glowGradient.Parent = headerGlow
     end
 
+    -- NEW SHELL: compact brand header + permanent left navigation rail.
     local autoTitle = Instance.new("TextLabel")
-    autoTitle.Size = UDim2.new(1, -64, 0, 30)
-    autoTitle.Position = UDim2.new(0, 30, 0, 12)
-    autoTitle.Text = "Pet Dimensions Hub"
-    autoTitle.TextColor3 = Color3.fromRGB(60, 140, 220)
+    autoTitle.Name = "BrandTitle"
+    autoTitle.Size = UDim2.new(0, 700, 0, 38)
+    autoTitle.Position = UDim2.fromOffset(250, 18)
+    autoTitle.Text = "PET DIMENSIONS"
+    autoTitle.TextColor3 = Color3.fromRGB(105, 215, 255)
     autoTitle.Font = Enum.Font.GothamBlack
-    autoTitle.TextSize = 21
+    autoTitle.TextSize = 27
     autoTitle.BackgroundTransparency = 1
     autoTitle.TextXAlignment = Enum.TextXAlignment.Left
     autoTitle.Parent = autoHatchMain
 
-    do
-        local accent = Instance.new("Frame")
-        accent.Name = "TitleAccent"
-        accent.Size = UDim2.new(0, 3, 0, 22)
-        accent.Position = UDim2.new(0, 18, 0, 16)
-        accent.BackgroundColor3 = Color3.fromRGB(60, 140, 220)
-        accent.BorderSizePixel = 0
-        accent.Parent = autoHatchMain
+    local autoSubtitle = Instance.new("TextLabel")
+    autoSubtitle.Name = "BrandSubtitle"
+    autoSubtitle.Size = UDim2.new(0, 700, 0, 20)
+    autoSubtitle.Position = UDim2.fromOffset(252, 57)
+    autoSubtitle.Visible = false
+    autoSubtitle.Text = ""
 
-        local accentCorner = Instance.new("UICorner")
-        accentCorner.CornerRadius = UDim.new(1, 0)
-        accentCorner.Parent = accent
+    local brandMark = Instance.new("Frame")
+    brandMark.Name = "BrandMark"
+    brandMark.Size = UDim2.fromOffset(54, 54)
+    brandMark.Position = UDim2.fromOffset(178, 18)
+    brandMark.BackgroundColor3 = Color3.fromRGB(36, 143, 220)
+    brandMark.BorderSizePixel = 0
+    brandMark.Parent = autoHatchMain
+    local brandMarkCorner = Instance.new("UICorner")
+    brandMarkCorner.CornerRadius = UDim.new(0, 16)
+    brandMarkCorner.Parent = brandMark
+    local brandMarkGradient = Instance.new("UIGradient")
+    brandMarkGradient.Color = ColorSequence.new({
+        ColorSequenceKeypoint.new(0, Color3.fromRGB(46, 214, 255)),
+        ColorSequenceKeypoint.new(1, Color3.fromRGB(105, 92, 255)),
+    })
+    brandMarkGradient.Rotation = 35
+    brandMarkGradient.Parent = brandMark
+    local brandMarkText = Instance.new("TextLabel")
+    brandMarkText.Size = UDim2.fromScale(1, 1)
+    brandMarkText.BackgroundTransparency = 1
+    brandMarkText.Text = "PD"
+    brandMarkText.TextColor3 = Color3.fromRGB(255, 255, 255)
+    brandMarkText.Font = Enum.Font.GothamBlack
+    brandMarkText.TextSize = 20
+    brandMarkText.Parent = brandMark
 
-        do
-            local autoSubtitle = Instance.new("TextLabel")
-            autoSubtitle.Size = UDim2.new(1, -64, 0, 16)
-            autoSubtitle.Position = UDim2.new(0, 30, 0, 44)
-            autoSubtitle.Text = "HATCH  ·  FARM  ·  DAYCARE  ·  TELEPORT"
-            autoSubtitle.TextColor3 = Color3.fromRGB(125, 135, 160)
-            autoSubtitle.Font = Enum.Font.Gotham
-            autoSubtitle.TextSize = 11
-            autoSubtitle.BackgroundTransparency = 1
-            autoSubtitle.TextXAlignment = Enum.TextXAlignment.Left
-            autoSubtitle.Parent = autoHatchMain
-        end
+    local sidebar = Instance.new("Frame")
+    sidebar.Name = "NavigationSidebar"
+    sidebar.Position = UDim2.fromOffset(18, 94)
+    sidebar.Size = UDim2.new(0, 190, 1, -112)
+    sidebar.BackgroundColor3 = Color3.fromRGB(25, 42, 66)
+    sidebar.BorderSizePixel = 0
+    sidebar.Parent = autoHatchMain
+    local sidebarCorner = Instance.new("UICorner")
+    sidebarCorner.CornerRadius = UDim.new(0, 18)
+    sidebarCorner.Parent = sidebar
+    local sidebarStroke = Instance.new("UIStroke")
+    sidebarStroke.Color = Color3.fromRGB(73, 145, 205)
+    sidebarStroke.Transparency = 0.28
+    sidebarStroke.Thickness = 1.4
+    sidebarStroke.Parent = sidebar
 
-        local titleDivider = Instance.new("Frame")
-        titleDivider.Name = "TitleDivider"
-        titleDivider.Size = UDim2.new(1, -40, 0, 1)
-        titleDivider.Position = UDim2.new(0, 20, 0, 66)
-        titleDivider.BackgroundColor3 = Color3.fromRGB(48, 56, 74)
-        titleDivider.BorderSizePixel = 0
-        titleDivider.Parent = autoHatchMain
-
-        local dividerGradient = Instance.new("UIGradient")
-        dividerGradient.Color = ColorSequence.new({
-            ColorSequenceKeypoint.new(0, Color3.fromRGB(60, 140, 220)),
-            ColorSequenceKeypoint.new(0.3, Color3.fromRGB(48, 56, 74)),
-            ColorSequenceKeypoint.new(1, Color3.fromRGB(48, 56, 74)),
-        })
-        dividerGradient.Parent = titleDivider
-    end
+    local navCaption = Instance.new("TextLabel")
+    navCaption.Size = UDim2.new(1, -24, 0, 24)
+    navCaption.Position = UDim2.fromOffset(12, 14)
+    navCaption.BackgroundTransparency = 1
+    navCaption.Text = "WORKSPACE"
+    navCaption.TextColor3 = Color3.fromRGB(152, 190, 226)
+    navCaption.Font = Enum.Font.GothamBold
+    navCaption.TextSize = 10
+    navCaption.TextXAlignment = Enum.TextXAlignment.Left
+    navCaption.Parent = sidebar
 
     local tabBar = Instance.new("Frame")
     tabBar.Name = "TabContainer"
-    tabBar.Size = UDim2.new(1, -40, 0, 44)
-    tabBar.Position = UDim2.new(0, 20, 0, 74)
+    tabBar.Size = UDim2.new(1, -20, 1, -58)
+    tabBar.Position = UDim2.fromOffset(10, 48)
     tabBar.BackgroundTransparency = 1
-    tabBar.Parent = autoHatchMain
+    tabBar.Parent = sidebar
 
-    local TAB_TOTAL = { count = 8 }
+    -- Stack all ten navigation tabs inside the available sidebar height.
+    -- Scale-based row heights keep the AFK tab inside the panel on short screens.
+    local tabLayout = Instance.new("UIListLayout")
+    tabLayout.FillDirection = Enum.FillDirection.Vertical
+    tabLayout.SortOrder = Enum.SortOrder.LayoutOrder
+    tabLayout.Padding = UDim.new(0, 4)
+    tabLayout.Parent = tabBar
+
+    local TAB_TOTAL = { count = 10 }
     local function createTabButton(text, index)
         local btn = Instance.new("TextButton")
-        btn.Size = UDim2.new(1 / TAB_TOTAL.count, -7, 1, 0)
-        btn.AnchorPoint = Vector2.new(0.5, 0)
-        btn.Position = UDim2.new((index - 0.5) / TAB_TOTAL.count, 0, 0, 0)
-        btn.Text = text
-        btn.BackgroundColor3 = Color3.fromRGB(32, 32, 42)
-        btn.TextColor3 = Color3.fromRGB(160, 171, 193)
+        btn.Name = text:gsub("%W", "") .. "NavigationButton"
+        btn.Size = UDim2.new(1, 0, 0.1, -4)
+        btn.LayoutOrder = index
+        btn.Text = string.format("%02d     %s", index, string.upper(text))
+        btn.BackgroundColor3 = Color3.fromRGB(48, 70, 99)
+        btn.TextColor3 = Color3.fromRGB(237, 246, 255)
         btn.Font = Enum.Font.GothamBold
-        btn.TextSize = 10
+        btn.TextSize = 12
+        btn.TextXAlignment = Enum.TextXAlignment.Left
         btn.TextTruncate = Enum.TextTruncate.AtEnd
         btn.AutoButtonColor = false
         btn.Parent = tabBar
-
+        local pad = Instance.new("UIPadding")
+        pad.PaddingLeft = UDim.new(0, 15)
+        pad.Parent = btn
         local corner = Instance.new("UICorner")
-        corner.CornerRadius = UDim.new(0, 11)
+        corner.CornerRadius = UDim.new(0, 12)
         corner.Parent = btn
-
         local stroke = Instance.new("UIStroke")
-        stroke.Color = Color3.fromRGB(80, 80, 100)
+        stroke.Color = Color3.fromRGB(112, 164, 215)
         stroke.Thickness = 1
-        stroke.Transparency = 0.72
+        stroke.Transparency = 0.42
         stroke.Parent = btn
-
-        local underline = Instance.new("Frame")
-        underline.Name = "ActiveUnderline"
-        underline.Size = UDim2.new(0.42, 0, 0, 2)
-        underline.AnchorPoint = Vector2.new(0.5, 1)
-        underline.Position = UDim2.new(0.5, 0, 1, -3)
-        underline.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
-        underline.BackgroundTransparency = 0.1
-        underline.BorderSizePixel = 0
-        underline.Visible = false
-        underline.ZIndex = 2
-        underline.Parent = btn
-
-        do
-            local underlineCorner = Instance.new("UICorner")
-            underlineCorner.CornerRadius = UDim.new(1, 0)
-            underlineCorner.Parent = underline
-        end
-
         return btn
     end
 
     local hatchTab = createTabButton("Hatch", 1)
-    local tpTab = createTabButton("Teleport", 2)
-    local settingsTab = createTabButton("Settings", 3)
-    local eggTab = createTabButton("Egg Chances", 4)
-    local farmTab = createTabButton("Farm", 5)
-TAB_TOTAL.tab = createTabButton("Daycare", 6)
-TAB_TOTAL.indexUI = { tab = createTabButton("Index", 7) }
-TAB_TOTAL.luckyWorld = createTabButton("Lucky World", 8)
+    TAB_TOTAL.autoFarmTab = createTabButton("Auto Farm", 2)
+    local tpTab = createTabButton("Teleport", 3)
+    local settingsTab = createTabButton("Settings", 4)
+    local eggTab = createTabButton("Egg Chances", 5)
+    local farmTab = createTabButton("Farm", 6)
+    TAB_TOTAL.tab = createTabButton("Daycare", 7)
+    TAB_TOTAL.indexUI = { tab = createTabButton("Pet Index", 8) }
+    TAB_TOTAL.luckyWorld = createTabButton("Lucky World", 9)
+    TAB_TOTAL.afk = createTabButton("AFK", 10)
+
+    local pageSurface = Instance.new("Frame")
+    pageSurface.Name = "PageSurface"
+    pageSurface.Position = UDim2.fromOffset(222, 94)
+    pageSurface.Size = UDim2.new(1, -240, 1, -112)
+    pageSurface.BackgroundColor3 = Color3.fromRGB(26, 41, 62)
+    pageSurface.BorderSizePixel = 0
+    pageSurface.ClipsDescendants = true
+    pageSurface.Parent = autoHatchMain
+    local pageSurfaceCorner = Instance.new("UICorner")
+    pageSurfaceCorner.CornerRadius = UDim.new(0, 18)
+    pageSurfaceCorner.Parent = pageSurface
+    local pageSurfaceStroke = Instance.new("UIStroke")
+    pageSurfaceStroke.Color = Color3.fromRGB(73, 145, 205)
+    pageSurfaceStroke.Transparency = 0.52
+    pageSurfaceStroke.Thickness = 1
+    pageSurfaceStroke.Parent = pageSurface
+
+    local pageCaption = Instance.new("TextLabel")
+    pageCaption.Name = "PageCaption"
+    pageCaption.Position = UDim2.fromOffset(250, 108)
+    pageCaption.Size = UDim2.new(1, -280, 0, 26)
+    pageCaption.BackgroundTransparency = 1
+    pageCaption.Text = "HATCHING"
+    pageCaption.TextColor3 = Color3.fromRGB(111, 213, 255)
+    pageCaption.Font = Enum.Font.GothamBlack
+    pageCaption.TextSize = 16
+    pageCaption.TextXAlignment = Enum.TextXAlignment.Left
+    pageCaption.Parent = autoHatchMain
 
     local hatchFrame = Instance.new("ScrollingFrame")
-    hatchFrame.Size = UDim2.new(1, -40, 1, -136)
-    hatchFrame.Position = UDim2.new(0, 20, 0, 128)
+    hatchFrame.Size = UDim2.new(1, -260, 1, -145)
+    hatchFrame.Position = UDim2.new(0, 240, 0, 145)
     hatchFrame.BackgroundTransparency = 1
     hatchFrame.BorderSizePixel = 0
     hatchFrame.ClipsDescendants = true
     hatchFrame.ScrollBarThickness = 4
     hatchFrame.ScrollingDirection = Enum.ScrollingDirection.Y
-    hatchFrame.CanvasSize = UDim2.new(0, 0, 0, 1020)
+    hatchFrame.CanvasSize = UDim2.new(0, 0, 0, 0)
+    hatchFrame.AutomaticCanvasSize = Enum.AutomaticSize.Y
+    hatchFrame.ClipsDescendants = true
+    hatchFrame.ScrollBarThickness = 5
+    do
+        local hatchContentPadding = Instance.new("UIPadding")
+        hatchContentPadding.Name = "HatchContentPadding"
+        hatchContentPadding.PaddingLeft = UDim.new(0, 2)
+        hatchContentPadding.PaddingRight = UDim.new(0, 2)
+        hatchContentPadding.PaddingTop = UDim.new(0, 8)
+        hatchContentPadding.PaddingBottom = UDim.new(0, 18)
+        hatchContentPadding.Parent = hatchFrame
+    end
     hatchFrame.Parent = autoHatchMain
 
     local tpFrame = Instance.new("Frame")
-    tpFrame.Size = UDim2.new(1, -40, 1, -136)
-    tpFrame.Position = UDim2.new(0, 20, 0, 128)
+    tpFrame.Size = UDim2.new(1, -260, 1, -145)
+    tpFrame.Position = UDim2.new(0, 240, 0, 145)
     tpFrame.BackgroundTransparency = 1
     tpFrame.Visible = false
     tpFrame.Parent = autoHatchMain
 
     local settingsFrame = Instance.new("Frame")
-    settingsFrame.Size = UDim2.new(1, -40, 1, -136)
-    settingsFrame.Position = UDim2.new(0, 20, 0, 128)
+    settingsFrame.Size = UDim2.new(1, -260, 1, -145)
+    settingsFrame.Position = UDim2.new(0, 240, 0, 145)
     settingsFrame.BackgroundTransparency = 1
     settingsFrame.Visible = false
     settingsFrame.Parent = autoHatchMain
 
     local eggFrame = Instance.new("Frame")
-    eggFrame.Size = UDim2.new(1, -40, 1, -136)
-    eggFrame.Position = UDim2.new(0, 20, 0, 128)
+    eggFrame.Size = UDim2.new(1, -260, 1, -145)
+    eggFrame.Position = UDim2.new(0, 240, 0, 145)
     eggFrame.BackgroundTransparency = 1
     eggFrame.Visible = false
     eggFrame.Parent = autoHatchMain
 
     local farmFrame = Instance.new("ScrollingFrame")
     farmFrame.Name = "FarmScroll"
-    farmFrame.Size = UDim2.new(1, -40, 1, -136)
-    farmFrame.Position = UDim2.new(0, 20, 0, 128)
+    farmFrame.Size = UDim2.new(1, -260, 1, -145)
+    farmFrame.Position = UDim2.new(0, 240, 0, 145)
     farmFrame.BackgroundTransparency = 1
     farmFrame.BorderSizePixel = 0
     farmFrame.ScrollBarThickness = 5
@@ -2539,8 +3050,8 @@ TAB_TOTAL.luckyWorld = createTabButton("Lucky World", 8)
 
     TAB_TOTAL.indexUI.frame = Instance.new("Frame")
     TAB_TOTAL.indexUI.frame.Name = "IndexFrame"
-    TAB_TOTAL.indexUI.frame.Size = UDim2.new(1, -40, 1, -136)
-    TAB_TOTAL.indexUI.frame.Position = UDim2.new(0, 20, 0, 128)
+    TAB_TOTAL.indexUI.frame.Size = UDim2.new(1, -260, 1, -145)
+    TAB_TOTAL.indexUI.frame.Position = UDim2.new(0, 240, 0, 145)
     TAB_TOTAL.indexUI.frame.BackgroundTransparency = 1
     TAB_TOTAL.indexUI.frame.Visible = false
     TAB_TOTAL.indexUI.frame.Parent = autoHatchMain
@@ -2583,9 +3094,11 @@ TAB_TOTAL.luckyWorld = createTabButton("Lucky World", 8)
     TAB_TOTAL.indexUI.nearbyToggle.Name = "NearbyEggUIToggle"
     TAB_TOTAL.indexUI.nearbyToggle.Size = UDim2.new(0, 154, 0, 34)
     TAB_TOTAL.indexUI.nearbyToggle.Position = UDim2.new(1, -240, 0, 2)
-    TAB_TOTAL.indexUI.nearbyToggle.BackgroundColor3 = Color3.fromRGB(55, 62, 76)
-    TAB_TOTAL.indexUI.nearbyToggle.TextColor3 = Color3.fromRGB(245, 245, 250)
+    TAB_TOTAL.indexUI.nearbyToggle.BackgroundColor3 = Color3.fromRGB(67, 104, 145)
+    TAB_TOTAL.indexUI.nearbyToggle.TextColor3 = Color3.fromRGB(255, 255, 255)
     TAB_TOTAL.indexUI.nearbyToggle.Text = "Nearby Egg UI: OFF"
+    TAB_TOTAL.indexUI.nearbyToggle:SetAttribute("ThemeRole", "Toggle")
+    TAB_TOTAL.indexUI.nearbyToggle:SetAttribute("ToggleState", false)
     TAB_TOTAL.indexUI.nearbyToggle.Font = Enum.Font.GothamBold
     TAB_TOTAL.indexUI.nearbyToggle.TextSize = 11
     TAB_TOTAL.indexUI.nearbyToggle.Parent = TAB_TOTAL.indexUI.frame
@@ -2596,7 +3109,7 @@ TAB_TOTAL.luckyWorld = createTabButton("Lucky World", 8)
     TAB_TOTAL.indexUI.summary = Instance.new("TextLabel")
     TAB_TOTAL.indexUI.summary.Name = "IndexSummary"
     TAB_TOTAL.indexUI.summary.Size = UDim2.new(1, 0, 0, 22)
-    TAB_TOTAL.indexUI.summary.Position = UDim2.fromOffset(0, 76)
+    TAB_TOTAL.indexUI.summary.Position = UDim2.fromOffset(0, 42)
     TAB_TOTAL.indexUI.summary.BackgroundTransparency = 1
     TAB_TOTAL.indexUI.summary.TextColor3 = Color3.fromRGB(165, 174, 192)
     TAB_TOTAL.indexUI.summary.TextXAlignment = Enum.TextXAlignment.Left
@@ -2605,47 +3118,10 @@ TAB_TOTAL.luckyWorld = createTabButton("Lucky World", 8)
     TAB_TOTAL.indexUI.summary.Text = "Loading pet index..."
     TAB_TOTAL.indexUI.summary.Parent = TAB_TOTAL.indexUI.frame
 
-    -- Auto Index row: toggle button on the left, live driver status beside it.
-    TAB_TOTAL.indexUI.autoBtn = Instance.new("TextButton")
-    TAB_TOTAL.indexUI.autoBtn.Name = "AutoIndexToggle"
-    TAB_TOTAL.indexUI.autoBtn.Size = UDim2.new(0, 160, 0, 30)
-    TAB_TOTAL.indexUI.autoBtn.Position = UDim2.fromOffset(0, 40)
-    TAB_TOTAL.indexUI.autoBtn.BackgroundColor3 = Color3.fromRGB(55, 62, 76)
-    TAB_TOTAL.indexUI.autoBtn.TextColor3 = Color3.fromRGB(180, 180, 190)
-    TAB_TOTAL.indexUI.autoBtn.Text = "Auto Index: OFF"
-    TAB_TOTAL.indexUI.autoBtn.Font = Enum.Font.GothamBold
-    TAB_TOTAL.indexUI.autoBtn.TextSize = 12
-    TAB_TOTAL.indexUI.autoBtn.Parent = TAB_TOTAL.indexUI.frame
-    do
-        local autoBtnCorner = Instance.new("UICorner")
-        autoBtnCorner.CornerRadius = UDim.new(0, 6)
-        autoBtnCorner.Parent = TAB_TOTAL.indexUI.autoBtn
-    end
-    do
-        local autoBtnStroke = Instance.new("UIStroke")
-        autoBtnStroke.Color = Color3.fromRGB(80, 80, 100)
-        autoBtnStroke.Thickness = 1
-        autoBtnStroke.Transparency = 0.7
-        autoBtnStroke.Parent = TAB_TOTAL.indexUI.autoBtn
-    end
-
-    TAB_TOTAL.indexUI.autoStatus = Instance.new("TextLabel")
-    TAB_TOTAL.indexUI.autoStatus.Name = "AutoIndexStatus"
-    TAB_TOTAL.indexUI.autoStatus.Size = UDim2.new(1, -168, 0, 30)
-    TAB_TOTAL.indexUI.autoStatus.Position = UDim2.fromOffset(168, 40)
-    TAB_TOTAL.indexUI.autoStatus.BackgroundTransparency = 1
-    TAB_TOTAL.indexUI.autoStatus.TextColor3 = Color3.fromRGB(165, 174, 192)
-    TAB_TOTAL.indexUI.autoStatus.TextXAlignment = Enum.TextXAlignment.Left
-    TAB_TOTAL.indexUI.autoStatus.TextTruncate = Enum.TextTruncate.AtEnd
-    TAB_TOTAL.indexUI.autoStatus.Font = Enum.Font.GothamMedium
-    TAB_TOTAL.indexUI.autoStatus.TextSize = 11
-    TAB_TOTAL.indexUI.autoStatus.Text = "Idle"
-    TAB_TOTAL.indexUI.autoStatus.Parent = TAB_TOTAL.indexUI.frame
-
     TAB_TOTAL.indexUI.list = Instance.new("ScrollingFrame")
     TAB_TOTAL.indexUI.list.Name = "IndexPetList"
-    TAB_TOTAL.indexUI.list.Size = UDim2.new(1, 0, 1, -100)
-    TAB_TOTAL.indexUI.list.Position = UDim2.fromOffset(0, 98)
+    TAB_TOTAL.indexUI.list.Size = UDim2.new(1, 0, 1, -78)
+    TAB_TOTAL.indexUI.list.Position = UDim2.fromOffset(0, 72)
     TAB_TOTAL.indexUI.list.BackgroundTransparency = 1
     TAB_TOTAL.indexUI.list.BorderSizePixel = 0
     TAB_TOTAL.indexUI.list.ScrollBarThickness = 4
@@ -2662,16 +3138,53 @@ TAB_TOTAL.indexUI.padding.Parent = TAB_TOTAL.indexUI.list
 
 TAB_TOTAL.luckyWorldFrame = Instance.new("Frame")
 TAB_TOTAL.luckyWorldFrame.Name = "LuckyWorldFrame"
-TAB_TOTAL.luckyWorldFrame.Size = UDim2.new(1, -40, 1, -136)
-TAB_TOTAL.luckyWorldFrame.Position = UDim2.new(0, 20, 0, 128)
+TAB_TOTAL.luckyWorldFrame.Size = UDim2.new(1, -260, 1, -145)
+TAB_TOTAL.luckyWorldFrame.Position = UDim2.new(0, 240, 0, 145)
 TAB_TOTAL.luckyWorldFrame.BackgroundTransparency = 1
 TAB_TOTAL.luckyWorldFrame.Visible = false
 TAB_TOTAL.luckyWorldFrame.Parent = autoHatchMain
 
+TAB_TOTAL.afkFrame = Instance.new("ScrollingFrame")
+TAB_TOTAL.afkFrame.Name = "AfkFrame"
+TAB_TOTAL.afkFrame.Size = UDim2.new(1, -260, 1, -145)
+TAB_TOTAL.afkFrame.Position = UDim2.new(0, 240, 0, 145)
+TAB_TOTAL.afkFrame.BackgroundTransparency = 1
+TAB_TOTAL.afkFrame.BorderSizePixel = 0
+TAB_TOTAL.afkFrame.ScrollBarThickness = 5
+TAB_TOTAL.afkFrame.AutomaticCanvasSize = Enum.AutomaticSize.Y
+TAB_TOTAL.afkFrame.CanvasSize = UDim2.new(0, 0, 0, 0)
+TAB_TOTAL.afkFrame.Visible = false
+TAB_TOTAL.afkFrame.Parent = autoHatchMain
+do local _afkPad = Instance.new("UIPadding") _afkPad.PaddingBottom = UDim.new(0, 24) _afkPad.Parent = TAB_TOTAL.afkFrame end
+
+-- Auto Farm page was referenced by the tab switcher and page container, but
+-- its frame was never instantiated. That nil frame stopped the UI build.
+-- Use a ScrollingFrame so the dropdowns and helper text remain reachable on
+-- shorter windows and lower resolutions.
+TAB_TOTAL.autoFarmFrame = Instance.new("ScrollingFrame")
+TAB_TOTAL.autoFarmFrame.Name = "AutoFarmFrame"
+TAB_TOTAL.autoFarmFrame.Size = UDim2.new(1, -260, 1, -145)
+TAB_TOTAL.autoFarmFrame.Position = UDim2.new(0, 240, 0, 145)
+TAB_TOTAL.autoFarmFrame.BackgroundTransparency = 1
+TAB_TOTAL.autoFarmFrame.BorderSizePixel = 0
+TAB_TOTAL.autoFarmFrame.ScrollBarThickness = 5
+TAB_TOTAL.autoFarmFrame.ScrollBarImageTransparency = 0.35
+TAB_TOTAL.autoFarmFrame.ScrollingDirection = Enum.ScrollingDirection.Y
+TAB_TOTAL.autoFarmFrame.CanvasSize = UDim2.new(0, 0, 0, 0)
+TAB_TOTAL.autoFarmFrame.AutomaticCanvasSize = Enum.AutomaticSize.Y
+TAB_TOTAL.autoFarmFrame.Visible = false
+TAB_TOTAL.autoFarmFrame.Parent = autoHatchMain
+do
+    local afPadding = Instance.new("UIPadding")
+    afPadding.PaddingRight = UDim.new(0, 8)
+    afPadding.PaddingBottom = UDim.new(0, 18)
+    afPadding.Parent = TAB_TOTAL.autoFarmFrame
+end
+
 TAB_TOTAL.frame = Instance.new("ScrollingFrame")
     TAB_TOTAL.frame.Name = "DaycareScroll"
-    TAB_TOTAL.frame.Size = UDim2.new(1, -40, 1, -136)
-    TAB_TOTAL.frame.Position = UDim2.new(0, 20, 0, 128)
+    TAB_TOTAL.frame.Size = UDim2.new(1, -260, 1, -145)
+    TAB_TOTAL.frame.Position = UDim2.new(0, 240, 0, 145)
     TAB_TOTAL.frame.BackgroundTransparency = 1
     TAB_TOTAL.frame.BorderSizePixel = 0
     TAB_TOTAL.frame.ScrollBarThickness = 5
@@ -2681,6 +3194,24 @@ TAB_TOTAL.frame = Instance.new("ScrollingFrame")
     TAB_TOTAL.frame.Parent = autoHatchMain
     do local _dp = Instance.new("UIPadding") _dp.PaddingBottom = UDim.new(0, 24) _dp.Parent = TAB_TOTAL.frame end
 
+    -- All tab pages share one clipped viewport inside PageSurface. Previously
+    -- they were siblings of the panel and extended below its bottom edge; that
+    -- let scrolling content (notably the webhook card) appear outside the page.
+    local pageFrames = {
+        hatchFrame, TAB_TOTAL.autoFarmFrame, tpFrame, settingsFrame, eggFrame, farmFrame,
+        TAB_TOTAL.frame, TAB_TOTAL.indexUI.frame, TAB_TOTAL.luckyWorldFrame,
+        TAB_TOTAL.afkFrame,
+    }
+    for _, page in ipairs(pageFrames) do
+        page.Parent = pageSurface
+        page.Position = UDim2.fromOffset(18, 51)
+        page.Size = UDim2.new(1, -36, 1, -66)
+        page.ClipsDescendants = true
+        if page:IsA("ScrollingFrame") then
+            page.AutomaticCanvasSize = Enum.AutomaticSize.Y
+            page.CanvasSize = UDim2.new(0, 0, 0, 0)
+        end
+    end
 
     -- =====================================================================
     -- FULL EXTENDED THEMES SYSTEM
@@ -2803,11 +3334,20 @@ TAB_TOTAL.frame = Instance.new("ScrollingFrame")
         if not obj or themeBaseColors[obj] then return themeBaseColors[obj] end
         local data = {}
         pcall(function()
-            if obj:IsA("GuiObject") and obj.BackgroundTransparency < 1 then
+            if obj:IsA("GuiObject") then
+                -- Capture even currently-transparent surfaces so a later
+                -- transparency change can reveal them in the active palette.
                 data.background = obj.BackgroundColor3
             end
             if obj:IsA("TextLabel") or obj:IsA("TextButton") or obj:IsA("TextBox") then
                 data.text = obj.TextColor3
+                data.textStroke = obj.TextStrokeColor3
+            end
+            if obj:IsA("TextBox") then
+                data.placeholder = obj.PlaceholderColor3
+            end
+            if obj:IsA("ScrollingFrame") then
+                data.scrollbar = obj.ScrollBarImageColor3
             end
             if obj:IsA("UIStroke") then
                 data.stroke = obj.Color
@@ -2831,27 +3371,31 @@ TAB_TOTAL.frame = Instance.new("ScrollingFrame")
         end
 
         if kind == "text" then
+            -- Preserve deliberately saturated text colors. These include
+            -- rarity labels (Golden/Rainbow/Shiny), category names and the
+            -- green/blue stat values. Only neutral text is remapped to the
+            -- active palette, so a theme switch cannot erase rarity meaning.
+            if maxc - minc >= 0.18 and bright < 0.94 then
+                return original
+            end
             if minc > 0.82 then
                 return activeTheme.text
-            elseif maxc - minc < 0.10 then
-                return activeTheme.muted
-            elseif r > g * 1.35 and r > b * 1.35 then
-                return activeTheme.danger
-            elseif g > r * 1.30 and g > b * 1.15 then
-                return activeTheme.controlOn
             end
-            return activeTheme.accent
+            return activeTheme.muted
         end
 
         if kind == "background" then
-            if r > g * 1.45 and r > b * 1.45 and r > 0.45 then
+            -- State-aware controls are handled by ThemeRole below. All other
+            -- decorative/colorful fills follow the active palette; red danger
+            -- states retain the theme danger color.
+            if r > g * 1.45 and r > b * 1.45 and r > 0.38 then
                 return activeTheme.danger
-            elseif g > r * 1.35 and g > b * 1.15 and g > 0.35 then
-                return activeTheme.controlOn
-            elseif bright < 0.16 then
+            elseif bright < 0.055 then
                 return activeTheme.background
-            elseif bright < 0.30 then
+            elseif bright < 0.20 then
                 return activeTheme.panel
+            elseif bright < 0.42 then
+                return activeTheme.surface
             else
                 return activeTheme.surface
             end
@@ -2860,18 +3404,103 @@ TAB_TOTAL.frame = Instance.new("ScrollingFrame")
         return original
     end
 
+    local themeApplying = false
+    local themedWatchers = setmetatable({}, { __mode = "k" })
+
     local function applyThemeToObject(obj)
         if not obj or not obj.Parent then return end
-        if obj:GetAttribute("ThemePreview") or obj:GetAttribute("ThemeLocked") then return end
+        if obj:GetAttribute("ThemePreview") then return end
+        if themeApplying then return end
 
-        -- Themes only recolor actual/full button boxes. Text, search fields,
-        -- thin divider/line frames, labels, and strokes keep their original colors.
-        if obj:IsA("TextButton") then
-            local base = rememberBaseColors(obj)
-            if base.background and obj.BackgroundTransparency < 1 then
+        local locked = obj:GetAttribute("ThemeLocked") == true
+        local keepText = obj:GetAttribute("ThemeKeepTextColor") == true
+        local role = obj:GetAttribute("ThemeRole")
+        local base = rememberBaseColors(obj)
+        themeApplying = true
+
+        -- Rounded surfaces are cards/containers in this UI. Ensure they have
+        -- a subtle outline so they remain distinguishable even in themes
+        -- whose panel and background colors are very close together.
+        if obj:IsA("GuiObject") and obj:FindFirstChildOfClass("UICorner")
+            and not obj:FindFirstChildOfClass("UIStroke") then
+            local outline = Instance.new("UIStroke")
+            outline.Name = "ThemeAutoOutline"
+            outline.Color = activeTheme.stroke
+            outline.Thickness = 1
+            outline.Transparency = 0.42
+            outline.Parent = obj
+            rememberBaseColors(outline)
+        end
+
+        -- Every surface, including AFK cards and overlays, follows the active
+        -- palette. ThemeLocked is reserved only for deliberately semantic fills.
+        if not locked and base.background and obj:IsA("GuiObject") and obj.BackgroundTransparency < 1 then
+            if role == "Toggle" then
+                local isOn = obj:GetAttribute("ToggleState") == true
+                local isHovered = obj:GetAttribute("ThemeHover") == true
+                obj.BackgroundColor3 = isOn and activeTheme.controlOn or (isHovered and activeTheme.accent or activeTheme.surface)
+            elseif role == "Tab" then
+                local isActive = obj:GetAttribute("TabActive") == true
+                local isHovered = obj:GetAttribute("ThemeHover") == true
+                obj.BackgroundColor3 = isActive and activeTheme.accent or (isHovered and activeTheme.panel or activeTheme.surface)
+            elseif role == "Accent" then
+                obj.BackgroundColor3 = activeTheme.accent
+            else
                 obj.BackgroundColor3 = themeAdaptColor(base.background, "background")
             end
         end
+
+        if base.text and (obj:IsA("TextLabel") or obj:IsA("TextButton") or obj:IsA("TextBox")) then
+            if keepText then
+                -- Restore the original semantic color, not the currently
+                -- themed color. This matters when a label was first themed
+                -- before its rarity/semantic attribute was assigned.
+                obj.TextColor3 = base.text
+            elseif role == "Toggle" or role == "Tab" then
+                local isActive = obj:GetAttribute("ToggleState") == true or obj:GetAttribute("TabActive") == true
+                obj.TextColor3 = isActive and activeTheme.text or activeTheme.muted
+            else
+                obj.TextColor3 = themeAdaptColor(base.text, "text")
+            end
+        end
+
+        if base.textStroke and (obj:IsA("TextLabel") or obj:IsA("TextButton") or obj:IsA("TextBox")) then
+            obj.TextStrokeColor3 = activeTheme.stroke
+        end
+        if base.placeholder and obj:IsA("TextBox") then
+            obj.PlaceholderColor3 = activeTheme.muted
+        end
+        if base.scrollbar and obj:IsA("ScrollingFrame") then
+            obj.ScrollBarImageColor3 = activeTheme.accent
+        end
+        if base.stroke and obj:IsA("UIStroke") then
+            obj.Color = activeTheme.stroke
+            obj.Transparency = math.min(obj.Transparency, 0.42)
+        end
+        if base.image and (obj:IsA("ImageLabel") or obj:IsA("ImageButton")) then
+            obj.ImageColor3 = activeTheme.accent
+        end
+
+        -- Repaint gradients too; otherwise the AFK backdrop/title retain the
+        -- previous palette even when their parent Frames have been themed.
+        if obj:IsA("UIGradient") then
+            if obj.Parent and obj.Parent.Name == "Title" then
+                obj.Color = ColorSequence.new({
+                    ColorSequenceKeypoint.new(0, activeTheme.text),
+                    ColorSequenceKeypoint.new(0.55, activeTheme.accent),
+                    ColorSequenceKeypoint.new(1, activeTheme.controlOn),
+                })
+            elseif obj.Parent and obj.Parent.Name == "Backdrop" then
+                obj.Color = ColorSequence.new({
+                    ColorSequenceKeypoint.new(0, activeTheme.panel),
+                    ColorSequenceKeypoint.new(0.55, activeTheme.background),
+                    ColorSequenceKeypoint.new(1, activeTheme.background),
+                })
+            else
+                obj.Color = ColorSequence.new(activeTheme.surface, activeTheme.accent)
+            end
+        end
+        themeApplying = false
     end
 
     local function applyThemeToUI(root)
@@ -2922,18 +3551,47 @@ TAB_TOTAL.frame = Instance.new("ScrollingFrame")
         polishedStrokes[obj] = stroke
     end
 
+    -- Give information groups a consistent visible boundary. Several older
+    -- builders used transparent frames, so on low-contrast palettes their
+    -- contents visually ran together. Only semantic card/panel/section groups
+    -- are normalized; layout-only frames remain untouched.
+    local polishedPanels = setmetatable({}, { __mode = "k" })
+    local function polishPanel(obj)
+        if not obj or not obj:IsA("Frame") or polishedPanels[obj] then return end
+        local n = string.lower(obj.Name or "")
+        local semanticPanel = n:find("card", 1, true) or n:find("panel", 1, true)
+            or n:find("section", 1, true) or n:find("tile", 1, true)
+        if not semanticPanel then return end
+        polishedPanels[obj] = true
+        if obj.BackgroundTransparency >= 0.98 then
+            obj.BackgroundTransparency = 0.12
+            obj.BackgroundColor3 = activeTheme.panel
+        end
+        local stroke = obj:FindFirstChildOfClass("UIStroke")
+        if not stroke then
+            stroke = Instance.new("UIStroke")
+            stroke.Name = "ThemePanelStroke"
+            stroke.Thickness = 1
+            stroke.Transparency = 0.42
+            stroke.Color = activeTheme.stroke
+            stroke.Parent = obj
+        end
+        stroke.Color = activeTheme.stroke
+    end
+
     local function applyTheme(themeObj)
         activeTheme = themeObj
         CurrentThemeName = themeObj.name
         saveSettings()
 
-        applyThemeToUI(autoHatchMain)
+        applyThemeToUI(ui)
+        applyThemeToUI(afkGui)
 
         autoHatchMain.BackgroundColor3 = activeTheme.background
         autoHatchShadow.Color = activeTheme.accent
         -- The title used to be hard-coded blue, so it ignored the theme
         -- entirely and sat oddly against every palette except the default.
-        autoTitle.TextColor3 = activeTheme.accent
+        autoTitle.TextColor3 = activeTheme.text
 
         local halo = autoHatchMain:FindFirstChild("WindowHalo")
         if halo then halo.BackgroundColor3 = activeTheme.accent end
@@ -2941,17 +3599,6 @@ TAB_TOTAL.frame = Instance.new("ScrollingFrame")
         if headerGlow then headerGlow.BackgroundColor3 = activeTheme.accent end
         local titleAccent = autoHatchMain:FindFirstChild("TitleAccent")
         if titleAccent then titleAccent.BackgroundColor3 = activeTheme.accent end
-        local titleDivider = autoHatchMain:FindFirstChild("TitleDivider")
-        if titleDivider then
-            local dividerGradient = titleDivider:FindFirstChildOfClass("UIGradient")
-            if dividerGradient then
-                dividerGradient.Color = ColorSequence.new({
-                    ColorSequenceKeypoint.new(0, activeTheme.accent),
-                    ColorSequenceKeypoint.new(0.3, activeTheme.stroke),
-                    ColorSequenceKeypoint.new(1, activeTheme.stroke),
-                })
-            end
-        end
         trackerStroke.Color = activeTheme.accent
         trackerStroke.Transparency = 0.55
 
@@ -2960,17 +3607,27 @@ TAB_TOTAL.frame = Instance.new("ScrollingFrame")
                 stroke.Color = activeTheme.stroke
             end
         end
+        for panel in pairs(polishedPanels) do
+            if panel and panel.Parent then
+                local panelStroke = panel:FindFirstChild("ThemePanelStroke") or panel:FindFirstChildOfClass("UIStroke")
+                if panelStroke then panelStroke.Color = activeTheme.stroke end
+                if panel.BackgroundTransparency < 0.98 then
+                    panel.BackgroundColor3 = activeTheme.panel
+                end
+            end
+        end
 
-        for _, btn in ipairs({hatchTab, tpTab, settingsTab, eggTab, farmTab, TAB_TOTAL.tab, TAB_TOTAL.indexUI.tab, TAB_TOTAL.luckyWorld}) do
+        for _, btn in ipairs({hatchTab, tpTab, settingsTab, eggTab, farmTab, TAB_TOTAL.tab, TAB_TOTAL.indexUI.tab, TAB_TOTAL.luckyWorld, TAB_TOTAL.afk}) do
+            btn:SetAttribute("ThemeRole", "Tab")
             local tabStroke = btn:FindFirstChildOfClass("UIStroke")
             local isActive = (btn == currentTabBtn)
             btn:SetAttribute("TabActive", isActive)
             if isActive then
                 btn.BackgroundColor3 = activeTheme.accent
-                btn.TextColor3 = Color3.fromRGB(255, 255, 255)
+                btn.TextColor3 = activeTheme.text
                 if tabStroke then
                     tabStroke.Color = activeTheme.accent
-                    tabStroke.Transparency = 0.15
+                    tabStroke.Transparency = 0.08
                 end
             else
                 btn.BackgroundColor3 = activeTheme.surface
@@ -2995,31 +3652,87 @@ TAB_TOTAL.frame = Instance.new("ScrollingFrame")
             end
         end
         if themeScroll then themeScroll.BackgroundColor3 = activeTheme.panel end
+        -- Re-apply state-aware colors after the theme switch so no toggle keeps
+        -- its previous blue/green fill. This also covers generated controls.
+        for _, root in ipairs({ui, afkGui}) do
+            for _, obj in ipairs(root:GetDescendants()) do
+                if obj:GetAttribute("ThemeRole") == "Toggle" then
+                    applyThemeToObject(obj)
+                end
+            end
+        end
     end
 
     -- Instantly theme newly-created UI too. This fixes controls that previously
     -- needed a click/repaint before their new colors became visible.
-    ui.DescendantAdded:Connect(function(obj)
+    local function watchThemeProperties(obj)
+        if not obj or themedWatchers[obj] then return end
+        themedWatchers[obj] = true
+        local function repaint()
+            if themeApplying then return end
+            task.defer(function()
+                if obj and obj.Parent and not themeApplying then
+                    applyThemeToObject(obj)
+                end
+            end)
+        end
+        if obj:IsA("GuiObject") then
+            obj:GetPropertyChangedSignal("BackgroundColor3"):Connect(repaint)
+            obj:GetPropertyChangedSignal("BackgroundTransparency"):Connect(repaint)
+        end
+        if obj:IsA("TextLabel") or obj:IsA("TextButton") or obj:IsA("TextBox") then
+            obj:GetPropertyChangedSignal("TextColor3"):Connect(repaint)
+            obj:GetPropertyChangedSignal("TextStrokeColor3"):Connect(repaint)
+        end
+        if obj:IsA("TextBox") then
+            obj:GetPropertyChangedSignal("PlaceholderColor3"):Connect(repaint)
+        end
+        if obj:IsA("ScrollingFrame") then
+            obj:GetPropertyChangedSignal("ScrollBarImageColor3"):Connect(repaint)
+        end
+        if obj:IsA("UIGradient") then
+            obj:GetPropertyChangedSignal("Color"):Connect(repaint)
+        end
+        if obj:IsA("ImageLabel") or obj:IsA("ImageButton") then
+            obj:GetPropertyChangedSignal("ImageColor3"):Connect(repaint)
+        end
+        if obj:IsA("UIStroke") then
+            obj:GetPropertyChangedSignal("Color"):Connect(repaint)
+        end
+    end
+
+    local function onThemedDescendantAdded(obj)
         task.defer(function()
             if obj and obj.Parent then
+                rememberBaseColors(obj)
+                watchThemeProperties(obj)
                 applyThemeToObject(obj)
                 if obj:IsA("TextButton") then
                     polishControl(obj)
                 end
+                polishPanel(obj)
             end
         end)
-    end)
+    end
+    ui.DescendantAdded:Connect(onThemedDescendantAdded)
+    afkGui.DescendantAdded:Connect(onThemedDescendantAdded)
 
     -- Sweep controls that existed before the connection above.
-    for _, obj in ipairs(ui:GetDescendants()) do
-        if obj:IsA("TextButton") then
-            polishControl(obj)
+    for _, root in ipairs({ui, afkGui}) do
+        for _, obj in ipairs(root:GetDescendants()) do
+            rememberBaseColors(obj)
+            watchThemeProperties(obj)
+            if obj:IsA("TextButton") and root == ui then
+                polishControl(obj)
+            end
+            polishPanel(obj)
         end
     end
 
 
     local function switchTab(activeBtn, activeFrame)
     hatchFrame.Visible = false
+    TAB_TOTAL.autoFarmFrame.Visible = false
     tpFrame.Visible = false
     settingsFrame.Visible = false
     eggFrame.Visible = false
@@ -3027,8 +3740,9 @@ TAB_TOTAL.frame = Instance.new("ScrollingFrame")
     TAB_TOTAL.frame.Visible = false
     TAB_TOTAL.indexUI.frame.Visible = false
     TAB_TOTAL.luckyWorldFrame.Visible = false
+    TAB_TOTAL.afkFrame.Visible = false
 
-    for _, btn in ipairs({hatchTab, tpTab, settingsTab, eggTab, farmTab, TAB_TOTAL.tab, TAB_TOTAL.indexUI.tab, TAB_TOTAL.luckyWorld}) do
+    for _, btn in ipairs({hatchTab, TAB_TOTAL.autoFarmTab, tpTab, settingsTab, eggTab, farmTab, TAB_TOTAL.tab, TAB_TOTAL.indexUI.tab, TAB_TOTAL.luckyWorld, TAB_TOTAL.afk}) do
             local tabStroke = btn:FindFirstChildOfClass("UIStroke")
             btn:SetAttribute("TabActive", false)
             btn.BackgroundColor3 = activeTheme.surface
@@ -3046,37 +3760,39 @@ TAB_TOTAL.frame = Instance.new("ScrollingFrame")
         activeFrame.Visible = true
         activeBtn:SetAttribute("TabActive", true)
         activeBtn.BackgroundColor3 = activeTheme.accent
-        activeBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+        activeBtn.TextColor3 = activeTheme.text
         local activeStroke = activeBtn:FindFirstChildOfClass("UIStroke")
         if activeStroke then
             activeStroke.Color = activeTheme.accent
-            activeStroke.Transparency = 0.15
-        end
-        local activeUnderline = activeBtn:FindFirstChild("ActiveUnderline")
-        if activeUnderline then
-            activeUnderline.Visible = true
+            activeStroke.Transparency = 0.08
         end
         currentTabBtn = activeBtn
         currentTabFrame = activeFrame
+        if pageCaption then
+            pageCaption.Text = string.upper(activeBtn.Text:gsub("^%d+%s+", "")):gsub("%s+", " ")
+        end
     end
 
     -- Tab hover: lifts the fill toward the accent without touching the active
     -- tab. Defined here because it needs activeTheme in scope.
-    for _, btn in ipairs({hatchTab, tpTab, settingsTab, eggTab, farmTab, TAB_TOTAL.tab, TAB_TOTAL.indexUI.tab, TAB_TOTAL.luckyWorld}) do
+    for _, btn in ipairs({hatchTab, TAB_TOTAL.autoFarmTab, tpTab, settingsTab, eggTab, farmTab, TAB_TOTAL.tab, TAB_TOTAL.indexUI.tab, TAB_TOTAL.luckyWorld, TAB_TOTAL.afk}) do
         local tabStroke = btn:FindFirstChildOfClass("UIStroke")
         btn.MouseEnter:Connect(function()
             if btn:GetAttribute("TabActive") then return end
-            btn.BackgroundColor3 = activeTheme.surface:Lerp(activeTheme.accent, 0.18)
+            btn:SetAttribute("ThemeHover", true)
+            btn.BackgroundColor3 = activeTheme.panel
             if tabStroke then tabStroke.Transparency = 0.45 end
         end)
         btn.MouseLeave:Connect(function()
+            btn:SetAttribute("ThemeHover", false)
             if btn:GetAttribute("TabActive") then return end
             btn.BackgroundColor3 = activeTheme.surface
-            if tabStroke then tabStroke.Transparency = 0.72 end
+            if tabStroke then tabStroke.Transparency = 0.42 end
         end)
     end
 
     hatchTab.MouseButton1Click:Connect(function() switchTab(hatchTab, hatchFrame) end)
+    TAB_TOTAL.autoFarmTab.MouseButton1Click:Connect(function() switchTab(TAB_TOTAL.autoFarmTab, TAB_TOTAL.autoFarmFrame) end)
     tpTab.MouseButton1Click:Connect(function() switchTab(tpTab, tpFrame) end)
     settingsTab.MouseButton1Click:Connect(function() switchTab(settingsTab, settingsFrame) end)
     eggTab.MouseButton1Click:Connect(function() switchTab(eggTab, eggFrame) end)
@@ -3084,6 +3800,7 @@ TAB_TOTAL.frame = Instance.new("ScrollingFrame")
     TAB_TOTAL.tab.MouseButton1Click:Connect(function() switchTab(TAB_TOTAL.tab, TAB_TOTAL.frame) end)
 TAB_TOTAL.indexUI.tab.MouseButton1Click:Connect(function() switchTab(TAB_TOTAL.indexUI.tab, TAB_TOTAL.indexUI.frame) end)
 TAB_TOTAL.luckyWorld.MouseButton1Click:Connect(function() switchTab(TAB_TOTAL.luckyWorld, TAB_TOTAL.luckyWorldFrame) end)
+TAB_TOTAL.afk.MouseButton1Click:Connect(function() switchTab(TAB_TOTAL.afk, TAB_TOTAL.afkFrame) end)
 
 switchTab(hatchTab, hatchFrame)
 
@@ -3095,9 +3812,9 @@ switchTab(hatchTab, hatchFrame)
         local btn = Instance.new("TextButton")
         btn.Size = UDim2.new(1, 0, 0, 34)
         btn.Position = UDim2.new(0, 0, 0, yPos)
-        btn.BackgroundColor3 = defaultState and activeTheme.controlOn or activeTheme.surface
+        btn.BackgroundColor3 = defaultState and Color3.fromRGB(20, 190, 126) or Color3.fromRGB(67, 104, 145)
         btn.Text = text .. (defaultState and ": ON" or ": OFF")
-        btn.TextColor3 = defaultState and Color3.fromRGB(255, 255, 255) or Color3.fromRGB(180, 180, 190)
+        btn.TextColor3 = Color3.fromRGB(255, 255, 255)
         btn.Font = Enum.Font.GothamBold
         btn.TextSize = 13
         btn.Parent = parent
@@ -3131,6 +3848,7 @@ switchTab(hatchTab, hatchFrame)
             CurrentToggleStates[text] = false
         end
         btn:SetAttribute("ToggleState", state)
+        btn:SetAttribute("ThemeRole", "Toggle")
         toggleCallbacks[text] = callback
 
         -- A restored toggle used to show ON without actually running, so the
@@ -3145,22 +3863,22 @@ switchTab(hatchTab, hatchFrame)
         local function updateVisuals(newState)
             state = newState
             btn:SetAttribute("ToggleState", state)
-            local base = state and activeTheme.controlOn or activeTheme.surface
-            if hovered and not state then
-                base = base:Lerp(activeTheme.accent, 0.14)
-            end
-            btn.BackgroundColor3 = base
+            btn.BackgroundColor3 = state and activeTheme.controlOn or (hovered and activeTheme.accent or activeTheme.surface)
             btn.Text = text .. (state and ": ON" or ": OFF")
-            btn.TextColor3 = state and Color3.fromRGB(255, 255, 255) or Color3.fromRGB(180, 180, 190)
+            btn.TextColor3 = activeTheme.text
         end
+
+        updateVisuals(state)
 
         btn.MouseEnter:Connect(function()
             hovered = true
+            btn:SetAttribute("ThemeHover", true)
             updateVisuals(state)
         end)
 
         btn.MouseLeave:Connect(function()
             hovered = false
+            btn:SetAttribute("ThemeHover", false)
             updateVisuals(state)
         end)
 
@@ -3258,10 +3976,19 @@ switchTab(hatchTab, hatchFrame)
         AntiAFK = state
     end)
 
+    -- Buys out every Diamond Pack in the Exclusive Shop with Rainbow Coins and
+    -- keeps re-buying as the daily stock restocks.
+    createUnifiedToggle(farmFrame, 452, "Auto Diamond Packs", false, function(state)
+        AutoDiamondPacks = state
+        DiamondPackStatus = state and "Starting..." or "Idle"
+        DiamondPackLastStock = -1
+        if not state then DiamondPackStockText = "" end
+    end)
+
     do
         local antiAfkLabel = Instance.new("TextLabel")
         antiAfkLabel.Size = UDim2.new(0.58, 0, 0, 28)
-        antiAfkLabel.Position = UDim2.new(0, 0, 0, 452)
+        antiAfkLabel.Position = UDim2.new(0, 0, 0, 494)
         antiAfkLabel.BackgroundTransparency = 1
         antiAfkLabel.Text = "Anti AFK interval (minutes)"
         antiAfkLabel.TextColor3 = Color3.fromRGB(190, 190, 200)
@@ -3273,7 +4000,7 @@ switchTab(hatchTab, hatchFrame)
 
     local antiAfkBox = Instance.new("TextBox")
     antiAfkBox.Size = UDim2.new(0.32, 0, 0, 28)
-    antiAfkBox.Position = UDim2.new(0.68, 0, 0, 452)
+    antiAfkBox.Position = UDim2.new(0.68, 0, 0, 494)
     antiAfkBox.BackgroundColor3 = Color3.fromRGB(35, 35, 48)
     antiAfkBox.BorderSizePixel = 0
     antiAfkBox.ClearTextOnFocus = false
@@ -3306,7 +4033,7 @@ switchTab(hatchTab, hatchFrame)
 
     local farmStatus = Instance.new("TextLabel")
     farmStatus.Size = UDim2.new(1, 0, 0, 28)
-    farmStatus.Position = UDim2.new(0, 0, 0, 490)
+    farmStatus.Position = UDim2.new(0, 0, 0, 532)
     farmStatus.BackgroundTransparency = 1
     farmStatus.Text = "Status: Idle"
     farmStatus.TextColor3 = Color3.fromRGB(180, 180, 180)
@@ -3315,9 +4042,28 @@ switchTab(hatchTab, hatchFrame)
     farmStatus.TextXAlignment = Enum.TextXAlignment.Left
     farmStatus.Parent = farmFrame
 
+    -- Per-tier Diamond Pack stock, shown only while Auto Diamond Packs is on so
+    -- each tier can be watched draining and the engine's reads confirmed.
+    local diamondStock = Instance.new("TextLabel")
+    diamondStock.Size = UDim2.new(1, 0, 0, 24)
+    diamondStock.Position = UDim2.new(0, 0, 0, 562)
+    diamondStock.BackgroundTransparency = 1
+    diamondStock.Text = ""
+    diamondStock.TextColor3 = Color3.fromRGB(215, 170, 255)
+    diamondStock.Font = Enum.Font.GothamBold
+    diamondStock.TextSize = 12
+    diamondStock.TextXAlignment = Enum.TextXAlignment.Left
+    diamondStock.Visible = false
+    diamondStock.Parent = farmFrame
+
     task.spawn(function()
         while farmFrame.Parent do
-            if AutoBuying then
+            diamondStock.Visible = AutoDiamondPacks
+            if AutoDiamondPacks then
+                farmStatus.Text = "Status: " .. tostring(DiamondPackStatus)
+                farmStatus.TextColor3 = Color3.fromRGB(255, 190, 255)
+                diamondStock.Text = "Stock: " .. (DiamondPackStockText ~= "" and DiamondPackStockText or "-")
+            elseif AutoBuying then
                 farmStatus.Text = "Status: " .. tostring(HatchWatchdogStatus)
                 farmStatus.TextColor3 = Color3.fromRGB(120, 255, 180)
             elseif AutoFarmRobot and CurrentTargetId then
@@ -3351,6 +4097,143 @@ switchTab(hatchTab, hatchFrame)
             task.wait(0.5)
         end
     end)
+
+    -- =====================================================================
+    -- AFK TAB UI
+    -- Unattended chores: group rewards, spinny wheels, potion upgrade/use and
+    -- the quest driver. The engines live further down (they need the teleport
+    -- helpers), so these rows only flip the shared top-level flags.
+    -- =====================================================================
+    do
+        local afkTitle = Instance.new("TextLabel")
+        afkTitle.Size = UDim2.new(1, 0, 0, 24)
+        afkTitle.Position = UDim2.new(0, 0, 0, 0)
+        afkTitle.BackgroundTransparency = 1
+        afkTitle.Text = "AFK AUTOMATION"
+        afkTitle.TextColor3 = Color3.fromRGB(255, 255, 255)
+        afkTitle.Font = Enum.Font.GothamBold
+        afkTitle.TextSize = 14
+        afkTitle.TextXAlignment = Enum.TextXAlignment.Left
+        afkTitle.Parent = TAB_TOTAL.afkFrame
+    end
+
+    do
+        local afkSub = Instance.new("TextLabel")
+        afkSub.Size = UDim2.new(1, 0, 0, 40)
+        afkSub.Position = UDim2.new(0, 0, 0, 26)
+        afkSub.BackgroundTransparency = 1
+        afkSub.Text = "Claim group rewards, spin the wheels, upgrade and drink max-tier Lucky/Coins/Damage potions. Auto Quests accepts each main quest line on its own and plays it through to the claim, then moves to the next."
+        afkSub.TextColor3 = Color3.fromRGB(190, 190, 200)
+        afkSub.Font = Enum.Font.Gotham
+        afkSub.TextSize = 11
+        afkSub.TextWrapped = true
+        afkSub.TextXAlignment = Enum.TextXAlignment.Left
+        afkSub.Parent = TAB_TOTAL.afkFrame
+    end
+
+    createUnifiedToggle(TAB_TOTAL.afkFrame, 74, "Auto Group Rewards", false, function(state)
+        AutoGroupRewards = state
+        AfkGroupStatus = state and "Starting..." or "Idle"
+    end)
+
+    createUnifiedToggle(TAB_TOTAL.afkFrame, 116, "Auto Spinny Wheels", false, function(state)
+        AutoSpinnyWheels = state
+        AfkWheelStatus = state and "Starting..." or "Idle"
+    end)
+
+    createUnifiedToggle(TAB_TOTAL.afkFrame, 158, "Auto Upgrade Potions", false, function(state)
+        AutoPotionUpgrade = state
+        AfkPotionStatus = state and "Starting..." or "Idle"
+    end)
+
+    createUnifiedToggle(TAB_TOTAL.afkFrame, 200, "Auto Use Max Potions", false, function(state)
+        AutoPotionUse = state
+        AfkPotionUseStatus = state and "Starting..." or "Idle"
+    end)
+
+    -- -----------------------------------------------------------------
+    -- Quest section header + the two driver toggles.
+    --
+    -- These rows used to sit at 242/268, which is only 26px apart while every
+    -- other toggle row is 42px and 34px tall, so the two quest buttons overlapped
+    -- each other and the status label below cut into the second one.
+    --
+    -- The header is built inside an immediately-called function so it adds no
+    -- local register to this already register-tight UI builder closure.
+    -- -----------------------------------------------------------------
+    ;(function(frame)
+        local questHeader = Instance.new("TextLabel")
+        questHeader.Size = UDim2.new(1, 0, 0, 22)
+        questHeader.Position = UDim2.new(0, 0, 0, 240)
+        questHeader.BackgroundTransparency = 1
+        questHeader.Text = "QUEST LINES  (auto-accepts and works them in order)"
+        questHeader.TextColor3 = Color3.fromRGB(255, 220, 120)
+        questHeader.Font = Enum.Font.GothamBold
+        questHeader.TextSize = 11
+        questHeader.TextXAlignment = Enum.TextXAlignment.Left
+        questHeader.Parent = frame
+    end)(TAB_TOTAL.afkFrame)
+
+    local autoQuestsToggle = createUnifiedToggle(TAB_TOTAL.afkFrame, 264, "Auto Quests (main lines)", false, function(state)
+        AutoQuests = state
+        AfkQuestStatus = state and "Starting..." or "Idle"
+        if not state then
+            QuestCoinFilter = nil
+            QuestFarmActive = false
+            QuestAreaFarmWanted = false
+            QuestAreaFarmTarget = nil
+            QuestHatchAnywhere = false
+            QuestTargetEggId = nil
+            QuestTargetEggLabel = nil
+        end
+    end)
+
+    local autoQuestsSideToggle = createUnifiedToggle(TAB_TOTAL.afkFrame, 306, "Auto Side Quests (event lines)", false, function(state)
+        AutoQuestsSide = state
+        AfkSideQuestStatus = state and "Starting..." or "Idle"
+        if not state then
+            QuestCoinFilter = nil
+            QuestFarmActive = false
+            QuestAreaFarmWanted = false
+            QuestAreaFarmTarget = nil
+            QuestHatchAnywhere = false
+            QuestTargetEggId = nil
+            QuestTargetEggLabel = nil
+        end
+    end)
+
+    if not autoQuestsToggle or not autoQuestsSideToggle then
+        warn("[Pet Dimensions Hub] Auto Quests toggle failed to create")
+    end
+
+    do
+        local afkStatus = Instance.new("TextLabel")
+        afkStatus.Size = UDim2.new(1, 0, 0, 150)
+        afkStatus.Position = UDim2.new(0, 0, 0, 352)
+        afkStatus.BackgroundTransparency = 1
+        afkStatus.Text = ""
+        afkStatus.TextColor3 = Color3.fromRGB(200, 200, 210)
+        afkStatus.Font = Enum.Font.Gotham
+        afkStatus.TextSize = 12
+        afkStatus.TextWrapped = true
+        afkStatus.TextXAlignment = Enum.TextXAlignment.Left
+        afkStatus.TextYAlignment = Enum.TextYAlignment.Top
+        afkStatus.Parent = TAB_TOTAL.afkFrame
+
+        task.spawn(function()
+            while afkStatus.Parent do
+                afkStatus.Text = table.concat({
+                    "Group rewards: " .. tostring(AfkGroupStatus),
+                    "Wheels: " .. tostring(AfkWheelStatus),
+                    "Potion upgrade: " .. tostring(AfkPotionStatus),
+                    "Potion use: " .. tostring(AfkPotionUseStatus),
+                    "Main quests: " .. tostring(AfkQuestStatus),
+                    "Side quests: " .. tostring(AfkSideQuestStatus),
+                }, "\n")
+                task.wait(0.5)
+            end
+        end)
+    end
 
     -- =====================================================================
     -- LUCKY WORLD TAB
@@ -4767,8 +5650,8 @@ end
 
     statsContainer = Instance.new("Frame")
     statsContainer.Name = "StatsContainer"
-    statsContainer.Size = UDim2.new(1, 0, 0, 232)
-    statsContainer.Position = UDim2.new(0, 0, 0, 0)
+    statsContainer.Size = UDim2.new(1, -6, 0, 232)
+    statsContainer.Position = UDim2.new(0, 3, 0, 8)
     statsContainer.BackgroundColor3 = Color3.fromRGB(22, 24, 33)
     statsContainer.Parent = hatchFrame
 
@@ -4812,8 +5695,8 @@ end
     end
 
     local EggsLabel = Instance.new("TextLabel")
-    EggsLabel.Size = UDim2.new(0.5, -12, 0, 46)
-    EggsLabel.Position = UDim2.new(0, 8, 0, 32)
+    EggsLabel.Size = UDim2.new(0.5, -19, 0, 46)
+    EggsLabel.Position = UDim2.new(0, 14, 0, 32)
     EggsLabel.Text = "Eggs: 0"
     EggsLabel.TextColor3 = Color3.fromRGB(80, 230, 80)
     EggsLabel.BackgroundColor3 = Color3.fromRGB(29, 32, 44)
@@ -4824,8 +5707,8 @@ end
     EggsLabel.Parent = statsContainer
 
     local GemsLabel = Instance.new("TextLabel")
-    GemsLabel.Size = UDim2.new(0.5, -12, 0, 46)
-    GemsLabel.Position = UDim2.new(0.5, 4, 0, 32)
+    GemsLabel.Size = UDim2.new(0.5, -19, 0, 46)
+    GemsLabel.Position = UDim2.new(0.5, 5, 0, 32)
     GemsLabel.Text = "Diamonds: 0"
     GemsLabel.TextColor3 = Color3.fromRGB(110, 185, 255)
     GemsLabel.BackgroundColor3 = Color3.fromRGB(29, 32, 44)
@@ -4840,8 +5723,8 @@ end
     local hatchDiamondsBlue = Color3.fromRGB(110, 185, 255)
     EggsLabel.TextColor3 = hatchEggsGreen
     GemsLabel.TextColor3 = hatchDiamondsBlue
-    EggsLabel:SetAttribute("ThemeLocked", true)
-    GemsLabel:SetAttribute("ThemeLocked", true)
+    EggsLabel:SetAttribute("ThemeKeepTextColor", true)
+    GemsLabel:SetAttribute("ThemeKeepTextColor", true)
 
     do
         local function cardify(label)
@@ -4855,8 +5738,8 @@ end
             padding.Parent = label
 
             local stroke = Instance.new("UIStroke")
-            stroke.Color = Color3.fromRGB(52, 58, 76)
-            stroke.Transparency = 0.55
+            stroke.Color = activeTheme.stroke
+            stroke.Transparency = 0.35
             stroke.Parent = label
         end
 
@@ -4866,8 +5749,8 @@ end
 
     local function makeHatchRareLabel(name, position)
         local label = Instance.new("TextLabel")
-        label.Size = UDim2.new(0.25, -8, 0, 30)
-        label.Position = UDim2.new(position, 4, 0, 88)
+        label.Size = UDim2.new(0.25, -10, 0, 30)
+        label.Position = UDim2.new(position, 5, 0, 88)
         label.Text = name .. ": 0"
         label.TextColor3 = Color3.fromRGB(255, 210, 80)
         label.BackgroundColor3 = Color3.fromRGB(27, 30, 41)
@@ -5050,7 +5933,7 @@ end
         afkToggleBtn:SetAttribute("ToggleState", enabled)
         afkToggleBtn.BackgroundColor3 = enabled and activeTheme.controlOn or activeTheme.surface
         afkToggleBtn.Text = "AFK Mode: " .. (enabled and "ON" or "OFF")
-        afkToggleBtn.TextColor3 = enabled and Color3.fromRGB(255, 255, 255) or Color3.fromRGB(180, 180, 190)
+        afkToggleBtn.TextColor3 = activeTheme.text
     end
 
     local function setAfkMode(enabled)
@@ -5088,7 +5971,7 @@ end
     local controlPanel = Instance.new("Frame")
     controlPanel.Name = "ControlPanel"
     controlPanel.Size = UDim2.new(1, -6, 0, 90)
-    controlPanel.Position = UDim2.new(0, 3, 0, 242)
+    controlPanel.Position = UDim2.new(0, 3, 0, 250)
     controlPanel.BackgroundColor3 = activeTheme.panel
     controlPanel.BorderSizePixel = 0
     controlPanel.Parent = hatchFrame
@@ -5123,10 +6006,11 @@ end
     afkToggleBtn = Instance.new("TextButton")
     afkToggleBtn.Size = UDim2.new(0.5, -8, 0, 34)
     afkToggleBtn.Position = UDim2.new(0, 8, 0, 36)
-    afkToggleBtn.BackgroundColor3 = false and activeTheme.controlOn or activeTheme.surface
+    afkToggleBtn.BackgroundColor3 = Color3.fromRGB(67, 104, 145)
     afkToggleBtn.Text = "AFK Mode: OFF"
     afkToggleBtn:SetAttribute("ToggleState", false)
-    afkToggleBtn.TextColor3 = Color3.fromRGB(180, 180, 190)
+    afkToggleBtn:SetAttribute("ThemeRole", "Toggle")
+    afkToggleBtn.TextColor3 = activeTheme.text
     afkToggleBtn.Font = Enum.Font.GothamBold
     afkToggleBtn.TextSize = 13
     afkToggleBtn.Parent = controlPanel
@@ -5153,9 +6037,11 @@ end
     local hatchToggleBtn = Instance.new("TextButton")
     hatchToggleBtn.Size = UDim2.new(0.5, -8, 0, 34)
     hatchToggleBtn.Position = UDim2.new(0.5, 0, 0, 36)
-    hatchToggleBtn.BackgroundColor3 = false and activeTheme.controlOn or activeTheme.surface
+    hatchToggleBtn.BackgroundColor3 = Color3.fromRGB(67, 104, 145)
     hatchToggleBtn.Text = "Auto-Hatch Egg: OFF"
-    hatchToggleBtn.TextColor3 = Color3.fromRGB(180, 180, 190)
+    hatchToggleBtn:SetAttribute("ToggleState", false)
+    hatchToggleBtn:SetAttribute("ThemeRole", "Toggle")
+    hatchToggleBtn.TextColor3 = activeTheme.text
     hatchToggleBtn.Font = Enum.Font.GothamBold
     hatchToggleBtn.TextSize = 13
     hatchToggleBtn.Parent = controlPanel
@@ -5192,7 +6078,7 @@ end
     local recentPanel = Instance.new("Frame")
     recentPanel.Name = "RecentHatchesPanel"
     recentPanel.Size = UDim2.new(1, -6, 0, 194)
-    recentPanel.Position = UDim2.new(0, 3, 0, 342)
+    recentPanel.Position = UDim2.new(0, 3, 0, 350)
     recentPanel.BackgroundColor3 = activeTheme.panel
     recentPanel.BorderSizePixel = 0
     recentPanel.Parent = hatchFrame
@@ -5547,7 +6433,9 @@ end
         local enable = Instance.new("TextButton")
         enable.Size = UDim2.new(1, -24, 0, 30)
         enable.Position = UDim2.new(0, 12, 0, 98)
-        enable.BackgroundColor3 = activeTheme.surface
+        enable.BackgroundColor3 = Color3.fromRGB(67, 104, 145)
+        enable:SetAttribute("ThemeRole", "Toggle")
+        enable:SetAttribute("ToggleState", WebhookEnabled == true)
         enable.BorderSizePixel = 0
         enable.Text = "Webhook: OFF"
         enable.TextColor3 = Color3.fromRGB(255,255,255)
@@ -5563,10 +6451,12 @@ end
         local function updateEnable()
             if WebhookEnabled then
                 enable.Text = "Webhook: ON"
+                enable:SetAttribute("ToggleState", true)
                 enable.BackgroundColor3 = activeTheme.controlOn
                 status.Text = "Webhook is ON"
             else
                 enable.Text = "Webhook: OFF"
+                enable:SetAttribute("ToggleState", false)
                 enable.BackgroundColor3 = activeTheme.surface
                 status.Text = "Webhook is OFF"
             end
@@ -5592,7 +6482,9 @@ end
             local b = Instance.new("TextButton")
             b.Size = UDim2.new(0.47,0,0,28)
             b.Position = UDim2.new(x, x == 0 and 12 or 0, 0, y)
-            b.BackgroundColor3 = activeTheme.surface
+            b.BackgroundColor3 = WebhookNotify[key] and Color3.fromRGB(20, 190, 126) or Color3.fromRGB(67, 104, 145)
+            b:SetAttribute("ThemeRole", "Toggle")
+            b:SetAttribute("ToggleState", WebhookNotify[key] == true)
             b.BorderSizePixel = 0
             b.Font = Enum.Font.GothamSemibold
             b.TextSize = 10
@@ -5602,7 +6494,10 @@ end
             c.CornerRadius = UDim.new(0,6)
             c.Parent = b
             local function redraw()
+                b:SetAttribute("ToggleState", WebhookNotify[key] == true)
                 b.Text = (WebhookNotify[key] and "ON  -  " or "OFF -  ") .. labelText
+                b.BackgroundColor3 = WebhookNotify[key] and activeTheme.controlOn or activeTheme.surface
+                b.TextColor3 = activeTheme.text
             end
             redraw()
             b.MouseButton1Click:Connect(function()
@@ -5663,7 +6558,9 @@ end
         local summaryToggle = Instance.new("TextButton")
         summaryToggle.Size = UDim2.new(0.54, -12, 0, 26)
         summaryToggle.Position = UDim2.new(0, 12, 0, 262)
-        summaryToggle.BackgroundColor3 = activeTheme.surface
+        summaryToggle.BackgroundColor3 = Color3.fromRGB(67, 104, 145)
+        summaryToggle:SetAttribute("ThemeRole", "Toggle")
+        summaryToggle:SetAttribute("ToggleState", WebhookSummaryEnabled == true)
         summaryToggle.BorderSizePixel = 0
         summaryToggle.TextColor3 = Color3.fromRGB(255, 255, 255)
         summaryToggle.Font = Enum.Font.GothamSemibold
@@ -5707,8 +6604,10 @@ end
         end
 
         local function updateSummary()
+            summaryToggle:SetAttribute("ToggleState", WebhookSummaryEnabled == true)
             summaryToggle.Text = WebhookSummaryEnabled and "Summary every: ON" or "Summary every: OFF"
             summaryToggle.BackgroundColor3 = WebhookSummaryEnabled and activeTheme.controlOn or activeTheme.surface
+            summaryToggle.TextColor3 = activeTheme.text
         end
         updateSummary()
 
@@ -6343,7 +7242,7 @@ end
             title.Position = UDim2.new(0, 0, 0, 0)
             title.BackgroundTransparency = 1
             title.Text = "DAYCARE AUTOMATION"
-            title.TextColor3 = Color3.fromRGB(255, 255, 255)
+            title.TextColor3 = Color3.fromRGB(224, 229, 239)
             title.Font = Enum.Font.GothamBold
             title.TextSize = 14
             title.TextXAlignment = Enum.TextXAlignment.Left
@@ -6665,11 +7564,12 @@ end
     do
         local panel = Instance.new("Frame")
         panel.Name = "AfkRarePanel"
-        panel.Size = UDim2.new(1, 0, 0.51, 0)
-        panel.Position = UDim2.new(0, 0, 0.365, 0)
-        panel.BackgroundColor3 = Style.surfaceAlt
-        panel.BackgroundTransparency = 0.12
+        panel.Size = UDim2.new(1, -12, 0.49, 0)
+        panel.Position = UDim2.new(0, 6, 0.38, 0)
+        panel.BackgroundColor3 = Color3.fromRGB(19, 25, 37)
+        panel.BackgroundTransparency = 0.02
         panel.BorderSizePixel = 0
+        panel.ClipsDescendants = false
         panel.Visible = true
         panel.ZIndex = 103
         panel.Parent = afkCenter
@@ -6682,8 +7582,9 @@ end
 
         do
             local panelStroke = Instance.new("UIStroke")
-            panelStroke.Color = Style.line
-            panelStroke.Transparency = 0.25
+            panelStroke.Color = Color3.fromRGB(91, 105, 128)
+            panelStroke.Transparency = 0.62
+            panelStroke.Thickness = 1
             panelStroke.Parent = panel
         end
 
@@ -6710,7 +7611,7 @@ end
 
         do
             local headerTitle = Instance.new("TextLabel")
-            headerTitle.Size = UDim2.new(1, -220, 1, 0)
+            headerTitle.Size = UDim2.new(0.62, -30, 1, 0)
             headerTitle.Position = UDim2.new(0, 30, 0, 0)
             headerTitle.BackgroundTransparency = 1
             headerTitle.Text = "RECENT RARE HATCHES"
@@ -6724,13 +7625,13 @@ end
 
         do
             local headerHint = Instance.new("TextLabel")
-            headerHint.Size = UDim2.new(0, 160, 1, 0)
-            headerHint.Position = UDim2.new(1, -176, 0, 0)
+            headerHint.Size = UDim2.new(0.30, -16, 1, 0)
+            headerHint.Position = UDim2.new(0.68, 0, 0, 0)
             headerHint.BackgroundTransparency = 1
             headerHint.Text = "this AFK session"
             headerHint.TextColor3 = Style.muted
             headerHint.Font = Enum.Font.Gotham
-            headerHint.TextSize = 11
+            headerHint.TextSize = 10
             headerHint.TextXAlignment = Enum.TextXAlignment.Right
             headerHint.ZIndex = 105
             headerHint.Parent = header
@@ -6747,13 +7648,21 @@ end
             headerLine.Parent = panel
         end
 
+        local afkCategoryLabelColors = {
+            Color3.fromRGB(151, 181, 207),
+            Color3.fromRGB(151, 190, 171),
+            Color3.fromRGB(177, 164, 204),
+            Color3.fromRGB(202, 163, 169),
+        }
+
         for index, category in ipairs(recentCategories) do
             local card = Instance.new("Frame")
             card.Name = category.name .. "Card"
-            card.Size = UDim2.new(0.25, -8, 1, -50)
-            card.Position = UDim2.new((index - 1) * 0.25, 4, 0, 45)
-            card.BackgroundColor3 = Style.surface
-            card.BackgroundTransparency = 0.12
+            card.Size = UDim2.new(0.25, -14, 1, -50)
+            card.Position = UDim2.new((index - 1) * 0.25, 7, 0, 45)
+            card.BackgroundColor3 = Color3.fromRGB(28, 34, 47)
+            card.BackgroundTransparency = 0.02
+            card.ClipsDescendants = false
             card.BorderSizePixel = 0
             card.ZIndex = 104
             card.Parent = panel
@@ -6764,15 +7673,17 @@ end
 
             do
                 local cardStroke = Instance.new("UIStroke")
-                cardStroke.Color = category.color
+                cardStroke.Color = Color3.fromRGB(91, 105, 128)
                 cardStroke.Transparency = 0.72
+                cardStroke.Thickness = 1
                 cardStroke.Parent = card
             end
 
             local accent = Instance.new("Frame")
-            accent.Size = UDim2.new(1, -24, 0, 3)
-            accent.Position = UDim2.new(0, 12, 0, 8)
-            accent.BackgroundColor3 = category.color
+            accent.Size = UDim2.new(1, -28, 0, 2)
+            accent.Position = UDim2.new(0, 14, 0, 10)
+            accent:SetAttribute("ThemeRole", "Accent")
+            accent.BackgroundColor3 = activeTheme.accent
             accent.BackgroundTransparency = 0.15
             accent.BorderSizePixel = 0
             accent.ZIndex = 105
@@ -6785,36 +7696,36 @@ end
             end
 
             local nameLabel = Instance.new("TextLabel")
-            nameLabel.Size = UDim2.new(1, -24, 0, 14)
-            nameLabel.Position = UDim2.new(0, 12, 0, 16)
+            nameLabel.Size = UDim2.new(1, -28, 0, 16)
+            nameLabel.Position = UDim2.new(0, 14, 0, 20)
             nameLabel.BackgroundTransparency = 1
             nameLabel.Text = category.name:upper()
-            nameLabel.TextColor3 = category.color
+            nameLabel.TextColor3 = afkCategoryLabelColors[index] or Color3.fromRGB(174, 183, 199)
             nameLabel.Font = Enum.Font.GothamBold
-            nameLabel.TextSize = 11
+            nameLabel.TextSize = 10
             nameLabel.TextXAlignment = Enum.TextXAlignment.Left
             nameLabel.ZIndex = 105
             nameLabel.Parent = card
 
             local countLabel = Instance.new("TextLabel")
-            countLabel.Size = UDim2.new(1, -24, 0, 38)
-            countLabel.Position = UDim2.new(0, 12, 0, 32)
+            countLabel.Size = UDim2.new(1, -28, 0, 36)
+            countLabel.Position = UDim2.new(0, 14, 0, 40)
             countLabel.BackgroundTransparency = 1
             countLabel.Text = "0"
-            countLabel.TextColor3 = Style.text
-            countLabel.Font = Enum.Font.GothamBlack
-            countLabel.TextSize = 30
+            countLabel.TextColor3 = Color3.fromRGB(218, 224, 236)
+            countLabel.Font = Enum.Font.GothamBold
+            countLabel.TextSize = 27
             countLabel.TextXAlignment = Enum.TextXAlignment.Left
             countLabel.ZIndex = 105
             countLabel.Parent = card
             afkRareLabels[category.name .. "s"] = countLabel
 
             local sessionLabel = Instance.new("TextLabel")
-            sessionLabel.Size = UDim2.new(1, -24, 0, 15)
-            sessionLabel.Position = UDim2.new(0, 12, 0, 72)
+            sessionLabel.Size = UDim2.new(1, -28, 0, 15)
+            sessionLabel.Position = UDim2.new(0, 14, 0, 80)
             sessionLabel.BackgroundTransparency = 1
             sessionLabel.Text = "+0 this session"
-            sessionLabel.TextColor3 = category.color
+            sessionLabel.TextColor3 = Color3.fromRGB(174, 183, 199)
             sessionLabel.Font = Enum.Font.GothamBold
             sessionLabel.TextSize = 11
             sessionLabel.TextXAlignment = Enum.TextXAlignment.Left
@@ -6823,8 +7734,8 @@ end
             afkSessionLabels[category.name .. "s"] = sessionLabel
 
             local variantLabel = Instance.new("TextLabel")
-            variantLabel.Size = UDim2.new(1, -24, 0, 14)
-            variantLabel.Position = UDim2.new(0, 12, 0, 90)
+            variantLabel.Size = UDim2.new(1, -28, 0, 14)
+            variantLabel.Position = UDim2.new(0, 14, 0, 100)
             variantLabel.BackgroundTransparency = 1
             variantLabel.Text = "R 0   G 0   S 0"
             variantLabel.TextColor3 = Style.muted
@@ -6836,8 +7747,8 @@ end
             afkSessionVariantLabels[category.name .. "s"] = variantLabel
 
             local startupLabel = Instance.new("TextLabel")
-            startupLabel.Size = UDim2.new(1, -24, 0, 14)
-            startupLabel.Position = UDim2.new(0, 12, 0, 106)
+            startupLabel.Size = UDim2.new(1, -28, 0, 14)
+            startupLabel.Position = UDim2.new(0, 14, 0, 118)
             startupLabel.BackgroundTransparency = 1
             startupLabel.Text = "+0 since launch"
             startupLabel.TextColor3 = Style.muted
@@ -6850,8 +7761,8 @@ end
 
             do
                 local divider = Instance.new("Frame")
-                divider.Size = UDim2.new(1, -24, 0, 1)
-                divider.Position = UDim2.new(0, 12, 0, 126)
+                divider.Size = UDim2.new(1, -28, 0, 1)
+                divider.Position = UDim2.new(0, 14, 0, 140)
                 divider.BackgroundColor3 = Style.line
                 divider.BackgroundTransparency = 0.45
                 divider.BorderSizePixel = 0
@@ -6861,8 +7772,8 @@ end
 
             local list = Instance.new("ScrollingFrame")
             list.Name = category.name .. "Recent"
-            list.Size = UDim2.new(1, -12, 1, -138)
-            list.Position = UDim2.new(0, 6, 0, 134)
+            list.Size = UDim2.new(1, -20, 1, -154)
+            list.Position = UDim2.new(0, 10, 0, 148)
             list.BackgroundTransparency = 1
             list.BorderSizePixel = 0
             list.ScrollBarThickness = 3
@@ -6873,8 +7784,10 @@ end
 
             do
                 local listPadding = Instance.new("UIPadding")
-                listPadding.PaddingLeft = UDim.new(0, 6)
-                listPadding.PaddingRight = UDim.new(0, 4)
+                listPadding.PaddingLeft = UDim.new(0, 4)
+                listPadding.PaddingRight = UDim.new(0, 6)
+                listPadding.PaddingTop = UDim.new(0, 4)
+                listPadding.PaddingBottom = UDim.new(0, 6)
                 listPadding.Parent = list
             end
 
@@ -6906,7 +7819,7 @@ end
                             empty.Font = Enum.Font.Gotham
                             empty.TextSize = 10
                             empty.TextXAlignment = Enum.TextXAlignment.Left
-                            empty.TextTransparency = 0.4
+                            empty.TextTransparency = 0.12
                             empty.Parent = listData.frame
                         end
                     end
@@ -7046,8 +7959,35 @@ local function findClosestEggId()
     return bestId
 end
 
--- Auto-hatch uses the closest egg only - no manual selection
+-- Auto-hatch normally uses the closest egg only. While the quest driver is
+-- working an egg objective it publishes QuestTargetEggId, and that egg wins as
+-- long as its capsule is streamed in - so the moment the objective clears (or
+-- the player leaves the area) the loop falls back to the closest egg.
+local function eggCapsuleExists(eggId)
+    local map = Workspace:FindFirstChild("__MAP")
+    local eggsFolder = map and map:FindFirstChild("Eggs")
+    if not eggsFolder then return false end
+    for _, model in ipairs(eggsFolder:GetDescendants()) do
+        if model:IsA("Model") and model.Name == "Egg Capsule" then
+            local id = model:GetAttribute("ID")
+            if id ~= nil and tostring(id) == eggId then
+                return true
+            end
+        end
+    end
+    return false
+end
+
 local function currentHatchEggId()
+    local target = QuestTargetEggId
+    if target and eggCapsuleExists(target) then
+        return target
+    end
+    -- The Auto Farm tab's chosen egg wins when it is in the current map and
+    -- its capsule is actually present, so hatching happens at the right zone.
+    if type(AutoFarmTabTargetEgg) == "string" and eggCapsuleExists(AutoFarmTabTargetEgg) then
+        return AutoFarmTabTargetEgg
+    end
     return findClosestEggId()
 end
 
@@ -7164,9 +8104,10 @@ setAutoHatchState = function(enabled)
     -- Keep the visible control synchronized with the actual automation state.
     if hatchToggleBtn and hatchToggleBtn.Parent then
         hatchToggleBtn:SetAttribute("ToggleState", enabled)
+        hatchToggleBtn:SetAttribute("ThemeRole", "Toggle")
         hatchToggleBtn.BackgroundColor3 = enabled and activeTheme.controlOn or activeTheme.surface
         hatchToggleBtn.Text = "Auto-Hatch Egg: " .. (enabled and "ON" or "OFF")
-        hatchToggleBtn.TextColor3 = enabled and Color3.fromRGB(255, 255, 255) or Color3.fromRGB(180, 180, 190)
+        hatchToggleBtn.TextColor3 = activeTheme.text
     end
 end
 
@@ -7175,14 +8116,16 @@ end
     -- sync its state here and keep hatchFrame CanvasSize clear of overlaps.
     if toggleRegistry["Auto-Hatch Egg"] then
         table.insert(toggleRegistry["Auto-Hatch Egg"], function(value)
+            hatchToggleBtn:SetAttribute("ToggleState", value == true)
             hatchToggleBtn.BackgroundColor3 = value and activeTheme.controlOn or activeTheme.surface
             hatchToggleBtn.Text = "Auto-Hatch Egg: " .. (value and "ON" or "OFF")
-            hatchToggleBtn.TextColor3 = value and Color3.fromRGB(255, 255, 255) or Color3.fromRGB(180, 180, 190)
+            hatchToggleBtn.TextColor3 = activeTheme.text
         end)
     end
-    hatchFrame.CanvasSize = UDim2.new(0, 0, 0, 920)
+    hatchFrame.CanvasSize = UDim2.new(0, 0, 0, 0)
+    hatchFrame.AutomaticCanvasSize = Enum.AutomaticSize.Y
 
-    -- Shared teleport primitives. The Auto Index driver needs to move the
+    -- Shared teleport primitives. The teleport workflow needs to move the
     -- player to the area whose egg drops a missing pet, so the world-load and
     -- area-center helpers live at this scope instead of inside the teleport
     -- tab block only. Assigned by buildTeleportTab(); no-ops until then.
@@ -7305,7 +8248,7 @@ end
             return character, root
         end
 
-        -- Exposed for the Auto Index driver (see sharedGetCharacterRoot above).
+        -- Exposed for the teleport workflow (see sharedGetCharacterRoot above).
         sharedGetCharacterRoot = getCharacterRoot
 
         -- Area centre resolution, in order of reliability:
@@ -7442,7 +8385,7 @@ end
             return result == true
         end
 
-        -- Exposed for the Auto Index driver (see sharedLoadWorldSafely above).
+        -- Exposed for the teleport workflow (see sharedLoadWorldSafely above).
         sharedGetAreaCenter = getAreaCenter
         sharedLoadWorldSafely = loadWorldSafely
 
@@ -7724,6 +8667,1682 @@ end
     end
 
     buildTeleportTab()
+
+    -- =====================================================================
+    -- AUTO FARM TAB
+    -- Teleports to a chosen area, switches on the game's own Auto Farm, then
+    -- auto-hatches the chosen egg. The driver loop re-asserts both whenever
+    -- the engine drops them (world change / re-capture).
+    --
+    -- Wrapped in a named function because Luau caps a function at 200
+    -- registers; the UI thread that builds every tab already sits near the
+    -- cap and this tab's own frame/dropdown construction pushes it over.
+    -- =====================================================================
+    TAB_TOTAL.buildAutoFarm = function()
+        -- Local alias for the shared frame; keeps this function's body
+        -- readable without polluting the UI thread's register budget.
+        local autoFarmFrame = TAB_TOTAL.autoFarmFrame
+        local afStatus = Instance.new("TextLabel")
+        afStatus.Size = UDim2.new(1, 0, 0, 20)
+        afStatus.Position = UDim2.fromOffset(0, 608)
+        afStatus.BackgroundTransparency = 1
+        afStatus.Text = "Ready."
+        afStatus.TextColor3 = Color3.fromRGB(170, 175, 185)
+        afStatus.Font = Enum.Font.GothamSemibold
+        afStatus.TextSize = 11
+        afStatus.TextXAlignment = Enum.TextXAlignment.Left
+        afStatus.TextTruncate = Enum.TextTruncate.AtEnd
+        afStatus.Parent = autoFarmFrame
+
+        local AF_OK = Color3.fromRGB(120, 220, 150)
+        local AF_WARN = Color3.fromRGB(255, 170, 70)
+        local AF_ACCENT = Color3.fromRGB(120, 205, 255)
+
+        local function setAfStatus(text, color)
+            afStatus.Text = text
+            afStatus.TextColor3 = color or Color3.fromRGB(170, 175, 185)
+        end
+
+        -- Area dropdown state. Populated from the live directory each time the
+        -- tab is opened so new worlds show up without a reload.
+        local afAreaOptions = nil -- { names = {..}, frames = {..} }, rebuilt on open
+        local afAreaSelect
+        local afAreaList
+
+        local function buildAreaOptions()
+            if afAreaList then
+                for _, child in ipairs(afAreaList:GetChildren()) do
+                    if child:IsA("TextButton") then child:Destroy() end
+                end
+            end
+            local names = {}
+            local areas = Library.Directory.Areas
+            if type(areas) == "table" then
+                for name in pairs(areas) do names[#names + 1] = tostring(name) end
+            end
+            table.sort(names)
+            afAreaOptions = { names = names }
+        end
+
+        -- Egg dropdown state. Only hatchable eggs (engine can actually buy
+        -- them), sorted alphabetically.
+        local afEggOptions = nil
+        local afEggSelect
+        local afEggList
+
+        local function buildEggOptions()
+            if afEggList then
+                for _, child in ipairs(afEggList:GetChildren()) do
+                    if child:IsA("TextButton") then child:Destroy() end
+                end
+            end
+            local names = {}
+            local eggs = Library.Directory.Eggs
+            if type(eggs) == "table" then
+                for name, def in pairs(eggs) do
+                    if type(def) == "table" and def.hatchable == true then
+                        names[#names + 1] = tostring(name)
+                    end
+                end
+            end
+            table.sort(names)
+            afEggOptions = { names = names }
+        end
+
+        -- Shared helpers may not exist yet if something re-runs before the
+        -- teleport tab builds; guard every use.
+        local function afGetRoot()
+            if sharedGetCharacterRoot then
+                local _, root = sharedGetCharacterRoot()
+                if root then return root end
+            end
+            local character = localPlayer.Character
+            return character and character:FindFirstChild("HumanoidRootPart")
+        end
+
+        local function afCurrentWorld()
+            local ok, world = pcall(function() return Library.WorldCmds.Get() end)
+            return ok and world or nil
+        end
+
+        local function afWorldForArea(areaName)
+            local areas = Library.Directory.Areas
+            local def = type(areas) == "table" and areas[areaName] or nil
+            return type(def) == "table" and def.world or nil
+        end
+
+        -- Teleport to the area center, loading its world first if needed.
+        local function afSteerToArea(areaName)
+            if not areaName then return false end
+            local root = afGetRoot()
+            if not root then return false end
+
+            local targetWorld = afWorldForArea(areaName)
+            local currentWorld = afCurrentWorld()
+
+            if targetWorld and currentWorld and targetWorld ~= currentWorld then
+                if not sharedLoadWorldSafely then return false end
+                local ok, loaded = pcall(sharedLoadWorldSafely, targetWorld)
+                if not ok or loaded ~= true then return false end
+                task.wait(1.5)
+                root = afGetRoot()
+                if not root then return false end
+            end
+
+            if sharedGetAreaCenter then
+                local center = sharedGetAreaCenter(areaName)
+                if center then
+                    pcall(function() root.CFrame = CFrame.new(center) end)
+                    return true
+                end
+            end
+            return false
+        end
+
+        -- Teleport to the chosen egg's capsule. Capsules live under
+        -- Workspace.__MAP.Eggs.<area>.Eggs, so questFindEggCapsule (which
+        -- matches on the ID attribute) returns the model and we park the
+        -- player a few studs above it - the same offset the quest driver
+        -- uses. Returns false when the capsule is not streamed in yet so
+        -- the caller can retry it inside the watchdog loop.
+        local function afSteerToEgg(eggName)
+            if not eggName then return false end
+            local capsule = questFindEggCapsule(eggName)
+            if not capsule then return false end
+            local part = capsule.PrimaryPart or capsule:FindFirstChildWhichIsA("BasePart")
+            local root = afGetRoot()
+            if not part or not root then return false end
+            pcall(function()
+                root.CFrame = CFrame.new(part.Position + Vector3.new(0, 5, 0))
+            end)
+            return true
+        end
+
+        -- Enable the game's own Auto Farm via the shared manager so the
+        -- engine's Tick loop captures the current area on its next tick.
+        local function afEnableGameFarm()
+            local ok, enabled = pcall(function() return Library.Variables.AutoFarmEnabled end)
+            if ok and enabled == true then return true end
+            local res = questSetGameAutoFarm(true)
+            return res == true
+        end
+
+        local function afDisableGameFarm()
+            local ok, enabled = pcall(function() return Library.Variables.AutoFarmEnabled end)
+            if ok and enabled == false then return end
+            questSetGameAutoFarm(false)
+        end
+
+        -- Driver state
+        local afRunning = false
+        local afSelectedArea = nil
+        local afSelectedEgg = nil
+        local afToggleBtn = nil
+
+        -- Rebuild the two dropdown lists each time the toggle flips on, so the
+        -- freshest area/egg sets are always used.
+        local function afRefreshLists()
+            buildAreaOptions()
+            buildEggOptions()
+        end
+
+        -- The main workflow, run once per toggle-on.
+        local function afStart()
+            afRunning = true
+            local area = afSelectedArea
+            local egg = afSelectedEgg
+
+            if not area then
+                setAfStatus("Pick an area first.", AF_WARN)
+                afRunning = false
+                AutoFarmTabActive = false
+                if afToggleBtn then
+                    afToggleBtn:SetAttribute("ToggleState", false)
+                    afToggleBtn.BackgroundColor3 = Color3.fromRGB(67, 104, 145)
+                    afToggleBtn.Text = "AUTO FARM: OFF"
+                end
+                return
+            end
+
+            -- 1. Teleport to the area.
+            setAfStatus("Teleporting to " .. area .. "...", AF_ACCENT)
+            local moved = afSteerToArea(area)
+            if not moved then
+                setAfStatus("Teleport to " .. area .. " failed.", AF_WARN)
+                afRunning = false
+                AutoFarmTabActive = false
+                if afToggleBtn then
+                    afToggleBtn:SetAttribute("ToggleState", false)
+                    afToggleBtn.BackgroundColor3 = Color3.fromRGB(67, 104, 145)
+                    afToggleBtn.Text = "AUTO FARM: OFF"
+                end
+                return
+            end
+
+            -- 2. Force a clean capture of the selected area. The engine only
+            --    re-captures after a world change, so flip AutoFarm off for a
+            --    beat (clears its cached AutoFarmArea), let it settle, then on
+            --    again - it re-captures from wherever the player is standing,
+            --    which the teleport just parked at the area center.
+            task.wait(1.0)
+            setAfStatus("Enabling Auto Farm in " .. area .. "...", AF_ACCENT)
+            if type(questSetGameAutoFarm) == "function" then
+                pcall(questSetGameAutoFarm, false)
+                task.wait(0.6)
+            end
+            local farmOk = afEnableGameFarm()
+            if not farmOk then
+                setAfStatus("Could not enable Auto Farm.", AF_WARN)
+            end
+
+            -- 3. Target the chosen egg for auto-hatch.
+            if egg then
+                AutoFarmTabTargetEgg = egg
+                setAfStatus("Auto Farm on in " .. area .. " | hatching " .. egg, AF_OK)
+            else
+                AutoFarmTabTargetEgg = nil
+                setAfStatus("Auto Farm on in " .. area, AF_OK)
+            end
+
+            -- 3b. Teleport onto the chosen egg capsule now that auto farm is
+            --     running in the area, so hatching happens at the egg itself.
+            --     If the capsule is not streamed in yet, the watchdog below
+            --     keeps retrying until it is.
+            if egg then
+                setAfStatus("Teleporting to " .. egg .. "...", AF_ACCENT)
+                local eggMoved = afSteerToEgg(egg)
+                task.wait(0.6)
+                if not eggMoved then
+                    setAfStatus("Waiting for " .. egg .. " capsule...", AF_WARN)
+                end
+            end
+
+            -- setAutoHatchState is the canonical toggle for the engine-driven
+            -- auto-hatch loop; never fall back to mutating AutoBuying directly
+            -- because that local lives at script scope and the watchdog loop
+            -- is the only safe writer outside setAutoHatchState.
+            if type(setAutoHatchState) == "function" then
+                pcall(setAutoHatchState, true)
+            end
+
+            -- 4. Watchdog. Re-assert farm + hatch target while the toggle is on.
+            task.spawn(function()
+                local recaptureLeft = 3
+                local lastFlipAt = 0
+                while afRunning do
+                    if not AutoFarmTabActive or afRunning ~= true then break end
+                    local ok, enabled = pcall(function() return Library.Variables.AutoFarmEnabled end)
+                    if not ok or enabled ~= true then
+                        questSetGameAutoFarm(true)
+                    else
+                        -- The engine only re-captures after a world change, so
+                        -- when the player moved to a different area it keeps its
+                        -- stale capture. Flip off one tick to clear it, then on
+                        -- again to re-capture at the new location. Bounded so an
+                        -- area with no breakable zones cannot jitter forever.
+                        local okArea, captured = pcall(function() return Library.Variables.AutoFarmArea end)
+                        if okArea and recaptureLeft > 0
+                            and captured and tostring(captured) ~= area then
+                            if os.clock() - lastFlipAt > 3 then
+                                lastFlipAt = os.clock()
+                                recaptureLeft -= 1
+                                questSetGameAutoFarm(false)
+                                task.wait(0.5)
+                                questSetGameAutoFarm(true)
+                            end
+                        end
+                    end
+                    if egg and AutoFarmTabTargetEgg ~= egg then
+                        AutoFarmTabTargetEgg = egg
+                    end
+                    -- Keep the player parked on the chosen egg capsule so
+                    -- auto-hatch stays in buy range even if the area's Auto
+                    -- Farm, world changes or the anti-AFK jog nudged them off.
+                    if egg then
+                        local capsule = questFindEggCapsule(egg)
+                        if capsule then
+                            local part = capsule.PrimaryPart or capsule:FindFirstChildWhichIsA("BasePart")
+                            local root = afGetRoot()
+                            if part and root and (root.Position - part.Position).Magnitude > 20 then
+                                pcall(function()
+                                    root.CFrame = CFrame.new(part.Position + Vector3.new(0, 5, 0))
+                                end)
+                            end
+                        else
+                            -- Capsule not streamed in: re-park once more now
+                            -- instead of waiting for the next watchdog tick.
+                            afSteerToEgg(egg)
+                        end
+                    end
+                    if type(setAutoHatchState) == "function" and not AutoBuying then
+                        pcall(setAutoHatchState, true)
+                    end
+                    task.wait(1.5)
+                end
+            end)
+        end
+
+        local function afStop()
+            afRunning = false
+            AutoFarmTabActive = false
+            AutoFarmTabTargetEgg = nil
+            if type(setAutoHatchState) == "function" then
+                pcall(setAutoHatchState, false)
+            end
+            afDisableGameFarm()
+            setAfStatus("Stopped.", Color3.fromRGB(170, 175, 185))
+        end
+
+        -- Toggle lives near the top of the tab.
+        afToggleBtn = Instance.new("TextButton")
+        afToggleBtn.Name = "AutoFarmToggle"
+        afToggleBtn.Size = UDim2.new(1, 0, 0, 42)
+        afToggleBtn.Position = UDim2.new(0, 0, 0, 8)
+        afToggleBtn.BackgroundColor3 = Color3.fromRGB(67, 104, 145)
+        afToggleBtn.Text = "AUTO FARM: OFF"
+        afToggleBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+        afToggleBtn.Font = Enum.Font.GothamBold
+        afToggleBtn.TextSize = 14
+        afToggleBtn:SetAttribute("ThemeRole", "Toggle")
+        afToggleBtn:SetAttribute("ToggleState", false)
+        afToggleBtn.Parent = autoFarmFrame
+
+        do
+            local c = Instance.new("UICorner"); c.CornerRadius = UDim.new(0, 8); c.Parent = afToggleBtn
+        end
+        do
+            local s = Instance.new("UIStroke"); s.Color = activeTheme.stroke; s.Thickness = 1; s.Transparency = 0.7; s.Parent = afToggleBtn
+        end
+
+        -- Auto Farm tab active flag, so the watchdog only runs while the tab
+        -- is driving (also gates currentHatchEggId's override).
+        AutoFarmTabActive = false
+
+        afToggleBtn.MouseButton1Click:Connect(function()
+            if afRunning then
+                afStop()
+                local on = false
+                afToggleBtn.BackgroundColor3 = on and Color3.fromRGB(20, 190, 126) or Color3.fromRGB(67, 104, 145)
+                afToggleBtn.Text = "AUTO FARM: " .. (on and "ON" or "OFF")
+                afToggleBtn:SetAttribute("ToggleState", on)
+                AutoFarmTabActive = on
+                SetSetting("autoFarmOn", false)
+                saveSettings()
+            else
+                -- Flip state immediately so the button reflects that a run
+                -- started, then drive the (slow) teleport workflow off-thread.
+                afRunning = true
+                AutoFarmTabActive = true
+                local on = true
+                afToggleBtn.BackgroundColor3 = on and Color3.fromRGB(20, 190, 126) or Color3.fromRGB(67, 104, 145)
+                afToggleBtn.Text = "AUTO FARM: " .. (on and "ON" or "OFF")
+                afToggleBtn:SetAttribute("ToggleState", on)
+                afRefreshLists()
+                -- Remember the run (toggle + chosen area + chosen egg) so a
+                -- rejoin restores the exact same farm setup automatically.
+                SetSetting("autoFarmOn", true)
+                SetSetting("autoFarmArea", afSelectedArea)
+                SetSetting("autoFarmEgg", afSelectedEgg)
+                saveSettings()
+                task.spawn(function()
+                    pcall(afStart)
+                end)
+            end
+        end)
+
+        -- Area select label (opens the dropdown list)
+        do
+            local afAreaLabel = Instance.new("TextLabel")
+            afAreaLabel.Size = UDim2.new(1, 0, 0, 20)
+            afAreaLabel.Position = UDim2.new(0, 0, 0, 62)
+            afAreaLabel.BackgroundTransparency = 1
+            afAreaLabel.Text = "FARM AREA"
+            afAreaLabel.TextColor3 = Color3.fromRGB(190, 200, 215)
+            afAreaLabel.Font = Enum.Font.GothamBold
+            afAreaLabel.TextSize = 11
+            afAreaLabel.TextXAlignment = Enum.TextXAlignment.Left
+            afAreaLabel.Parent = autoFarmFrame
+
+            afAreaSelect = Instance.new("TextButton")
+            afAreaSelect.Name = "AutoFarmAreaSelect"
+            afAreaSelect.Size = UDim2.new(1, 0, 0, 34)
+            afAreaSelect.Position = UDim2.new(0, 0, 0, 84)
+            afAreaSelect.BackgroundColor3 = activeTheme.surface
+            afAreaSelect.TextColor3 = Color3.fromRGB(235, 238, 245)
+            afAreaSelect.Font = Enum.Font.GothamBold
+            afAreaSelect.TextSize = 12
+            afAreaSelect.TextXAlignment = Enum.TextXAlignment.Left
+            afAreaSelect.Text = "Select area..."
+            afAreaSelect.Parent = autoFarmFrame
+            do local c = Instance.new("UICorner"); c.CornerRadius = UDim.new(0, 6); c.Parent = afAreaSelect end
+            do local s = Instance.new("UIStroke"); s.Color = activeTheme.stroke; s.Thickness = 1; s.Transparency = 0.7; s.Parent = afAreaSelect end
+            local pad = Instance.new("UIPadding"); pad.PaddingLeft = UDim.new(0, 10); pad.Parent = afAreaSelect
+        end
+
+        -- Area dropdown list (hidden until the select is clicked)
+        afAreaList = Instance.new("ScrollingFrame")
+        afAreaList.Name = "AutoFarmAreaList"
+        afAreaList.Size = UDim2.new(1, 0, 0, 160)
+        afAreaList.Position = UDim2.new(0, 0, 0, 120)
+        afAreaList.BackgroundColor3 = Color3.fromRGB(30, 34, 44)
+        afAreaList.BorderSizePixel = 0
+        afAreaList.ScrollBarThickness = 4
+        afAreaList.Visible = false
+        afAreaList.ZIndex = 20
+        afAreaList.CanvasSize = UDim2.new(0, 0, 0, 0)
+        afAreaList.AutomaticCanvasSize = Enum.AutomaticSize.Y
+        afAreaList.Parent = autoFarmFrame
+        local afAreaListLayout = Instance.new("UIListLayout")
+        afAreaListLayout.Padding = UDim.new(0, 1)
+        afAreaListLayout.SortOrder = Enum.SortOrder.LayoutOrder
+        afAreaListLayout.Parent = afAreaList
+
+        local afAreaSearch = Instance.new("TextBox")
+        afAreaSearch.Name = "FarmAreaSearch"
+        afAreaSearch.Size = UDim2.new(1, -6, 0, 30)
+        afAreaSearch.BackgroundColor3 = activeTheme.surface
+        afAreaSearch.TextColor3 = Color3.fromRGB(235, 238, 245)
+        afAreaSearch.PlaceholderColor3 = Color3.fromRGB(145, 155, 170)
+        afAreaSearch.PlaceholderText = "Search farm area..."
+        afAreaSearch.Text = ""
+        afAreaSearch.ClearTextOnFocus = false
+        afAreaSearch.Font = Enum.Font.Gotham
+        afAreaSearch.TextSize = 11
+        afAreaSearch.TextXAlignment = Enum.TextXAlignment.Left
+        afAreaSearch.LayoutOrder = 0
+        afAreaSearch.ZIndex = 21
+        afAreaSearch.Parent = afAreaList
+        do local c = Instance.new("UICorner"); c.CornerRadius = UDim.new(0, 5); c.Parent = afAreaSearch end
+        do local pad = Instance.new("UIPadding"); pad.PaddingLeft = UDim.new(0, 8); pad.Parent = afAreaSearch end
+
+        local function renderAreaList()
+            for _, child in ipairs(afAreaList:GetChildren()) do
+                if child ~= afAreaListLayout and child ~= afAreaSearch then child:Destroy() end
+            end
+            if not afAreaOptions then buildAreaOptions() end
+            local query = afAreaSearch.Text:lower():gsub("^%s+", ""):gsub("%s+$", "")
+            local shown = 0
+            for i, name in ipairs(afAreaOptions.names) do
+                if query == "" or name:lower():find(query, 1, true) then
+                    shown = shown + 1
+                    local row = Instance.new("TextButton")
+                    row.Size = UDim2.new(1, -6, 0, 26)
+                    row.ZIndex = 21
+                    row.BackgroundTransparency = 1
+                    row.TextColor3 = Color3.fromRGB(230, 233, 240)
+                    row.Text = name
+                    row.Font = Enum.Font.Gotham
+                    row.TextSize = 11
+                    row.TextXAlignment = Enum.TextXAlignment.Left
+                    row.LayoutOrder = shown
+                    row.Parent = afAreaList
+
+                    row.MouseButton1Click:Connect(function()
+                        afSelectedArea = name
+                        afAreaSelect.Text = "Area: " .. name
+                        afAreaList.Visible = false
+                        SetSetting("autoFarmArea", name)
+                        saveSettings()
+                    end)
+                end
+            end
+            if shown == 0 then
+                local empty = Instance.new("TextLabel")
+                empty.Size = UDim2.new(1, -8, 0, 26)
+                empty.BackgroundTransparency = 1
+                empty.Text = "No matching areas"
+                empty.TextColor3 = Color3.fromRGB(170, 175, 185)
+                empty.Font = Enum.Font.Gotham
+                empty.TextSize = 11
+                empty.LayoutOrder = 1
+                empty.ZIndex = 21
+                empty.Parent = afAreaList
+            end
+        end
+
+        afAreaSearch:GetPropertyChangedSignal("Text"):Connect(function()
+            if afAreaList.Visible then renderAreaList() end
+        end)
+
+        afAreaSelect.MouseButton1Click:Connect(function()
+            afEggList.Visible = false
+            if afAreaList.Visible then
+                afAreaList.Visible = false
+            else
+                if not afAreaOptions then afRefreshLists() end
+                renderAreaList()
+                afAreaList.Visible = true
+            end
+        end)
+
+        -- Egg select label + dropdown
+        do
+            local afEggLabel = Instance.new("TextLabel")
+            afEggLabel.Size = UDim2.new(1, 0, 0, 20)
+            afEggLabel.Position = UDim2.new(0, 0, 0, 302)
+            afEggLabel.BackgroundTransparency = 1
+            afEggLabel.Text = "HATCH TARGET (EGG)"
+            afEggLabel.TextColor3 = Color3.fromRGB(190, 200, 215)
+            afEggLabel.Font = Enum.Font.GothamBold
+            afEggLabel.TextSize = 11
+            afEggLabel.TextXAlignment = Enum.TextXAlignment.Left
+            afEggLabel.Parent = autoFarmFrame
+
+            afEggSelect = Instance.new("TextButton")
+            afEggSelect.Name = "AutoFarmEggSelect"
+            afEggSelect.Size = UDim2.new(1, 0, 0, 34)
+            afEggSelect.Position = UDim2.new(0, 0, 0, 324)
+            afEggSelect.BackgroundColor3 = activeTheme.surface
+            afEggSelect.TextColor3 = Color3.fromRGB(235, 238, 245)
+            afEggSelect.Font = Enum.Font.GothamBold
+            afEggSelect.TextSize = 12
+            afEggSelect.TextXAlignment = Enum.TextXAlignment.Left
+            afEggSelect.Text = "Select egg..."
+            afEggSelect.Parent = autoFarmFrame
+            do local c = Instance.new("UICorner"); c.CornerRadius = UDim.new(0, 6); c.Parent = afEggSelect end
+            do local s = Instance.new("UIStroke"); s.Color = activeTheme.stroke; s.Thickness = 1; s.Transparency = 0.7; s.Parent = afEggSelect end
+            local pad = Instance.new("UIPadding"); pad.PaddingLeft = UDim.new(0, 10); pad.Parent = afEggSelect
+        end
+
+        afEggList = Instance.new("ScrollingFrame")
+        afEggList.Name = "AutoFarmEggList"
+        afEggList.Size = UDim2.new(1, 0, 0, 180)
+        afEggList.Position = UDim2.new(0, 0, 0, 360)
+        afEggList.BackgroundColor3 = Color3.fromRGB(30, 34, 44)
+        afEggList.BorderSizePixel = 0
+        afEggList.ScrollBarThickness = 4
+        afEggList.Visible = false
+        afEggList.ZIndex = 20
+        afEggList.CanvasSize = UDim2.new(0, 0, 0, 0)
+        afEggList.AutomaticCanvasSize = Enum.AutomaticSize.Y
+        afEggList.Parent = autoFarmFrame
+        local afEggListLayout = Instance.new("UIListLayout")
+        afEggListLayout.Padding = UDim.new(0, 1)
+        afEggListLayout.SortOrder = Enum.SortOrder.LayoutOrder
+        afEggListLayout.Parent = afEggList
+
+        local afEggSearch = Instance.new("TextBox")
+        afEggSearch.Name = "HatchTargetEggSearch"
+        afEggSearch.Size = UDim2.new(1, -6, 0, 30)
+        afEggSearch.BackgroundColor3 = activeTheme.surface
+        afEggSearch.TextColor3 = Color3.fromRGB(235, 238, 245)
+        afEggSearch.PlaceholderColor3 = Color3.fromRGB(145, 155, 170)
+        afEggSearch.PlaceholderText = "Search hatch target egg..."
+        afEggSearch.Text = ""
+        afEggSearch.ClearTextOnFocus = false
+        afEggSearch.Font = Enum.Font.Gotham
+        afEggSearch.TextSize = 11
+        afEggSearch.TextXAlignment = Enum.TextXAlignment.Left
+        afEggSearch.LayoutOrder = 0
+        afEggSearch.ZIndex = 21
+        afEggSearch.Parent = afEggList
+        do local c = Instance.new("UICorner"); c.CornerRadius = UDim.new(0, 5); c.Parent = afEggSearch end
+        do local pad = Instance.new("UIPadding"); pad.PaddingLeft = UDim.new(0, 8); pad.Parent = afEggSearch end
+
+        local function renderEggList()
+            for _, child in ipairs(afEggList:GetChildren()) do
+                if child ~= afEggListLayout and child ~= afEggSearch then child:Destroy() end
+            end
+            if not afEggOptions then buildEggOptions() end
+            local query = afEggSearch.Text:lower():gsub("^%s+", ""):gsub("%s+$", "")
+            local shown = 0
+            for i, name in ipairs(afEggOptions.names) do
+                if query == "" or name:lower():find(query, 1, true) then
+                    shown = shown + 1
+                    local row = Instance.new("TextButton")
+                    row.Size = UDim2.new(1, -6, 0, 26)
+                    row.ZIndex = 21
+                row.BackgroundTransparency = 1
+                row.TextColor3 = Color3.fromRGB(230, 233, 240)
+                    row.Text = name
+                    row.Font = Enum.Font.Gotham
+                    row.TextSize = 11
+                    row.TextXAlignment = Enum.TextXAlignment.Left
+                    row.LayoutOrder = shown
+                    row.Parent = afEggList
+
+                    row.MouseButton1Click:Connect(function()
+                        afSelectedEgg = name
+                        afEggSelect.Text = "Egg: " .. name
+                        afEggList.Visible = false
+                        SetSetting("autoFarmEgg", name)
+                        saveSettings()
+                    end)
+                end
+            end
+            if shown == 0 then
+                local empty = Instance.new("TextLabel")
+                empty.Size = UDim2.new(1, -8, 0, 26)
+                empty.BackgroundTransparency = 1
+                empty.Text = "No matching eggs"
+                empty.TextColor3 = Color3.fromRGB(170, 175, 185)
+                empty.Font = Enum.Font.Gotham
+                empty.TextSize = 11
+                empty.LayoutOrder = 1
+                empty.ZIndex = 21
+                empty.Parent = afEggList
+            end
+        end
+
+        afEggSearch:GetPropertyChangedSignal("Text"):Connect(function()
+            if afEggList.Visible then renderEggList() end
+        end)
+
+        afEggSelect.MouseButton1Click:Connect(function()
+            afAreaList.Visible = false
+            if afEggList.Visible then
+                afEggList.Visible = false
+            else
+                if not afEggOptions then afRefreshLists() end
+                renderEggList()
+                afEggList.Visible = true
+            end
+        end)
+
+        -- Status hint block
+        do
+            local afHint = Instance.new("TextLabel")
+            afHint.Size = UDim2.new(1, 0, 0, 44)
+            afHint.Position = UDim2.new(0, 0, 0, 556)
+            afHint.BackgroundTransparency = 1
+            afHint.Text = "Pick an area and an egg, then toggle Auto Farm. The script teleports to the area, turns on the game's Auto Farm, and hatches your chosen egg."
+            afHint.TextColor3 = Color3.fromRGB(180, 190, 205)
+            afHint.Font = Enum.Font.GothamSemibold
+            afHint.TextSize = 11
+            afHint.TextWrapped = true
+            afHint.TextXAlignment = Enum.TextXAlignment.Left
+            afHint.TextYAlignment = Enum.TextYAlignment.Top
+            afHint.Parent = autoFarmFrame
+        end
+
+        -- Stop the watchdog when the tab is closed. The toggle itself lives on
+        -- the frame, so users can flip it back on from the tab again.
+        autoFarmFrame.AncestryChanged:Connect(function()
+            if not autoFarmFrame.Parent then
+                AutoFarmTabActive = false
+            end
+        end)
+
+        -- =====================================================================
+        -- PERSISTENCE ACROSS REJOINS
+        -- The Auto Farm toggle, chosen area and chosen egg are written to the
+        -- settings file every time they change. On load they are restored here:
+        -- the dropdowns repopulate, the toggle lights back up, and if it was
+        -- ON last time the script starts the whole farm workflow automatically
+        -- (area teleport -> auto farm -> egg teleport -> hatch).
+        -- =====================================================================
+        local savedArea = GetSetting("autoFarmArea")
+        local savedEgg = GetSetting("autoFarmEgg")
+        local savedOn = GetSetting("autoFarmOn", false)
+
+        if type(savedArea) == "string" and savedArea ~= "" then
+            afSelectedArea = savedArea
+            afAreaSelect.Text = "Area: " .. savedArea
+        end
+        if type(savedEgg) == "string" and savedEgg ~= "" then
+            afSelectedEgg = savedEgg
+            afEggSelect.Text = "Egg: " .. savedEgg
+        end
+
+        if savedOn == true then
+            -- Restore the button to its ON look immediately. The actual run
+            -- starts shortly after so the map and capsule have time to load.
+            afToggleBtn.BackgroundColor3 = Color3.fromRGB(20, 190, 126)
+            afToggleBtn.Text = "AUTO FARM: ON"
+            afToggleBtn:SetAttribute("ToggleState", true)
+            afRunning = true
+            AutoFarmTabActive = true
+            setAfStatus("Restoring auto farm...", AF_ACCENT)
+            task.spawn(function()
+                local waited = 0
+                while waited < 15 do
+                    task.wait(0.5)
+                    waited += 0.5
+                    if afGetRoot() then break end
+                end
+                pcall(afStart)
+            end)
+        end
+    end
+
+    TAB_TOTAL.buildAutoFarm()
+
+    -- =====================================================================
+    -- AFK ENGINES
+-- Group rewards, spinny wheels, potion upgrading/usage and the quest
+-- driver. They live inside the UI task (not at the top level) because the
+-- quest driver moves the player with the same world-load / area-centre
+-- helpers the teleport tab just built.
+-- =====================================================================
+do
+        local function getPlayerRoot()
+            if sharedGetCharacterRoot then
+                local _, root = sharedGetCharacterRoot()
+                if root then return root end
+            end
+            local character = localPlayer.Character
+            return character and character:FindFirstChild("HumanoidRootPart")
+        end
+
+        local function getCurrentWorld()
+            local ok, world = pcall(function() return Library.WorldCmds.Get() end)
+            return ok and world or nil
+        end
+
+        local function worldForArea(areaName)
+            local areas = Library.Directory.Areas
+            local def = type(areas) == "table" and areas[areaName] or nil
+            return type(def) == "table" and def.world or nil
+        end
+
+        -- Move the player to an area centre, loading its world first when the
+        -- area lives somewhere else. Returns true once the move was issued.
+        local function steerToArea(areaName)
+            if not areaName then return false end
+            local root = getPlayerRoot()
+            if not root then return false end
+
+            local targetWorld = worldForArea(areaName)
+            local currentWorld = getCurrentWorld()
+
+            if targetWorld and currentWorld and targetWorld ~= currentWorld then
+                if not sharedLoadWorldSafely then return false end
+                local ok, loaded = pcall(sharedLoadWorldSafely, targetWorld)
+                if not ok or loaded ~= true then return false end
+                task.wait(1.5)
+                root = getPlayerRoot()
+                if not root then return false end
+            end
+
+            if sharedGetAreaCenter then
+                local center = sharedGetAreaCenter(areaName)
+                if center then
+                    pcall(function() root.CFrame = CFrame.new(center) end)
+                    return true
+                end
+            end
+            return false
+        end
+
+        -- -----------------------------------------------------------------
+        -- Auto Group Rewards
+        -- The client only claims while standing on the pad, so walk onto it
+        -- first, then fire the claim. The pad lives in Spawn/Town (and Fantasy
+        -- Isle), so Spawn is loaded when the current map has no pad.
+        -- -----------------------------------------------------------------
+        task.spawn(function()
+            local function findPad()
+                local ok, map = pcall(function() return Library.WorldCmds.GetMap() end)
+                if not ok or not map then return nil end
+                local interactive = map:FindFirstChild("Interactive")
+                if not interactive then return nil end
+                local machine = interactive:FindFirstChild("GroupRewards", true)
+                if not machine then return nil end
+                local pad = machine:FindFirstChild("Pad", true)
+                if pad and pad:IsA("BasePart") then return pad end
+                return machine:FindFirstChildWhichIsA("BasePart", true)
+            end
+
+            while true do
+                if not AutoGroupRewards then
+                    AfkGroupStatus = "Idle"
+                    task.wait(0.5)
+                else
+                    local ok, state = false, nil
+                    if RawNet.invoke then
+                        ok, state = RawNet.invoke("Group Rewards: State")
+                    end
+
+                    if not ok or type(state) ~= "table" then
+                        AfkGroupStatus = "state unavailable"
+                        task.wait(5)
+                    elseif state.ready then
+                        local pad = findPad()
+                        if not pad then
+                            AfkGroupStatus = "loading Spawn for the pad..."
+                            local moved = false
+                            if sharedLoadWorldSafely then
+                                local okLoad, loaded = pcall(sharedLoadWorldSafely, "Spawn")
+                                moved = okLoad and loaded == true
+                            end
+                            task.wait(moved and 2 or 5)
+                        else
+                            local root = getPlayerRoot()
+                            if not root then
+                                AfkGroupStatus = "character not loaded"
+                                task.wait(1)
+                            else
+                                local padPos = pad.Position
+                                pcall(function()
+                                    root.CFrame = CFrame.new(padPos + Vector3.new(0, pad.Size.Y * 0.5 + 3, 0))
+                                end)
+                                task.wait(0.4)
+                                local okClaim, claimed, message = RawNet.invoke("Group Rewards: Claim")
+                                if okClaim and claimed then
+                                    AfkGroupStatus = "claimed"
+                                else
+                                    AfkGroupStatus = "claim failed: " .. tostring(message)
+                                end
+                                task.wait(3)
+                            end
+                        end
+                    else
+                        AfkGroupStatus = "ready in " .. tostring(state.secondsLeft or "?") .. "s"
+                        task.wait(15)
+                    end
+                end
+            end
+        end)
+
+        -- -----------------------------------------------------------------
+        -- Auto Spinny Wheels
+        -- One spin per ticket held, per wheel, read straight from the wheel
+        -- definition's TicketStat.
+        -- -----------------------------------------------------------------
+        task.spawn(function()
+            local wheelIds = {}
+            for id in pairs(Library.Directory.SpinnyWheels or {}) do
+                wheelIds[#wheelIds + 1] = tostring(id)
+            end
+            table.sort(wheelIds)
+
+            while true do
+                if not AutoSpinnyWheels or #wheelIds == 0 then
+                    AfkWheelStatus = #wheelIds == 0 and "no wheels in directory" or "Idle"
+                    task.wait(0.5)
+                else
+                    local save = nil
+                    pcall(function() save = Library.Save.Get() end)
+
+                    local parts, spun = {}, false
+                    for _, wheelId in ipairs(wheelIds) do
+                        local def = Library.Directory.SpinnyWheels[wheelId]
+                        local stat = type(def) == "table" and def.TicketStat or nil
+                        local tickets = 0
+                        if stat and type(save) == "table" then
+                            tickets = tonumber(save[stat]) or 0
+                        end
+                        parts[#parts + 1] = string.format("%s:%d", wheelId, tickets)
+
+                        if tickets >= 1 and RawNet.invoke then
+                            local ok, result = RawNet.invoke("Spinny Wheel: Request Spin", wheelId)
+                            if ok and result ~= nil and result ~= false then
+                                spun = true
+                            end
+                            task.wait(0.35)
+                        end
+                    end
+
+                    AfkWheelStatus = table.concat(parts, "  ")
+                    task.wait(spun and 0.5 or 5)
+                end
+            end
+        end)
+
+        -- -----------------------------------------------------------------
+        -- Auto Upgrade Potions
+        -- Reads the machine's own config so "needs N to make one" and the
+        -- per-press cap always track the live build. Upgrades every family;
+        -- only the max tier is ever drunk (see below).
+        -- -----------------------------------------------------------------
+        local function buildUpgradePlan()
+            local machine = Library.Shared and Library.Shared.PotionUpgradeMachine
+            if type(machine) ~= "table" then return {} end
+
+            local okSave, save = pcall(function() return Library.Save.Get() end)
+            if not okSave or type(save) ~= "table" or type(save.Items) ~= "table" then return {} end
+
+            local directory = Library.Directory.Items
+            local familyTiers = {}
+            for key, def in pairs(directory) do
+                if type(def) == "table" and def.potion and tonumber(def.tier) then
+                    local family = familyTiers[def.potion]
+                    if not family then family = {}; familyTiers[def.potion] = family end
+                    family[tonumber(def.tier)] = key
+                end
+            end
+
+            local excluded = machine.ExcludedFamilies
+            local perTier = machine.PerTier or {}
+            local plan = {}
+            for key, count in pairs(save.Items) do
+                local def = directory[key]
+                if type(def) == "table" and def.potion and tonumber(def.tier) then
+                    local tier = tonumber(def.tier)
+                    local family = familyTiers[def.potion]
+                    local nextKey = family and family[tier + 1]
+                    local need = perTier[tier]
+                    local blocked = type(excluded) == "table" and excluded[def.potion]
+                    if nextKey and need and not blocked then
+                        local upgrades = math.floor((tonumber(count) or 0) / need)
+                        if upgrades > 0 then
+                            plan[#plan + 1] = { key = key, upgrades = upgrades }
+                        end
+                    end
+                end
+            end
+            return plan
+        end
+
+        task.spawn(function()
+            while true do
+                if not AutoPotionUpgrade then
+                    AfkPotionStatus = "Idle"
+                    task.wait(0.5)
+                else
+                    local plan = buildUpgradePlan()
+                    if #plan == 0 then
+                        AfkPotionStatus = "nothing to upgrade"
+                        task.wait(10)
+                    else
+                        local cap = tonumber(Library.Shared.PotionUpgradeMachine.MaxUpgradesPerPress) or 500
+                        local parts, upgraded = {}, false
+                        for _, entry in ipairs(plan) do
+                            local batch = math.min(entry.upgrades, cap)
+                            if batch > 0 and RawNet.invoke then
+                                local ok, result = RawNet.invoke(
+                                    "UpgradePotionsMachine_ActivateBulk",
+                                    { [entry.key] = batch }
+                                )
+                                if ok and result then upgraded = true end
+                                parts[#parts + 1] = string.format("%s x%d", entry.key, batch)
+                                task.wait(0.4)
+                            end
+                        end
+                        AfkPotionStatus = #parts > 0 and ("upgraded " .. table.concat(parts, ", ")) or "nothing to upgrade"
+                        task.wait(upgraded and 2 or 15)
+                    end
+                end
+            end
+        end)
+
+        -- -----------------------------------------------------------------
+        -- Auto Use Max Potions
+        -- Only the highest tier of the Lucky Eggs / Coins / Damage families is
+        -- drunk, and the game's own 0.4s Use Item guard is respected.
+        -- -----------------------------------------------------------------
+        local USE_FAMILIES = {
+            ["Potion | Lucky"] = true,
+            ["Potion | Coins"] = true,
+            ["Potion | Damage"] = true,
+        }
+
+        local function maxTierKeyByFamily()
+            local best = {}
+            for key, def in pairs(Library.Directory.Items) do
+                if type(def) == "table" and USE_FAMILIES[def.potion] and tonumber(def.tier) then
+                    local tier = tonumber(def.tier)
+                    local current = best[def.potion]
+                    if not current or tier > current.tier then
+                        best[def.potion] = { key = key, tier = tier }
+                    end
+                end
+            end
+            return best
+        end
+
+        task.spawn(function()
+            while true do
+                if not AutoPotionUse then
+                    AfkPotionUseStatus = "Idle"
+                    task.wait(0.5)
+                else
+                    local best = maxTierKeyByFamily()
+                    local okSave, save = pcall(function() return Library.Save.Get() end)
+                    local items = okSave and type(save) == "table" and save.Items or nil
+                    local drank = false
+                    if type(items) == "table" and RawNet.fire then
+                        for _, entry in pairs(best) do
+                            local owned = tonumber(items[entry.key]) or 0
+                            if owned > 0 then
+                                RawNet.fire("Use Item", entry.key, owned)
+                                AfkPotionUseStatus = string.format("drank %s x%d", entry.key, owned)
+                                drank = true
+                                task.wait(0.45)
+                            end
+                        end
+                    end
+                    if not drank then
+                        AfkPotionUseStatus = "no max-tier potions held"
+                    end
+                    task.wait(drank and 1 or 10)
+                end
+            end
+        end)
+
+        -- -----------------------------------------------------------------
+        -- Isolate quest-controller helpers from the large UI-builder closure.
+        -- Luau allows at most 200 local registers in a function.
+        task.spawn(function()
+        -- -----------------------------------------------------------------
+        -- Auto Quests
+        -- Reads the live quest state, accepts unaccepted quests, steers the
+        -- existing farm/hatch automation at the current objective and claims
+        -- finished quests.
+        --
+        -- The game's Save.Questline tracks each line separately:
+        --   save.Questline.claimed        -> how many quests are finished on the
+        --                                    MAIN line (FreeBkPros/Zephyrr/
+        --                                    PetsGOModder share it).
+        --   save.Questline.tracks[Name]   -> per-line {accepted, active, claimed}
+        --                                    for every other NPC.
+        -- Library.Network's caller check blocks injected code, so all of this is
+        -- read through the RawNet resolver built at the top of the file.
+        --
+        -- Two toggles drive it:
+        --   AutoQuests     - the story lines: BK/Zeph (main), The Robot,
+        --                    Farmer and Deadpool. These are the "main quest
+        --                    lines" the player asked the driver to carry.
+        --   AutoQuestsSide - the event / side lines: Lucky BK, Old Feller
+        --                    (RainyFarmer) and the Arcade Robot.
+        -- -----------------------------------------------------------------
+        local MAIN_QUEST_NPCS = {
+            FreeBkPros = true,
+            Zephyrr = true,
+            PetsGOModder = true,
+            TheRobot = true,
+            Farmer = true,
+            DeadpoolHalloween = true,
+        }
+        -- save.Questline track keys, in the order the driver prefers to start a
+        -- fresh line. "main" is the shared FreeBkPros/Zephyrr/PetsGOModder line
+        -- and lives at the tree root, the rest under .tracks.
+        local MAIN_QUEST_TRACKS = { "main", "TheRobot", "Farmer", "DeadpoolHalloween" }
+        local SIDE_QUEST_TRACKS = { "LuckyBK", "RainyFarmer", "ArcadeRobot" }
+
+        -- Build the text -> stat lookup from the LIVE quest state, which already
+        -- carries the true `stat` field on every objective. This is primary
+        -- because the directory is a worst-case fallback that can hold more than
+        -- one objective with the same text.
+        local function readSaveQuestline()
+            if type(SaveModule) ~= "table" or type(SaveModule.Get) ~= "function" then
+                return nil
+            end
+            local ok, save = pcall(SaveModule.Get)
+            if ok and type(save) == "table" and type(save.Questline) == "table" then
+                return save.Questline
+            end
+            return nil
+        end
+
+        local questStatByText = nil
+        local function getQuestStatMap()
+            if questStatByText then return questStatByText end
+            local map = {}
+            for _, cfg in pairs(Library.Directory.Quests) do
+                if type(cfg) == "table" and type(cfg.objectives) == "table" then
+                    for _, objective in ipairs(cfg.objectives) do
+                        if type(objective) == "table" and objective.text and objective.stat then
+                            map[tostring(objective.text)] = tostring(objective.stat)
+                        end
+                    end
+                end
+            end
+            questStatByText = map
+            return map
+        end
+
+        -- Resolve the objective's stat from the objective itself first, then the
+        -- live-state text map, and only then the directory. A stat of "nil" (the
+        -- string) is what a client-built objective table ends up with, so it is
+        -- treated as missing.
+        local function statForObjective(objective)
+            if type(objective) ~= "table" then return nil end
+            local direct = objective.stat
+            if direct ~= nil and tostring(direct) ~= "nil" then return tostring(direct) end
+            local text = objective.text ~= nil and tostring(objective.text) or nil
+            if text then return getQuestStatMap()[text] end
+            return nil
+        end
+
+        local function petIsHuge(petDef)
+            if type(petDef) ~= "table" then return false end
+            if petDef.huge == true or petDef.titanic == true or petDef.gargantuan == true then return true end
+            local rarity = tostring(petDef.rarity):lower()
+            return rarity:find("huge") ~= nil or rarity:find("titanic") ~= nil or rarity:find("gargantuan") ~= nil
+        end
+
+        local function eachEggDrop(eggDef, fn)
+            local drops = type(eggDef) == "table" and eggDef.drops or nil
+            if type(drops) ~= "table" then return end
+            for _, drop in ipairs(drops) do
+                if type(drop) == "table" then
+                    local petId = drop[1] or drop.pet or drop.id
+                    local weight = tonumber(drop[2]) or tonumber(drop.weight) or tonumber(drop.chance) or tonumber(drop.w)
+                    if petId and weight then fn(petId, weight) end
+                end
+            end
+        end
+
+        -- Best hatchable, non-exclusive egg by a scoring function. Diamond eggs
+        -- are skipped unless allowDiamonds is set, so the driver never burns
+        -- gems when a coin egg can do the job.
+        local function bestEggFor(scoreFn, allowDiamonds)
+            local best, bestScore = nil, 0
+            for name, def in pairs(Library.Directory.Eggs) do
+                if type(def) == "table" and def.hatchable and not tostring(name):find("Exclusive Egg") then
+                    local currency = tostring(def.currency)
+                    if allowDiamonds or (currency ~= "Diamonds" and currency ~= "nil") then
+                        local score = scoreFn(tostring(name), def)
+                        if score and score > bestScore then
+                            bestScore = score
+                            best = tostring(name)
+                        end
+                    end
+                end
+            end
+            return best
+        end
+
+        local function hugeEggScore(_, def)
+            local total, huge = 0, 0
+            eachEggDrop(def, function(petId, weight)
+                total = total + weight
+                if petIsHuge(Library.Directory.Pets[petId]) then huge = huge + weight end
+            end)
+            if total <= 0 or huge <= 0 then return 0 end
+            -- Cheaper eggs win ties so the same huge chance is bought cheaply.
+            local cost = tonumber(def.cost) or math.huge
+            return (huge / total) * 1e6 + (1 / (1 + cost / 1e6))
+        end
+
+        local function rarityEggScore(rarity, _, def)
+            local total, wanted = 0, 0
+            eachEggDrop(def, function(petId, weight)
+                total = total + weight
+                local petDef = Library.Directory.Pets[petId]
+                if type(petDef) == "table" and tostring(petDef.rarity) == rarity then
+                    wanted = wanted + weight
+                end
+            end)
+            if total <= 0 or wanted <= 0 then return 0 end
+            return wanted / total
+        end
+
+        local function resolveEggIdByName(name)
+            local target = tostring(name):lower()
+            for eggName, def in pairs(Library.Directory.Eggs) do
+                if tostring(eggName):lower() == target then return tostring(eggName) end
+                if type(def) == "table" then
+                    if tostring(def.name):lower() == target or tostring(def.displayName):lower() == target then
+                        return tostring(eggName)
+                    end
+                end
+            end
+            return nil
+        end
+
+
+        -- Progress of one line, straight out of Save.Questline. `main` is the
+        -- shared root record (FreeBkPros/Zephyrr/PetsGOModder); every other NPC
+        -- has its own entry in .tracks. A line that is not present yet has never
+        -- been started and reads as claimed = 0 / accepted = false.
+        --
+        -- `total` is how many quests the line holds in the directory, so the
+        -- driver can tell a finished line from one that has merely been started.
+        local function trackQuestTotal(track)
+            local total = 0
+            for _, cfg in ipairs(Library.Directory.Quests) do
+                if type(cfg) == "table" then
+                    local cfgTrack = cfg.track ~= nil and tostring(cfg.track) or nil
+                    if track == "main" then
+                        -- The shared root line is exactly the quests with no
+                        -- `track` field of their own (FreeBkPros/Zephyrr/
+                        -- PetsGOModder), which is what save.Questline.claimed
+                        -- counts.
+                        if cfgTrack == nil then total = total + 1 end
+                    elseif cfgTrack == track or tostring(cfg.npc) == track then
+                        total = total + 1
+                    end
+                end
+            end
+            return total
+        end
+
+        local function questlineInfo(track)
+            local ql = readSaveQuestline()
+            local raw
+            if track == "main" then
+                raw = type(ql) == "table" and ql or nil
+            else
+                raw = type(ql) == "table" and ql.tracks and ql.tracks[track] or nil
+            end
+            local accepted = type(raw) == "table" and raw.accepted == true or false
+            local claimed = type(raw) == "table" and (tonumber(raw.claimed) or 0) or 0
+            local total = trackQuestTotal(track)
+            return {
+                accepted = accepted,
+                claimed = claimed,
+                total = total,
+                done = total > 0 and claimed >= total,
+            }
+        end
+
+        -- The driver turns on the sub-automations an objective needs and
+        -- remembers which ones it started, so switching Auto Quests off puts
+        -- the account back exactly as it was. `gameAutoFarm` covers the
+        -- game's own Auto Farm engine, which the manager above toggles.
+        local questOwned = {
+            hatch = false, potionUse = false, wheels = false, gifts = false,
+            tokens = false, gameAutoFarm = false,
+        }
+        local function questAcquire(kind)
+            if kind == "hatch" and not AutoBuying then
+                questOwned.hatch = true
+                if type(setAutoHatchState) == "function" then
+                    pcall(setAutoHatchState, true)
+                else
+                    AutoBuying = true
+                end
+            elseif kind == "gameAutoFarm" and not QuestOwnedAutoFarm then
+                questOwned.gameAutoFarm = true
+                QuestOwnedAutoFarm = true
+                QuestAreaFarmWanted = true
+            elseif kind == "potionUse" and not AutoPotionUse then
+                questOwned.potionUse = true
+                AutoPotionUse = true
+            elseif kind == "wheels" and not AutoSpinnyWheels then
+                questOwned.wheels = true
+                AutoSpinnyWheels = true
+            elseif kind == "gifts" and not AutoCollectFreeGifts then
+                questOwned.gifts = true
+                AutoCollectFreeGifts = true
+            elseif kind == "tokens" and not AutoTokens then
+                questOwned.tokens = true
+                AutoTokens = true
+            end
+        end
+
+        local function questReleaseAll()
+            if questOwned.hatch and type(setAutoHatchState) == "function" then
+                pcall(setAutoHatchState, false)
+            end
+            if questOwned.potionUse then AutoPotionUse = false end
+            if questOwned.wheels then AutoSpinnyWheels = false end
+            if questOwned.gifts then AutoCollectFreeGifts = false end
+            if questOwned.tokens then AutoTokens = false end
+            if questOwned.gameAutoFarm then
+                QuestAreaFarmWanted = false
+                QuestAreaFarmTarget = nil
+                QuestOwnedAutoFarm = false
+            end
+            questOwned = {
+                hatch = false, potionUse = false, wheels = false, gifts = false,
+                tokens = false, gameAutoFarm = false,
+            }
+        end
+
+        -- Point the shared state at the given objective stat. Breakable
+        -- objectives now route through the game's own Auto Farm (via
+        -- QuestAreaFarmWanted) instead of the hub's per-coin teleport farm,
+        -- so the player is parked once at the area centre and the game's
+        -- engine does the walking.
+        local function applyObjective(stat)
+            QuestCoinFilter = nil
+            QuestFarmActive = false
+            QuestAreaFarmWanted = false
+            QuestAreaFarmTarget = nil
+            QuestHatchAnywhere = false
+            QuestTargetEggId = nil
+            QuestTargetEggLabel = nil
+
+            if not stat then return "objective has no stat" end
+
+            -- Breakables ---------------------------------------------------
+            if stat == "Breakables" then
+                questAcquire("gameAutoFarm")
+                QuestAreaFarmTarget = nil
+                return "auto-farming breakables"
+            end
+            if stat:sub(1, 14) == "BreakableKind:" then
+                local kind = stat:sub(15)
+                -- The game's Auto Farm takes every breakable in the captured
+                -- area. A kind-restricted objective still farms the whole area
+                -- - the pets hit whatever is there, and the quest counts only
+                -- the kind it asked for. Chests are the one exception worth
+                -- steering for: they are rare, so the hub's targeted farm
+                -- (which teleports to the weakest chest specifically) beats
+                -- waiting for the game's engine to wander onto one.
+                if kind == "Chest" or kind == "Crystal Chest" then
+                    QuestCoinFilter = { kind = kind, lowestHealth = true }
+                    QuestFarmActive = true
+                    return "hunting " .. kind:lower() .. "s"
+                end
+                questAcquire("gameAutoFarm")
+                QuestAreaFarmTarget = nil
+                return "auto-farming " .. kind .. "s"
+            end
+            if stat == "CrystalChests" then
+                QuestCoinFilter = { kind = "Crystal Chest", lowestHealth = true }
+                QuestFarmActive = true
+                return "hunting crystal chests"
+            end
+            if stat:sub(1, 10) == "Breakable:" then
+                local name = stat:sub(11)
+                QuestCoinFilter = { name = name, lowestHealth = true }
+                QuestFarmActive = true
+                return "breaking " .. name
+            end
+            if stat:sub(1, 17) == "WorldBreakables:" then
+                questAcquire("gameAutoFarm")
+                QuestAreaFarmTarget = stat:sub(18)
+                return "auto-farming in " .. stat:sub(18)
+            end
+            if stat == "LuckyBlocks" then
+                questAcquire("gameAutoFarm")
+                QuestAreaFarmTarget = nil
+                return "auto-farming Lucky blocks"
+            end
+            if stat == "MobsDefeated" or stat == "BossDefeats" then
+                questAcquire("gameAutoFarm")
+                QuestAreaFarmTarget = nil
+                return "auto-farming mobs"
+            end
+
+            -- Eggs ---------------------------------------------------------
+            if stat == "Eggs" then
+                questAcquire("hatch")
+                QuestHatchAnywhere = true
+                return "hatching (auto-hatch)"
+            end
+            if stat == "ExclusiveEggs" then
+                questAcquire("hatch")
+                local id = bestEggFor(function(_, def)
+                    return tostring(def.currency) == "Diamonds" and 1 or 0
+                end, true)
+                QuestTargetEggId = id
+                QuestTargetEggLabel = id
+                return id and ("hatching " .. id) or "no exclusive egg found"
+            end
+            if stat == "LuckyEggs" then
+                questAcquire("hatch")
+                local id = resolveEggIdByName("Lucky Egg")
+                QuestTargetEggId = id
+                QuestTargetEggLabel = id
+                return "hatching Lucky Egg"
+            end
+            if stat:sub(1, 8) == "AreaEgg:" then
+                questAcquire("hatch")
+                local area = stat:sub(9)
+                local id = bestEggFor(function(_, def)
+                    return tostring(def.area) == area and 1 or 0
+                end, true)
+                QuestTargetEggId = id
+                QuestTargetEggLabel = id
+                return id and ("hatching " .. id .. " (" .. area .. ")") or ("no egg in " .. area)
+            end
+            if stat:sub(1, 4) == "Egg:" then
+                questAcquire("hatch")
+                local id = resolveEggIdByName(stat:sub(5))
+                QuestTargetEggId = id
+                QuestTargetEggLabel = id
+                return id and ("hatching " .. id) or ("egg " .. stat:sub(5) .. " not found")
+            end
+            if stat == "HugePets" or stat == "BountyHuges" then
+                questAcquire("hatch")
+                local id = bestEggFor(hugeEggScore, false)
+                QuestTargetEggId = id
+                QuestTargetEggLabel = id
+                return id and ("hunting huges in " .. id) or "no coin egg drops huges"
+            end
+            local RARITY_STATS = {
+                LegendaryPets = "Legendary",
+                MythicalPets = "Mythical",
+                SecretPets = "Secret",
+                ExclusivePets = "Exclusive",
+            }
+            if RARITY_STATS[stat] then
+                questAcquire("hatch")
+                local rarity = RARITY_STATS[stat]
+                local id = bestEggFor(function(_, def) return rarityEggScore(rarity, _, def) end, false)
+                QuestTargetEggId = id
+                QuestTargetEggLabel = id
+                return id and ("hatching " .. id .. " for " .. rarity) or ("no coin egg for " .. rarity)
+            end
+            -- Modifier pets (golden/rainbow/shiny/dark matter) can come out of
+            -- any egg, so the easiest path is just to keep hatching.
+            if stat == "GoldenPets" or stat == "RainbowPets" or stat == "ShinyPets"
+                or stat == "ShinyGoldenPets" or stat == "ShinyRainbowPets" or stat == "DarkMatterPets" then
+                questAcquire("hatch")
+                QuestHatchAnywhere = true
+                return "hatching for " .. stat
+            end
+
+            -- Chores -------------------------------------------------------
+            if stat == "PotionsUsed" then
+                questAcquire("potionUse")
+                return "drinking potions"
+            end
+            if stat == "WheelSpins" then
+                questAcquire("wheels")
+                return "spinning wheels"
+            end
+            if stat == "FreeGifts" or stat == "Giftboxes" then
+                questAcquire("gifts")
+                return "collecting free gifts"
+            end
+            if stat == "AbilityTokens" then
+                questAcquire("tokens")
+                return "collecting tokens"
+            end
+            if stat == "EnchantUpgrades" then
+                return "enchant upgrades (run the machine)"
+            end
+
+            -- Passive ------------------------------------------------------
+            if stat:sub(1, 9) == "Currency:" or stat:sub(1, 5) == "Rank:" then
+                QuestFarmActive = true
+                return "farming for " .. stat
+            end
+            if stat == "PlaytimeSeconds" then
+                return "waiting (playtime)"
+            end
+
+            return "unsupported: " .. stat
+        end
+
+        while true do
+                -- Release everything when neither quest toggle is on.
+                if not AutoQuests and not AutoQuestsSide then
+                    if QuestFarmActive or QuestCoinFilter or QuestTargetEggId
+                        or QuestAreaFarmWanted or QuestHatchAnywhere then
+                        questReleaseAll()
+                        QuestCoinFilter = nil
+                        QuestFarmActive = false
+                        QuestAreaFarmWanted = false
+                        QuestAreaFarmTarget = nil
+                        QuestHatchAnywhere = false
+                        QuestTargetEggId = nil
+                        QuestTargetEggLabel = nil
+                    end
+                    AfkQuestStatus = "Idle"
+                    AfkSideQuestStatus = "Idle"
+                    task.wait(0.5)
+                else
+                    local ok, all = false, nil
+                    if RawNet.invoke then
+                        ok, all = RawNet.invoke("Questline: GetAll")
+                    end
+
+                    if not ok or type(all) ~= "table" then
+                        AfkQuestStatus = "quest state unavailable"
+                        AfkSideQuestStatus = "quest state unavailable"
+                        task.wait(5)
+                    else
+                        -- Walk the enabled lines in a fixed order. An already
+                        -- accepted line always wins, then the first line that
+                        -- has not finished its current quest. A line is only
+                        -- skipped once save.Questline says it is fully done, so
+                        -- the driver keeps working (and auto-accepting) every
+                        -- main quest instead of stopping at the first claim.
+                        local function buildTracks()
+                            local list = {}
+                            if AutoQuests then
+                                for _, t in ipairs(MAIN_QUEST_TRACKS) do list[#list + 1] = t end
+                            end
+                            if AutoQuestsSide then
+                                for _, t in ipairs(SIDE_QUEST_TRACKS) do list[#list + 1] = t end
+                            end
+                            return list
+                        end
+
+                        local chosen, chosenState, chosenInfo = nil, nil, nil
+                        local statusByTrack = {}
+                        for _, track in ipairs(buildTracks()) do
+                            local state = all[track]
+                            local info = questlineInfo(track)
+                            statusByTrack[track] = info
+                            if type(state) == "table" and not info.done then
+                                if info.accepted then
+                                    chosen, chosenState, chosenInfo = track, state, info
+                                    break
+                                elseif not chosen then
+                                    chosen, chosenState, chosenInfo = track, state, info
+                                end
+                            end
+                        end
+
+                        -- Status summary per enabled toggle: the line being
+                        -- worked first, then how many of its lines are still
+                        -- open, so the AFK pane shows real progress.
+                        local function describe(prefixTracks)
+                            local open, total = 0, 0
+                            for _, track in ipairs(prefixTracks) do
+                                total = total + 1
+                                if not statusByTrack[track] or not statusByTrack[track].done then
+                                    open = open + 1
+                                end
+                            end
+                            if total == 0 then return "idle" end
+                            if open == 0 then return string.format("all %d lines done", total) end
+                            return string.format("%d/%d lines open", open, total)
+                        end
+
+                        local mainSummary = AutoQuests and describe(MAIN_QUEST_TRACKS) or "idle"
+                        local sideSummary = AutoQuestsSide and describe(SIDE_QUEST_TRACKS) or "idle"
+
+                        if not chosenState then
+                            AfkQuestStatus = mainSummary
+                            AfkSideQuestStatus = sideSummary
+                            task.wait(15)
+                        elseif not chosenInfo.accepted then
+                            -- The server rejects Accept handled by another line's
+                            -- NPC, so only accept when the track we picked really
+                            -- is that NPC's own line.
+                            local acceptOk = RawNet.invoke("Questline: Accept", chosen)
+                            if acceptOk then
+                                AfkQuestStatus = "accepted " .. tostring(chosenState.title) .. " [" .. chosen .. "]"
+                                AfkSideQuestStatus = AfkQuestStatus
+                            else
+                                AfkQuestStatus = "accept failed [" .. chosen .. "]"
+                                AfkSideQuestStatus = AfkQuestStatus
+                            end
+                            task.wait(1.5)
+                        else
+                            local objective = nil
+                            if type(chosenState.objectives) == "table" then
+                                for _, ob in ipairs(chosenState.objectives) do
+                                    if (tonumber(ob.have) or 0) < (tonumber(ob.need) or 0) then
+                                        objective = ob
+                                        break
+                                    end
+                                end
+                            end
+
+                            if chosenState.complete == true or objective == nil then
+                                local okClaim, claimed, message = RawNet.invoke("Questline: Claim", chosen)
+                                if okClaim and claimed then
+                                    AfkQuestStatus = "claimed " .. tostring(chosenState.title)
+                                else
+                                    AfkQuestStatus = "claim failed: " .. tostring(message)
+                                end
+                                AfkSideQuestStatus = AfkQuestStatus
+                                task.wait(2)
+                            else
+                                local stat = statForObjective(objective)
+
+                                local label = applyObjective(stat)
+                                local have = tonumber(objective.have) or 0
+                                local need = tonumber(objective.need) or 0
+                                local statusText = string.format(
+                                    "%s [%s] - %s (%d/%d) [%s]",
+                                    tostring(chosenState.title or chosen), chosen, label, have, need, tostring(stat or "?")
+                                )
+                                if chosenInfo and MAIN_QUEST_NPCS[tostring(chosenState.npc)] then
+                                    AfkQuestStatus = statusText
+                                    AfkSideQuestStatus = sideSummary
+                                else
+                                    AfkSideQuestStatus = statusText
+                                    AfkQuestStatus = mainSummary
+                                end
+
+                                -- Steer movement for area-bound objectives.
+                                if QuestAreaFarmWanted then
+                                    -- Breakable objective: park at the area
+                                    -- centre once and let the game's own Auto
+                                    -- Farm (manager loop above) walk the pets
+                                    -- over everything in range. The hub's
+                                    -- per-coin teleport farm is NOT used here.
+                                    local root = getPlayerRoot()
+
+                                    -- WorldBreakables:<world> names a world,
+                                    -- not an area - load it first.
+                                    if QuestAreaFarmTarget
+                                        and Library.WorldCmds.HasArea(QuestAreaFarmTarget) == false then
+                                        if sharedLoadWorldSafely then
+                                            pcall(sharedLoadWorldSafely, QuestAreaFarmTarget)
+                                            task.wait(1.5)
+                                            root = getPlayerRoot()
+                                        end
+                                    end
+
+                                    local area = richestAreaForFilter(QuestCoinFilter or {})
+                                    if root and area then
+                                        local centre = sharedGetAreaCenter and sharedGetAreaCenter(area) or nil
+                                        if centre and (root.Position - centre).Magnitude > 25 then
+                                            steerToArea(area)
+                                        end
+                                    elseif root == nil or area ~= nil then
+                                        steerToArea(area)
+                                    end
+                                elseif QuestCoinFilter then
+                                    -- Kind/name-restricted breakables (chests
+                                    -- and named breakables) still use the hub's
+                                    -- targeted farm, because the game's engine
+                                    -- would hit everything in the area instead.
+                                    local root = getPlayerRoot()
+                                    local nearMatch = false
+                                    if root then
+                                        local things = Workspace:FindFirstChild("__THINGS")
+                                        local coinsFolder = things and things:FindFirstChild("Coins")
+                                        if coinsFolder then
+                                            for _, coin in ipairs(coinsFolder:GetChildren()) do
+                                                if coinMatchesQuestFilter(coin) then
+                                                    local pos = GetCoinPosition(coin)
+                                                    if pos and (root.Position - pos).Magnitude < 200 then
+                                                        nearMatch = true
+                                                        break
+                                                    end
+                                                end
+                                            end
+                                        end
+                                    end
+                                    if not nearMatch then
+                                        steerToArea(richestAreaForFilter(QuestCoinFilter))
+                                    end
+                                elseif QuestTargetEggId then
+                                    -- Egg objective: teleport to the egg
+                                    -- capsule itself, not just the middle of
+                                    -- its area. Auto-hatch (driven by
+                                    -- QuestTargetEggId above) does the rest.
+                                    local capsule = questFindEggCapsule(QuestTargetEggId)
+                                    if capsule then
+                                        local part = capsule.PrimaryPart
+                                            or capsule:FindFirstChildWhichIsA("BasePart")
+                                        local root = getPlayerRoot()
+                                        if part and root then
+                                            local distance = (root.Position - part.Position).Magnitude
+                                            if distance > 15 then
+                                                pcall(function()
+                                                    root.CFrame = CFrame.new(part.Position + Vector3.new(0, 5, 0))
+                                                end)
+                                                task.wait(0.5)
+                                            end
+                                        end
+                                    else
+                                        -- Capsule not streamed in: fall back to
+                                        -- the egg's area centre until it is.
+                                        local eggDef = Library.Directory.Eggs[QuestTargetEggId]
+                                        local area = type(eggDef) == "table" and eggDef.area or nil
+                                        if area then steerToArea(area) end
+                                    end
+                                elseif QuestHatchAnywhere then
+                                    -- "Hatch N eggs" accepts any egg: park on
+                                    -- whatever capsule is closest.
+                                    local closestId = findClosestEggId()
+                                    if closestId then
+                                        local capsule = questFindEggCapsule(closestId)
+                                        if capsule then
+                                            local part = capsule.PrimaryPart
+                                                or capsule:FindFirstChildWhichIsA("BasePart")
+                                            local root = getPlayerRoot()
+                                            if part and root and (root.Position - part.Position).Magnitude > 15 then
+                                                pcall(function()
+                                                    root.CFrame = CFrame.new(part.Position + Vector3.new(0, 5, 0))
+                                                end)
+                                            end
+                                        end
+                                    end
+                                end
+
+                                task.wait(3)
+                            end
+                        end
+                    end
+                end
+            end
+        end)
+    end
 
     -- =====================================================================
     -- SETTINGS TAB UI & EXTENDED THEME SWITCHER
@@ -8560,8 +11179,9 @@ end
 
         local function updateNearbyPanelToggle()
             TAB_TOTAL.indexUI.nearbyToggle.Text = nearbyPanelEnabled and "Nearby Egg UI: ON" or "Nearby Egg UI: OFF"
+            TAB_TOTAL.indexUI.nearbyToggle:SetAttribute("ToggleState", nearbyPanelEnabled)
             TAB_TOTAL.indexUI.nearbyToggle.BackgroundColor3 = nearbyPanelEnabled and activeTheme.controlOn or activeTheme.surface
-            TAB_TOTAL.indexUI.nearbyToggle.TextColor3 = activeTheme.text
+            TAB_TOTAL.indexUI.nearbyToggle.TextColor3 = Color3.fromRGB(255, 255, 255)
         end
         TAB_TOTAL.indexUI.nearbyToggle.MouseButton1Click:Connect(function()
             nearbyPanelEnabled = not nearbyPanelEnabled
@@ -8957,435 +11577,6 @@ end
         end)
         refreshIndex()
 
-        -- =================================================================
-        -- AUTO INDEX
-        --
-        -- Full auto-complete for the pet index:
-        --   1. diff the save's Collection against the collectable catalog
-        --      (Base/Golden/Rainbow variants all count as separate entries)
-        --   2. pick the missing variant with the best drop chance and locate
-        --      an egg that can hatch it
-        --   3. teleport to that egg's area (reusing the Teleport tab's
-        --      world-load primitives) and drive "BuyX Egg" until owned
-        --   4. replan and continue until every indexed variant is owned
-        -- =================================================================
-        local autoIndexRunning = false
-        local autoIndexTarget = nil          -- { petId, variantId, eggId, areaName }
-        local autoIndexOwnedSnapshot = nil
-        local autoIndexCooldownUntil = 0
-        local autoIndexFailures = 0
-        local autoIndexOwnedPollAt = 0
-        local autoIndexEggAreaCache = {}
-        local autoIndexCatalog = nil
-        local autoIndexNoProgressTries = 0
-
-        local function autoIndexSetStatus(text)
-            if TAB_TOTAL.indexUI.autoStatus and TAB_TOTAL.indexUI.autoStatus.Parent then
-                TAB_TOTAL.indexUI.autoStatus.Text = text
-            end
-        end
-
-        -- petId -> { { eggId, chance, variants = { [1]=true, ... } } }, built
-        -- from the same directory fields the Egg Chances tab filters on.
-        local function buildAutoIndexCatalog()
-            local eggDirectory = Library.Directory and Library.Directory.Eggs
-            if type(eggDirectory) ~= "table" then return nil end
-            local byPet = {}
-            for eggId, egg in pairs(eggDirectory) do
-                if type(egg) == "table"
-                    and egg.hatchable ~= false
-                    and not egg.isExclusive
-                    and not egg.isGift
-                    and not egg.isPremium then
-                    local drops = resolveEggDrops(eggDirectory, egg)
-                    if type(drops) == "table" then
-                        -- Same variant rules as buildNearbyPanelRows: golden
-                        -- eggs only yield golden/rainbow, disableModifiers
-                        -- eggs only base, everything else all three unless
-                        -- individually disabled.
-                        local variants = {}
-                        if egg.isGolden then
-                            variants[2] = true
-                            if not egg.disableRainbow then variants[3] = true end
-                        elseif egg.disableModifiers then
-                            variants[1] = true
-                        else
-                            variants[1] = true
-                            if not egg.disableGold then variants[2] = true end
-                            if not egg.disableRainbow then variants[3] = true end
-                        end
-                        for _, drop in ipairs(drops) do
-                            local petId, chance
-                            if type(drop) == "table" then
-                                petId = drop.petName or drop[1]
-                                chance = tonumber(drop.chance or drop[2]) or 0
-                            end
-                            if type(petId) == "string" then
-                                local list = byPet[petId]
-                                if not list then
-                                    list = {}
-                                    byPet[petId] = list
-                                end
-                                list[#list + 1] = {
-                                    eggId = tostring(eggId),
-                                    chance = chance,
-                                    variants = variants,
-                                }
-                            end
-                        end
-                    end
-                end
-            end
-            return byPet
-        end
-
-        -- Resolve which map area an egg lives in. Preferred source: the live
-        -- capsule hierarchy (Workspace.__MAP.Eggs.<area>.Eggs), which also
-        -- proves the egg is physically present in the loaded world. Directory
-        -- area/zone fields are used as a fallback for eggs in other worlds.
-        local function findEggArea(eggId, eggCfg)
-            if autoIndexEggAreaCache[eggId] ~= nil then
-                return autoIndexEggAreaCache[eggId]
-            end
-
-            local map = Workspace:FindFirstChild("__MAP")
-            local eggsRoot = map and map:FindFirstChild("Eggs")
-            if eggsRoot then
-                for _, areaFolder in ipairs(eggsRoot:GetChildren()) do
-                    for _, model in ipairs(areaFolder:GetDescendants()) do
-                        if model:IsA("Model") and model.Name == "Egg Capsule"
-                            and tostring(model:GetAttribute("ID")) == eggId then
-                            autoIndexEggAreaCache[eggId] = areaFolder.Name
-                            return areaFolder.Name
-                        end
-                    end
-                end
-            end
-
-            local areas = Library.Directory and Library.Directory.Areas
-            for _, field in ipairs({ "area", "zone", "Area", "Zone" }) do
-                local candidate = type(eggCfg) == "table" and eggCfg[field] or nil
-                if type(candidate) == "string" and type(areas) == "table" and areas[candidate] then
-                    autoIndexEggAreaCache[eggId] = candidate
-                    return candidate
-                end
-            end
-            return nil
-        end
-
-        -- Build the work list: every missing petId#variant with its best egg
-        -- (highest drop chance) and that egg's area, most obtainable first.
-        local function buildAutoIndexPlan(owned)
-            if not autoIndexCatalog then
-                autoIndexCatalog = buildAutoIndexCatalog()
-            end
-            if type(autoIndexCatalog) ~= "table" then return nil end
-
-            if not cachedIndexCollectables then
-                local ok, result = pcall(function()
-                    return Library.Shared.GetAllCollectablePets()
-                end)
-                if ok and type(result) == "table" then
-                    cachedIndexCollectables = result
-                end
-            end
-            if type(cachedIndexCollectables) ~= "table" then return nil end
-
-            local eggDirectory = Library.Directory and Library.Directory.Eggs
-            local plan, seen, skipped = {}, {}, 0
-            for _, entry in ipairs(cachedIndexCollectables) do
-                local petId = entry.petId
-                local variantId
-                if entry.isGolden then
-                    variantId = 2
-                elseif entry.isRainbow then
-                    variantId = 3
-                elseif not entry.isDarkMatter then
-                    variantId = 1
-                end
-                if petId ~= nil and variantId then
-                    local id = tostring(petId)
-                    local key = id .. "#" .. variantId
-                    if not seen[key] and owned[key] ~= true then
-                        seen[key] = true
-                        local best, bestChance = nil, -1
-                        for _, source in ipairs(autoIndexCatalog[id] or {}) do
-                            if source.variants[variantId] and source.chance > bestChance then
-                                best = source
-                                bestChance = source.chance
-                            end
-                        end
-                        if best then
-                            local eggCfg = type(eggDirectory) == "table" and (eggDirectory[best.eggId] or eggDirectory[tostring(best.eggId)]) or nil
-                            local areaName = findEggArea(best.eggId, eggCfg)
-                            if areaName then
-                                plan[#plan + 1] = {
-                                    petId = id,
-                                    variantId = variantId,
-                                    eggId = best.eggId,
-                                    areaName = areaName,
-                                    chance = bestChance,
-                                }
-                            else
-                                skipped += 1
-                            end
-                        else
-                            skipped += 1
-                        end
-                    end
-                end
-            end
-
-            table.sort(plan, function(a, b)
-                if a.chance ~= b.chance then return a.chance > b.chance end
-                if a.petId ~= b.petId then return a.petId < b.petId end
-                return a.variantId < b.variantId
-            end)
-            return plan, skipped
-        end
-
-        -- Same flow as the Teleport tab's teleportToArea, minus the UI status
-        -- writes: load the target world when needed, then drop onto the area
-        -- center once its geometry has streamed in.
-        local function autoIndexTeleportToArea(areaName)
-            local areaData = Library.Directory.Areas and Library.Directory.Areas[areaName]
-            local targetWorld = type(areaData) == "table" and areaData.world or nil
-            local currentWorld = nil
-            pcall(function() currentWorld = Library.WorldCmds.Get() end)
-
-            local _, root = sharedGetCharacterRoot()
-            if not root then return false, "character not loaded" end
-
-            if not targetWorld or targetWorld == currentWorld then
-                local center = sharedGetAreaCenter(areaName)
-                if not center then return false, areaName .. " not found in this world" end
-                pcall(function() root.CFrame = CFrame.new(center) end)
-                return true
-            end
-
-            local worldData = Library.Directory.Worlds and Library.Directory.Worlds[targetWorld]
-            if type(worldData) ~= "table" or worldData.disabled == true or worldData.releasedToPlayers == false then
-                return false, tostring(targetWorld) .. " is disabled in-game"
-            end
-
-            if not sharedLoadWorldSafely(targetWorld) then
-                return false, "failed to load " .. tostring(targetWorld)
-            end
-            local landedWorld = nil
-            pcall(function() landedWorld = Library.WorldCmds.Get() end)
-            if landedWorld ~= targetWorld then
-                return false, "failed to load " .. tostring(targetWorld)
-            end
-
-            local deadline = os.clock() + 10
-            local center = nil
-            while os.clock() < deadline do
-                center = sharedGetAreaCenter(areaName)
-                if center then break end
-                task.wait(0.25)
-            end
-            if not center then return false, areaName .. " has no spawn point" end
-            task.wait(0.35)
-
-            local _, newRoot = sharedGetCharacterRoot()
-            if not newRoot then return false, "character missing after world load" end
-            pcall(function() newRoot.CFrame = CFrame.new(center) end)
-            return true
-        end
-
-        local function setAutoIndexState(enabled)
-            enabled = enabled == true
-            autoIndexRunning = enabled
-            SetSetting("AutoIndexEnabled", enabled)
-            saveSettings()
-
-            local btn = TAB_TOTAL.indexUI.autoBtn
-            if btn and btn.Parent then
-                btn:SetAttribute("ToggleState", enabled)
-                btn.BackgroundColor3 = enabled and activeTheme.controlOn or activeTheme.surface
-                btn.Text = "Auto Index: " .. (enabled and "ON" or "OFF")
-                btn.TextColor3 = enabled and Color3.fromRGB(255, 255, 255) or Color3.fromRGB(180, 180, 190)
-            end
-            if not enabled then
-                autoIndexTarget = nil
-                autoIndexOwnedSnapshot = nil
-                autoIndexSetStatus("Stopped")
-            end
-        end
-
-        TAB_TOTAL.indexUI.autoBtn.MouseButton1Click:Connect(function()
-            setAutoIndexState(not autoIndexRunning)
-        end)
-
-        -- Restored setting: start the driver shortly after load, once the
-        -- teleport primitives from the Teleport tab are in place.
-        if GetSetting("AutoIndexEnabled", false) == true then
-            task.delay(2, function()
-                if ui.Parent then setAutoIndexState(true) end
-            end)
-        end
-
-        task.spawn(function()
-            while ui.Parent do
-                if not autoIndexRunning then
-                    task.wait(0.5)
-                elseif not RawNet.invoke then
-                    autoIndexSetStatus("Network unavailable.")
-                    task.wait(2)
-                elseif AutoBuying then
-                    -- The main Auto-Hatch toggle already drives "BuyX Egg";
-                    -- running both would double the remote traffic.
-                    autoIndexSetStatus("Waiting: Auto-Hatch Egg is active.")
-                    task.wait(1)
-                elseif sharedIsTeleportBusy() then
-                    autoIndexSetStatus("Waiting: manual teleport running.")
-                    task.wait(1)
-                else
-                    -- Refresh ownership at most once per second; hatching is
-                    -- the slow path, the save does not change faster usefully.
-                    local owned, hasSave
-                    if os.clock() >= autoIndexOwnedPollAt then
-                        autoIndexOwnedPollAt = os.clock() + 1
-                        owned, hasSave = readIndexOwned()
-                        autoIndexOwnedSnapshot = hasSave and owned or nil
-                    else
-                        owned = autoIndexOwnedSnapshot
-                    end
-
-                    if type(owned) ~= "table" then
-                        autoIndexSetStatus("Waiting for save data...")
-                        task.wait(1)
-                    else
-                        local needPlan = not autoIndexTarget
-                            or owned[autoIndexTarget.petId .. "#" .. autoIndexTarget.variantId] == true
-
-                        if needPlan then
-                            local plan, skipped = buildAutoIndexPlan(owned)
-                            local nextEntry = nil
-                            if type(plan) == "table" then
-                                for _, entry in ipairs(plan) do
-                                    nextEntry = entry
-                                    break
-                                end
-                            end
-
-                            if not nextEntry then
-                                if type(plan) == "table" then
-                                    -- Entries whose egg lives in an unloaded
-                                    -- world cannot be resolved to an area yet.
-                                    -- Retry periodically instead of declaring
-                                    -- victory, so world loads can unstick them.
-                                    if skipped > 0 and autoIndexNoProgressTries < 5 then
-                                        autoIndexNoProgressTries += 1
-                                        autoIndexSetStatus(("Waiting on %d unreachable variants (retry %d/5)..."):format(skipped, autoIndexNoProgressTries))
-                                        task.wait(6)
-                                    else
-                                        setAutoIndexState(false)
-                                        autoIndexSetStatus(skipped > 0
-                                            and ("Done: %d missing variants have no reachable egg."):format(skipped)
-                                            or "Index complete!")
-                                    end
-                                else
-                                    autoIndexSetStatus("Egg directory unavailable.")
-                                    task.wait(3)
-                                end
-                            else
-                                autoIndexNoProgressTries = 0
-                                autoIndexTarget = {
-                                    petId = nextEntry.petId,
-                                    variantId = nextEntry.variantId,
-                                    eggId = nextEntry.eggId,
-                                    areaName = nextEntry.areaName,
-                                }
-                                autoIndexFailures = 0
-                                autoIndexSetStatus("Next: " .. autoIndexTarget.petId
-                                    .. " (" .. variantNames[autoIndexTarget.variantId] .. ")")
-                            end
-                        elseif autoIndexTarget then
-                            -- Make sure we are standing in the target area, then
-                            -- hatch with the same 0.25s cooldown the Auto-Hatch
-                            -- fallback uses (tested safe against the server).
-                            local _, root = sharedGetCharacterRoot()
-                            local map = Workspace:FindFirstChild("__MAP")
-                            local eggsRoot = map and map:FindFirstChild("Eggs")
-                            local areaFolder = eggsRoot and eggsRoot:FindFirstChild(autoIndexTarget.areaName) or nil
-                            local capsuleInRange = false
-                            if areaFolder and root then
-                                for _, model in ipairs(areaFolder:GetDescendants()) do
-                                    if model:IsA("Model") and model.Name == "Egg Capsule"
-                                        and tostring(model:GetAttribute("ID")) == autoIndexTarget.eggId then
-                                        local part = model.PrimaryPart or model:FindFirstChildWhichIsA("BasePart")
-                                        if part and root.Position and (root.Position - part.Position).Magnitude < 40 then
-                                            capsuleInRange = true
-                                        end
-                                        break
-                                    end
-                                end
-                            end
-
-                            if not capsuleInRange then
-                                autoIndexSetStatus("Teleporting to " .. autoIndexTarget.areaName .. "...")
-                                local okMove, moveError = autoIndexTeleportToArea(autoIndexTarget.areaName)
-                                if not okMove then
-                                    autoIndexFailures += 1
-                                    autoIndexSetStatus("Teleport failed: " .. tostring(moveError))
-                                    -- Drop the unreachable target and replan so a
-                                    -- broken area cannot stall the whole run.
-                                    if autoIndexFailures >= 2 then
-                                        autoIndexTarget = nil
-                                        autoIndexFailures = 0
-                                    end
-                                    task.wait(2)
-                                else
-                                    task.wait(0.5)
-                                end
-                            elseif os.clock() < autoIndexCooldownUntil then
-                                task.wait(0.05)
-                            elseif (tonumber(Library.Variables.OpeningEgg) or 0) > 0 then
-                                task.wait(0.1)
-                            else
-                                local okAction, canAct = pcall(function() return Library.WorldCmds.CanDoAction() end)
-                                if okAction and canAct == false then
-                                    task.wait(0.25)
-                                else
-                                    autoIndexCooldownUntil = os.clock() + 0.25
-                                    local invoked, result, err = RawNet.invoke("BuyX Egg", autoIndexTarget.eggId)
-                                    local label = autoIndexTarget.petId .. " ("
-                                        .. variantNames[autoIndexTarget.variantId] .. ") ← "
-                                        .. autoIndexTarget.eggId
-                                    if not invoked then
-                                        autoIndexFailures += 1
-                                        autoIndexSetStatus("Hatching " .. label .. " (retrying)")
-                                    elseif result == true then
-                                        autoIndexFailures = 0
-                                        autoIndexSetStatus("Hatching " .. label)
-                                    elseif type(err) == "string" and err:find("too quickly") then
-                                        autoIndexCooldownUntil = os.clock() + 0.5
-                                    elseif type(err) == "string" and err:find("too far") then
-                                        -- Walked/pushed away from the capsule; move back.
-                                        autoIndexCooldownUntil = os.clock() + 1.0
-                                        local center = sharedGetAreaCenter(autoIndexTarget.areaName)
-                                        if center and root then
-                                            pcall(function() root.CFrame = CFrame.new(center) end)
-                                        end
-                                    else
-                                        autoIndexFailures += 1
-                                        autoIndexSetStatus("Buy failed: " .. tostring(err))
-                                    end
-
-                                    if autoIndexFailures >= 5 then
-                                        autoIndexCooldownUntil = os.clock() + 5
-                                        autoIndexFailures = 0
-                                    end
-                                end
-                            end
-                            task.wait(0.05)
-                        end
-                    end
-                end
-            end
-        end)
-
         -- Keep the floating missing-pets panel independent from the normal
         -- Index list. Ownership is polled every 0.60 seconds for near-real-time
         -- updates; the heavier egg hierarchy sweep runs only every 8 seconds.
@@ -9598,6 +11789,25 @@ registerCleanup(function()
     FastAttackSpeed = false
     FastPetSpeed = false
     AutoBuying = false
+    AutoGroupRewards = false
+    AutoSpinnyWheels = false
+    AutoPotionUpgrade = false
+    AutoPotionUse = false
+    AutoQuests = false
+    AutoQuestsSide = false
+    QuestCoinFilter = nil
+    QuestFarmActive = false
+    QuestAreaFarmWanted = false
+    QuestHatchAnywhere = false
+    QuestTargetEggId = nil
+    QuestTargetEggLabel = nil
+    QuestOwnedAutoFarm = false
+    AutoFarmTabActive = false
+    AutoFarmTabTargetEgg = nil
+    pcall(function()
+        Library.Variables.AutoFarmEnabled = false
+        Library.Variables.AutoFarmArea = nil
+    end)
     
     -- Clean up UI elements
     pcall(function()
@@ -9633,7 +11843,7 @@ end)
 -- Script fully loaded indicator
 if getgenv then
     getgenv().PetDimensionsLoaded = true
-    getgenv().PetDimensionsVersion = "RealExecutor_Optimized_v2+v3fixes"
+    getgenv().PetDimensionsVersion = "RealExecutor_Optimized_v2+v3fixes+autoFarming"
 end
 
 return {
