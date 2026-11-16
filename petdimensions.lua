@@ -367,6 +367,20 @@ local QuestHatchAnywhere = false
 -- Auto Farm is on, so it is only ever turned back off by the same path.
 local QuestOwnedAutoFarm = false
 
+-- Playtime-quest AFK. The AFK tab lets the user pick the area to farm and the
+-- egg to hatch; while a PlaytimeSeconds objective is the one the driver is
+-- sitting on, the AFK engine loads that area, turns the game's Auto Farm on so
+-- the pets break for the whole playtime, and auto-hatches the chosen egg. With
+-- no area picked it simply waits the clock out (the old behaviour).
+local AfkFarmArea = nil
+local AfkFarmEgg = nil
+-- Set by the quest driver while a 3-NPC PlaytimeSeconds objective is current,
+-- so the playtime engine knows it is allowed to steer the player.
+local QuestPlaytimeActive = false
+-- Playtime startup is staged: area centre -> settle -> Auto Farm -> settle -> egg.
+local QuestPlaytimeFarmReady = false
+local QuestPlaytimeFarmTarget = nil
+
 -- Hatch state lives at the top level so every loop (including the egg-open
 -- cleanup poller, which is created long before the UI thread) reads the SAME
 -- variable instead of silently resolving an unrelated global.
@@ -1668,11 +1682,81 @@ local function questFindEggCapsule(eggId)
     return best
 end
 
--- Turn the game's own Auto Farm on or off. The GUI button is updated as well
--- so the button's colour matches what the engine is actually doing, but the
--- variable is the only thing the engine's Tick loop reads.
+-- Turn the game's own Auto Farm on or off through the engine's OWN button
+-- handler wherever we can reach it.
+--
+-- WHY THIS IS NOT JUST `Library.Variables.AutoFarmEnabled = true` ANYMORE:
+-- the engine only calls CaptureArea() inside its SetEnabled handler (the one
+-- wired to the Tools "Autofarm" button). Writing the raw variable makes the
+-- Tick loop believe farm is on while AutoFarmArea stays nil, so the pets have
+-- no captured area and just stand still until a world change happens to run
+-- CaptureArea for them. Driving the real handler captures the area the player
+-- is standing in, which is exactly what the button does.
+--
+-- The handler is a connection on the live button, so it is resolved once
+-- through getconnections and cached. Executors without getconnections fall back
+-- to the old variable write (still correct for the quest manager, which only
+-- ever flips the flag while parked inside the target area).
+local questAutoFarmHandlerCache = nil
+local questAutoFarmHandlerResolved = false
+
+local function questGameAutoFarmHandler()
+    if questAutoFarmHandlerResolved then
+        return questAutoFarmHandlerCache
+    end
+    questAutoFarmHandlerResolved = true
+
+    if type(getconnections) ~= "function" then
+        return nil
+    end
+
+    local okButton, button = pcall(function()
+        return Library.GUI
+            and Library.GUI.Main
+            and Library.GUI.Main.Left
+            and Library.GUI.Main.Left.Tools
+            and Library.GUI.Main.Left.Tools:FindFirstChild("Autofarm")
+    end)
+    if not okButton or not button then return nil end
+
+    local okConns, connections = pcall(getconnections, button.Activated)
+    if not okConns or type(connections) ~= "table" then return nil end
+
+    for _, connection in ipairs(connections) do
+        if type(connection.Function) == "function" then
+            questAutoFarmHandlerCache = connection.Function
+            return connection.Function
+        end
+    end
+    return nil
+end
+
 local function questSetGameAutoFarm(enabled)
-    local ok = pcall(function()
+    local handler = questGameAutoFarmHandler()
+    if handler then
+        -- The handler toggles from whatever the current state is, so calling it
+        -- twice in a row would flip straight back. Only invoke it on a real
+        -- state change.
+        local okCur, current = pcall(function() return Library.Variables.AutoFarmEnabled end)
+        if okCur and current ~= enabled then
+            pcall(handler)
+        end
+
+        -- The game's own handler is zone-gated: it refuses to start Auto Farm
+        -- outside a breakable zone. When it refused, force the variables the
+        -- Tick loop reads so the caller's contract is still met (the engine
+        -- then farms whatever it can capture from where the player stands).
+        -- Without this the manager loop would call the handler every tick
+        -- forever, since the state never became what it asked for.
+        local okAfter, after = pcall(function() return Library.Variables.AutoFarmEnabled end)
+        if okAfter and after == enabled then
+            return true
+        end
+    end
+
+    -- Fallback: no getconnections, or the handler refused. Write the variables
+    -- the Tick loop reads and mirror the change onto the button.
+    return pcall(function()
         Library.Variables.AutoFarmEnabled = enabled
         if not enabled then
             Library.Variables.AutoFarmArea = nil
@@ -1696,7 +1780,6 @@ local function questSetGameAutoFarm(enabled)
             end
         end
     end)
-    return ok
 end
 
 -- Manager loop. While a breakable objective is active it keeps the game's
@@ -1706,14 +1789,29 @@ end
 -- player is standing).
 task.spawn(function()
     local recaptureArmed = false
+    -- Bounded re-capture. The engine snaps its capture to wherever the player
+    -- stood when it enabled, so a mismatch usually means the driver has not
+    -- parked yet and one off/on fixes it. But an area the engine can never
+    -- capture (an egg whose `area` is not a real area, a world with no
+    -- breakable zone) would otherwise make the mismatch permanent and the loop
+    -- would toggle Auto Farm off/on forever. After a few tries it gives up and
+    -- leaves the farm running on whatever it captured.
+    local recaptureTries = 0
+    local lastTarget = nil
     while true do
-        if QuestAreaFarmWanted and (AutoQuests or AutoQuestsSide) then
+        if QuestAreaFarmWanted and (AutoQuests or AutoQuestsSide)
+            and (not QuestPlaytimeActive or QuestPlaytimeFarmReady) then
             local ok, enabled = pcall(function()
                 return Library.Variables.AutoFarmEnabled
             end)
             local okArea, capturedArea = pcall(function()
                 return Library.Variables.AutoFarmArea
             end)
+
+            if lastTarget ~= QuestAreaFarmTarget then
+                lastTarget = QuestAreaFarmTarget
+                recaptureTries = 0
+            end
 
             if not ok or enabled ~= true then
                 questSetGameAutoFarm(true)
@@ -1726,22 +1824,35 @@ task.spawn(function()
                 -- a tick so its Tick loop clears the capture, then back on -
                 -- it re-captures from wherever the player is standing now,
                 -- which the quest driver keeps parked at the target centre.
-                if not recaptureArmed then
-                    recaptureArmed = true
-                    questSetGameAutoFarm(false)
+                if recaptureTries < 4 then
+                    if not recaptureArmed then
+                        recaptureArmed = true
+                        questSetGameAutoFarm(false)
+                    else
+                        recaptureArmed = false
+                        recaptureTries += 1
+                        questSetGameAutoFarm(true)
+                    end
                 else
                     recaptureArmed = false
-                    questSetGameAutoFarm(true)
                 end
             else
                 recaptureArmed = false
+                recaptureTries = 0
             end
             task.wait(0.6)
+        elseif QuestAreaFarmWanted and QuestPlaytimeActive and not QuestPlaytimeFarmReady then
+            -- The playtime driver is deliberately handling the ordered startup
+            -- (centre, wait, Auto Farm, wait, egg). Do not race it by enabling
+            -- Auto Farm here, or by releasing a farm it has just acquired.
+            task.wait(0.25)
         else
             if QuestOwnedAutoFarm then
                 QuestOwnedAutoFarm = false
                 questSetGameAutoFarm(false)
             end
+            lastTarget = nil
+            recaptureTries = 0
             task.wait(0.5)
         end
     end
@@ -4122,7 +4233,7 @@ switchTab(hatchTab, hatchFrame)
         afkSub.Size = UDim2.new(1, 0, 0, 40)
         afkSub.Position = UDim2.new(0, 0, 0, 26)
         afkSub.BackgroundTransparency = 1
-        afkSub.Text = "Claim group rewards, spin the wheels, upgrade and drink max-tier Lucky/Coins/Damage potions. Auto Quests accepts each main quest line on its own and plays it through to the claim, then moves to the next."
+        afkSub.Text = "Claim group rewards, spin the wheels, upgrade and drink max-tier Lucky/Coins/Damage potions. Auto Quests works the BK / PetsGOModder / Zephyrr main line through each quest to the claim, then picks up the next one."
         afkSub.TextColor3 = Color3.fromRGB(190, 190, 200)
         afkSub.Font = Enum.Font.Gotham
         afkSub.TextSize = 11
@@ -4174,6 +4285,9 @@ switchTab(hatchTab, hatchFrame)
         questHeader.Parent = frame
     end)(TAB_TOTAL.afkFrame)
 
+    -- Forward declaration so quest-toggle callbacks can always stop auto-hatch.
+    local setAutoHatchState
+
     local autoQuestsToggle = createUnifiedToggle(TAB_TOTAL.afkFrame, 264, "Auto Quests (main lines)", false, function(state)
         AutoQuests = state
         AfkQuestStatus = state and "Starting..." or "Idle"
@@ -4185,6 +4299,10 @@ switchTab(hatchTab, hatchFrame)
             QuestHatchAnywhere = false
             QuestTargetEggId = nil
             QuestTargetEggLabel = nil
+            QuestPlaytimeActive = false
+            if not AutoQuestsSide and type(setAutoHatchState) == "function" then
+                pcall(setAutoHatchState, false)
+            end
         end
     end)
 
@@ -4199,6 +4317,10 @@ switchTab(hatchTab, hatchFrame)
             QuestHatchAnywhere = false
             QuestTargetEggId = nil
             QuestTargetEggLabel = nil
+            QuestPlaytimeActive = false
+            if not AutoQuests and type(setAutoHatchState) == "function" then
+                pcall(setAutoHatchState, false)
+            end
         end
     end)
 
@@ -4206,10 +4328,253 @@ switchTab(hatchTab, hatchFrame)
         warn("[Pet Dimensions Hub] Auto Quests toggle failed to create")
     end
 
+    ;(function()
+        -- -----------------------------------------------------------------
+        -- Playtime AFK pickers.
+        --
+        -- PlaytimeSeconds objectives used to just wait the clock out. These two
+        -- dropdowns let the user pick the area to farm and the egg to hatch
+        -- while that clock ticks, so the wait also earns breakables and pets.
+        -- Both write the top-level AfkFarmArea / AfkFarmEgg the quest driver
+        -- reads in applyObjective, and both persist across sessions.
+        --
+        -- Wrapped in an immediately-called function so this whole widget adds
+        -- no live locals to the surrounding register-tight UI builder.
+        -- -----------------------------------------------------------------
+        local afkPickHeader = Instance.new("TextLabel")
+        afkPickHeader.Size = UDim2.new(1, 0, 0, 20)
+        afkPickHeader.Position = UDim2.new(0, 0, 0, 352)
+        afkPickHeader.BackgroundTransparency = 1
+        afkPickHeader.Text = "PLAYTIME AFK  (farm + hatch during Playtime quests)"
+        afkPickHeader.TextColor3 = Color3.fromRGB(255, 220, 120)
+        afkPickHeader.Font = Enum.Font.GothamBold
+        afkPickHeader.TextSize = 11
+        afkPickHeader.TextXAlignment = Enum.TextXAlignment.Left
+        afkPickHeader.Parent = TAB_TOTAL.afkFrame
+
+        local function makePickerButton(name, y, text)
+            local button = Instance.new("TextButton")
+            button.Name = name
+            button.Size = UDim2.new(1, 0, 0, 34)
+            button.Position = UDim2.new(0, 0, 0, y)
+            button.BackgroundColor3 = activeTheme.surface
+            button.TextColor3 = Color3.fromRGB(235, 238, 245)
+            button.Font = Enum.Font.GothamBold
+            button.TextSize = 12
+            button.TextXAlignment = Enum.TextXAlignment.Left
+            button.Text = text
+            button.Parent = TAB_TOTAL.afkFrame
+            do local c = Instance.new("UICorner"); c.CornerRadius = UDim.new(0, 6); c.Parent = button end
+            do local s = Instance.new("UIStroke"); s.Color = activeTheme.stroke; s.Thickness = 1; s.Transparency = 0.7; s.Parent = button end
+            do local p = Instance.new("UIPadding"); p.PaddingLeft = UDim.new(0, 10); p.Parent = button end
+            return button
+        end
+
+        local afkAreaSelect = makePickerButton("AfkAreaSelect", 376, "Farm area: none (pick one)")
+        local afkEggSelect = makePickerButton("AfkEggSelect", 434, "Hatch egg: none (pick one)")
+
+        -- Shared dropdown renderer. `names` is the full option list, `onPick`
+        -- receives the chosen string. The list rebuilds itself on every open so
+        -- newly added areas/eggs show up without a reload.
+        local function makePickerList(name, y, height, placeholderText)
+            local list = Instance.new("ScrollingFrame")
+            list.Name = name
+            list.Size = UDim2.new(1, 0, 0, height)
+            list.Position = UDim2.new(0, 0, 0, y)
+            list.BackgroundColor3 = Color3.fromRGB(30, 34, 44)
+            list.BorderSizePixel = 0
+            list.ScrollBarThickness = 4
+            list.Visible = false
+            list.ZIndex = 20
+            list.CanvasSize = UDim2.new(0, 0, 0, 0)
+            list.AutomaticCanvasSize = Enum.AutomaticSize.Y
+            list.Parent = TAB_TOTAL.afkFrame
+            local layout = Instance.new("UIListLayout")
+            layout.Padding = UDim.new(0, 1)
+            layout.SortOrder = Enum.SortOrder.LayoutOrder
+            layout.Parent = list
+
+            local search = Instance.new("TextBox")
+            search.Name = name .. "Search"
+            search.Size = UDim2.new(1, -6, 0, 30)
+            search.BackgroundColor3 = activeTheme.surface
+            search.TextColor3 = Color3.fromRGB(235, 238, 245)
+            search.PlaceholderColor3 = Color3.fromRGB(145, 155, 170)
+            search.PlaceholderText = placeholderText
+            search.Text = ""
+            search.ClearTextOnFocus = false
+            search.Font = Enum.Font.Gotham
+            search.TextSize = 11
+            search.TextXAlignment = Enum.TextXAlignment.Left
+            search.LayoutOrder = 0
+            search.ZIndex = 21
+            search.Parent = list
+            do local c = Instance.new("UICorner"); c.CornerRadius = UDim.new(0, 5); c.Parent = search end
+            do local p = Instance.new("UIPadding"); p.PaddingLeft = UDim.new(0, 8); p.Parent = search end
+
+            return list, search, layout
+        end
+
+        local function renderPicker(list, search, layout, names, onPick)
+            for _, child in ipairs(list:GetChildren()) do
+                if child ~= layout and child ~= search then child:Destroy() end
+            end
+            local query = search.Text:lower():gsub("^%s+", ""):gsub("%s+$", "")
+            local shown = 0
+            for _, optionName in ipairs(names) do
+                if query == "" or optionName:lower():find(query, 1, true) then
+                    shown += 1
+                    local row = Instance.new("TextButton")
+                    row.Size = UDim2.new(1, -6, 0, 26)
+                    row.ZIndex = 21
+                    row.BackgroundTransparency = 1
+                    row.TextColor3 = Color3.fromRGB(230, 233, 240)
+                    row.Text = optionName
+                    row.Font = Enum.Font.Gotham
+                    row.TextSize = 11
+                    row.TextXAlignment = Enum.TextXAlignment.Left
+                    row.LayoutOrder = shown
+                    row.Parent = list
+                    row.MouseButton1Click:Connect(function()
+                        onPick(optionName)
+                        list.Visible = false
+                    end)
+                end
+            end
+            if shown == 0 then
+                local empty = Instance.new("TextLabel")
+                empty.Size = UDim2.new(1, -8, 0, 26)
+                empty.BackgroundTransparency = 1
+                empty.Text = "No matches"
+                empty.TextColor3 = Color3.fromRGB(170, 175, 185)
+                empty.Font = Enum.Font.Gotham
+                empty.TextSize = 11
+                empty.LayoutOrder = 1
+                empty.ZIndex = 21
+                empty.Parent = list
+            end
+        end
+
+        local function sortedKeys(t, predicate)
+            local names = {}
+            if type(t) == "table" then
+                for name, def in pairs(t) do
+                    if not predicate or predicate(name, def) then
+                        names[#names + 1] = tostring(name)
+                    end
+                end
+            end
+            table.sort(names)
+            return names
+        end
+
+        local afkAreaList, afkAreaSearch, afkAreaLayout =
+            makePickerList("AfkAreaList", 412, 160, "Search farm area...")
+        local afkEggList, afkEggSearch, afkEggLayout =
+            makePickerList("AfkEggList", 470, 180, "Search hatch egg...")
+
+        afkAreaSelect.MouseButton1Click:Connect(function()
+            afkEggList.Visible = false
+            if afkAreaList.Visible then
+                afkAreaList.Visible = false
+            else
+                renderPicker(
+                    afkAreaList, afkAreaSearch, afkAreaLayout,
+                    sortedKeys(Library.Directory.Areas),
+                    function(optionName)
+                        AfkFarmArea = optionName
+                        afkAreaSelect.Text = "Farm area: " .. optionName
+                        SetSetting("afkFarmArea", optionName)
+                        saveSettings()
+                    end
+                )
+                afkAreaList.Visible = true
+            end
+        end)
+
+        afkEggSelect.MouseButton1Click:Connect(function()
+            afkAreaList.Visible = false
+            if afkEggList.Visible then
+                afkEggList.Visible = false
+            else
+                renderPicker(
+                    afkEggList, afkEggSearch, afkEggLayout,
+                    sortedKeys(Library.Directory.Eggs, function(_, def)
+                        return type(def) == "table" and def.hatchable == true
+                    end),
+                    function(optionName)
+                        AfkFarmEgg = optionName
+                        afkEggSelect.Text = "Hatch egg: " .. optionName
+                        SetSetting("afkFarmEgg", optionName)
+                        saveSettings()
+                    end
+                )
+                afkEggList.Visible = true
+            end
+        end)
+
+        afkAreaSearch:GetPropertyChangedSignal("Text"):Connect(function()
+            if afkAreaList.Visible then
+                renderPicker(
+                    afkAreaList, afkAreaSearch, afkAreaLayout,
+                    sortedKeys(Library.Directory.Areas),
+                    function(optionName)
+                        AfkFarmArea = optionName
+                        afkAreaSelect.Text = "Farm area: " .. optionName
+                        SetSetting("afkFarmArea", optionName)
+                        saveSettings()
+                    end
+                )
+            end
+        end)
+
+        afkEggSearch:GetPropertyChangedSignal("Text"):Connect(function()
+            if afkEggList.Visible then
+                renderPicker(
+                    afkEggList, afkEggSearch, afkEggLayout,
+                    sortedKeys(Library.Directory.Eggs, function(_, def)
+                        return type(def) == "table" and def.hatchable == true
+                    end),
+                    function(optionName)
+                        AfkFarmEgg = optionName
+                        afkEggSelect.Text = "Hatch egg: " .. optionName
+                        SetSetting("afkFarmEgg", optionName)
+                        saveSettings()
+                    end
+                )
+            end
+        end)
+
+        -- Restore the saved picks so a rejoin keeps the same playtime setup.
+        local savedAfkArea = GetSetting("afkFarmArea")
+        if type(savedAfkArea) == "string" and savedAfkArea ~= "" then
+            AfkFarmArea = savedAfkArea
+            afkAreaSelect.Text = "Farm area: " .. savedAfkArea
+        end
+        local savedAfkEgg = GetSetting("afkFarmEgg")
+        if type(savedAfkEgg) == "string" and savedAfkEgg ~= "" then
+            AfkFarmEgg = savedAfkEgg
+            afkEggSelect.Text = "Hatch egg: " .. savedAfkEgg
+        end
+
+        local afkPickHint = Instance.new("TextLabel")
+        afkPickHint.Size = UDim2.new(1, 0, 0, 32)
+        afkPickHint.Position = UDim2.new(0, 0, 0, 494)
+        afkPickHint.BackgroundTransparency = 1
+        afkPickHint.Text = "While a Playtime quest is active the script parks in the chosen area, runs Auto Farm there and hatches the chosen egg. When both are set the egg decides the spot (its area is farmed); pick only an area to farm it without hatching."
+        afkPickHint.TextColor3 = Color3.fromRGB(180, 190, 205)
+        afkPickHint.Font = Enum.Font.Gotham
+        afkPickHint.TextSize = 11
+        afkPickHint.TextWrapped = true
+        afkPickHint.TextXAlignment = Enum.TextXAlignment.Left
+        afkPickHint.TextYAlignment = Enum.TextYAlignment.Top
+        afkPickHint.Parent = TAB_TOTAL.afkFrame
+    end)()
+
     do
         local afkStatus = Instance.new("TextLabel")
         afkStatus.Size = UDim2.new(1, 0, 0, 150)
-        afkStatus.Position = UDim2.new(0, 0, 0, 352)
+        afkStatus.Position = UDim2.new(0, 0, 0, 532)
         afkStatus.BackgroundTransparency = 1
         afkStatus.Text = ""
         afkStatus.TextColor3 = Color3.fromRGB(200, 200, 210)
@@ -5010,12 +5375,18 @@ end
             if type(value) ~= "string" then return nil end
             local text = trim(value):lower()
             if text == "" then return nil end
-            local numerator, denominator = text:match("(%d+)%s*/%s*(%d+)")
+            local numerator, denominator = text:match("(%d+)%s*/%s*([%d%,%s]+)")
             if numerator and denominator then
-                return tonumber(numerator) / tonumber(denominator)
+                denominator = tonumber((denominator:gsub("[%,%s]", "")))
+                if denominator and denominator > 0 then return tonumber(numerator) / denominator end
             end
-            local inValue = text:match("(%d+)%s*in%s*%d+")
-            if inValue then return tonumber(inValue) end
+            -- BUGFIX: "1 in 50000" used to return 1 (treated as 1%). It is an
+            -- odds statement, so the chance in percent is 100 / denominator.
+            local inNumerator, inDenominator = text:match("(%d+)%s*in%s*([%d%,%s]+)")
+            if inNumerator and inDenominator then
+                inDenominator = tonumber((inDenominator:gsub("[%,%s]", "")))
+                if inDenominator and inDenominator > 0 then return 100 * tonumber(inNumerator) / inDenominator end
+            end
             local percent = text:match("(%d+%.?%d*)%%")
             if percent then return tonumber(percent) / 100 end
             return tonumber(text)
@@ -5087,6 +5458,27 @@ end
                 end
             end
 
+            -- BUGFIX (chance accuracy): the fallback tables store either raw
+            -- weights (25000/5000/1), probability fractions (0.001) or real
+            -- percents. formatOdds expects percent, so normalize here:
+            --   all values in (0, 1]        -> fractions, scale by 100
+            --   all values > 1 and integral -> weights, split by total
+            local allFraction, allWeight = #results > 0, #results > 0
+            for _, entry in ipairs(results) do
+                local chance = entry.Chance
+                if not (chance > 0 and chance <= 1) then allFraction = false end
+                if not (chance > 1 and chance % 1 == 0) then allWeight = false end
+            end
+            if allFraction then
+                for _, entry in ipairs(results) do entry.Chance = entry.Chance * 100 end
+            elseif allWeight then
+                local totalWeight = 0
+                for _, entry in ipairs(results) do totalWeight += entry.Chance end
+                if totalWeight > 0 then
+                    for _, entry in ipairs(results) do entry.Chance = entry.Chance / totalWeight * 100 end
+                end
+            end
+
             local seen, deduplicated = {}, {}
             for _, entry in ipairs(results) do
                 if entry.Name ~= "" and not seen[entry.Name] then
@@ -5120,9 +5512,11 @@ end
         local function classifyPet(petInfo)
             if type(petInfo) ~= "table" then return nil end
             local rarity = tostring(petInfo.rarity or petInfo.Rarity or ""):lower()
-            if petInfo.gargantuan then return "Gargantuan" end
-            if petInfo.titanic then return "Titanic" end
-            if petInfo.huge or petInfo.gargantuan then return "Huge" end
+            if petInfo.gargantuan or rarity:find("gargantuan", 1, true) then return "Gargantuan" end
+            if petInfo.titanic or rarity:find("titanic", 1, true) then return "Titanic" end
+            -- BUGFIX (from v3): "petInfo.huge or petInfo.gargantuan" never
+            -- reached the Huge branch because gargantuan returned earlier.
+            if petInfo.huge or rarity:find("huge", 1, true) then return "Huge" end
             if rarity:find("secret", 1, true) then return "Secret" end
             return nil
         end
@@ -5151,6 +5545,11 @@ end
 
             -- BUGFIX (from v3): egg.drops may be a STRING chaining to another
             -- egg's drop list, not a table. resolveEggDrops follows the chain.
+            --
+            -- BUGFIX (chance accuracy): drop[2] is a raw WEIGHT, not a percent.
+            -- Showing it directly produced nonsense like "25000%" / "1/1".
+            -- Weights are normalized against the egg's total weight so the
+            -- displayed odds always sum to a real 100% split.
             for eggName, egg in pairs(directory.Eggs) do
                 if type(egg) == "table" and egg.currency and egg.hatchable ~= false then
                     local drops = resolveEggDrops(directory.Eggs, egg)
@@ -5158,14 +5557,45 @@ end
                         local label = tostring(egg.displayName or egg._id or eggName)
                         local lowerLabel = label:lower()
                         if not egg.isExclusive and not egg.isGift and not egg.isPremium and not lowerLabel:find("exclusive", 1, true) then
+                            -- GetProbabilityMap can't be trusted blindly: its
+                            -- values may be fractions (0.0001), "1 in N" odds
+                            -- (10000) or percents, and guessing the unit wrong
+                            -- skews every row by 100x. Weights from the
+                            -- directory are deterministic, so they are the
+                            -- source of truth; the map is only consulted for
+                            -- pets whose weight is missing or zero.
                             local probabilityMap = probabilityGetter(eggName)
-                            local pets = {}
+                            local mappedFraction = {}
+                            if type(probabilityMap) == "table" then
+                                for petId, value in pairs(probabilityMap) do
+                                    local number = tonumber(value)
+                                    if number and number > 0 and number <= 1 then
+                                        mappedFraction[petId] = number
+                                    end
+                                end
+                            end
+
+                            local totalWeight = 0
                             for _, drop in ipairs(drops) do
                                 if type(drop) == "table" and type(drop[1]) == "string" and tonumber(drop[2]) then
-                                    local chance = tonumber(drop[2])
-                                    local mapped = type(probabilityMap) == "table" and tonumber(probabilityMap[drop[1]])
-                                    if mapped then chance = mapped * 100 end
-                                    table.insert(pets, { Name = drop[1], Chance = chance, Category = classifyPet(directory.Pets[drop[1]]) })
+                                    totalWeight += tonumber(drop[2])
+                                end
+                            end
+
+                            local pets = {}
+                            for _, drop in ipairs(drops) do
+                                if type(drop) == "table" and type(drop[1]) == "string" then
+                                    local weight = tonumber(drop[2])
+                                    local chance
+                                    if weight and weight > 0 and totalWeight > 0 then
+                                        chance = weight / totalWeight * 100
+                                    else
+                                        local fraction = mappedFraction[drop[1]]
+                                        if fraction then chance = fraction * 100 end
+                                    end
+                                    if chance and chance > 0 then
+                                        table.insert(pets, { Name = drop[1], Chance = chance, Category = classifyPet(directory.Pets[drop[1]]) })
+                                    end
                                 end
                             end
                             if #pets > 0 then table.insert(liveEggs, { Name = label, Pets = pets }) end
@@ -5961,11 +6391,6 @@ end
             end
         end)
     end
-
-    -- Forward-declare the hatch setter before connecting the UI callback.
-    -- Without this, the earlier callback resolves setAutoHatchState as a
-    -- global (nil), because the local function is defined later in the file.
-    local setAutoHatchState
 
     -- CONTROL SECTION --------------------------------------------------------
     local controlPanel = Instance.new("Frame")
@@ -7932,7 +8357,18 @@ end
 -- The map keeps every egg capsule under Workspace.__MAP.Eggs.<area>.Eggs as a
 -- "Egg Capsule" model with an `ID` attribute that already matches the
 -- directory egg id, so the closest egg can be picked without any name games.
-local function findClosestEggId()
+local function eggCostsDiamonds(eggId)
+    local def = eggId and Library.Directory.Eggs and Library.Directory.Eggs[eggId]
+    return type(def) == "table" and tostring(def.currency) == "Diamonds"
+end
+
+local function selectedQuestDiamondEgg(eggId)
+    -- Quest automation may spend Diamonds only on an egg the user explicitly
+    -- chose in one of the egg dropdowns.
+    return eggId ~= nil and (eggId == AfkFarmEgg or eggId == AutoFarmTabTargetEgg)
+end
+
+local function findClosestEggId(allowDiamonds)
     local character = localPlayer.Character
     local hrp = character and character:FindFirstChild("HumanoidRootPart")
     if not hrp then return nil end
@@ -7946,7 +8382,7 @@ local function findClosestEggId()
         if model:IsA("Model") and model.Name == "Egg Capsule" then
             local id = model:GetAttribute("ID")
             local part = model.PrimaryPart or model:FindFirstChildWhichIsA("BasePart")
-            if id and part then
+            if id and part and (allowDiamonds ~= false or not eggCostsDiamonds(tostring(id))) then
                 local distance = (hrp.Position - part.Position).Magnitude
                 if distance < bestDistance then
                     bestDistance = distance
@@ -7979,16 +8415,27 @@ local function eggCapsuleExists(eggId)
 end
 
 local function currentHatchEggId()
+    local questMode = AutoQuests or AutoQuestsSide
     local target = QuestTargetEggId
-    if target and eggCapsuleExists(target) then
+    if target and (not questMode or not eggCostsDiamonds(target) or selectedQuestDiamondEgg(target))
+        and eggCapsuleExists(target) then
         return target
     end
-    -- The Auto Farm tab's chosen egg wins when it is in the current map and
-    -- its capsule is actually present, so hatching happens at the right zone.
-    if type(AutoFarmTabTargetEgg) == "string" and eggCapsuleExists(AutoFarmTabTargetEgg) then
+    -- Playtime AFK's dropdown is an explicit user selection, so a Diamond egg
+    -- selected there is allowed even while quest automation owns auto-hatch.
+    if QuestPlaytimeActive and AfkFarmEgg and Library.Directory.Eggs[AfkFarmEgg]
+        and (not questMode or not eggCostsDiamonds(AfkFarmEgg) or selectedQuestDiamondEgg(AfkFarmEgg)) then
+        return AfkFarmEgg
+    end
+    -- Auto Farm tab dropdown is also an explicit selection.
+    if type(AutoFarmTabTargetEgg) == "string" and Library.Directory.Eggs[AutoFarmTabTargetEgg]
+        and (not questMode or not eggCostsDiamonds(AutoFarmTabTargetEgg) or selectedQuestDiamondEgg(AutoFarmTabTargetEgg))
+        and eggCapsuleExists(AutoFarmTabTargetEgg) then
         return AutoFarmTabTargetEgg
     end
-    return findClosestEggId()
+    -- Quest-driven hatch must never silently spend Diamonds on the nearest
+    -- capsule. Standalone Auto Hatch intentionally supports Diamond eggs.
+    return findClosestEggId(not questMode)
 end
 
 local function hatchViaBuyX()
@@ -8070,7 +8517,14 @@ task.spawn(function()
                 ownsPassRefreshAt = os.clock() + 10
             end
 
-            if ownsPassCached then
+            local selectedEgg = currentHatchEggId()
+            local diamondEgg = selectedEgg and eggCostsDiamonds(selectedEgg)
+            if diamondEgg then
+                -- Keep the built-in engine from competing with the explicit
+                -- BuyX request for premium-currency eggs.
+                pcall(function() Library.Variables.AutoHatchEnabled = false end)
+            end
+            if ownsPassCached and not diamondEgg then
                 HatchWatchdogStatus = "auto hatch running (engine)"
                 task.wait(1)
             else
@@ -8879,12 +9333,14 @@ end
                 return
             end
 
-            -- 2. Force a clean capture of the selected area. The engine only
-            --    re-captures after a world change, so flip AutoFarm off for a
-            --    beat (clears its cached AutoFarmArea), let it settle, then on
-            --    again - it re-captures from wherever the player is standing,
-            --    which the teleport just parked at the area center.
-            task.wait(1.0)
+            -- 2. Let the character and area finish loading before Auto Farm
+            --    captures its area. The player is still at the area's centre.
+            setAfStatus("Settling in " .. area .. " (3 seconds)...", AF_ACCENT)
+            task.wait(3)
+            if not afRunning or not AutoFarmTabActive then return end
+
+            -- Force a clean capture of the selected area, then enable the
+            -- game's Auto Farm from the centre of that area.
             setAfStatus("Enabling Auto Farm in " .. area .. "...", AF_ACCENT)
             if type(questSetGameAutoFarm) == "function" then
                 pcall(questSetGameAutoFarm, false)
@@ -8894,6 +9350,12 @@ end
             if not farmOk then
                 setAfStatus("Could not enable Auto Farm.", AF_WARN)
             end
+
+            -- Keep the player at the area centre for a few seconds after
+            -- Auto Farm is enabled so its capture/engine can initialize.
+            setAfStatus("Auto Farm starting in " .. area .. " (3 seconds)...", AF_ACCENT)
+            task.wait(3)
+            if not afRunning or not AutoFarmTabActive then return end
 
             -- 3. Target the chosen egg for auto-hatch.
             if egg then
@@ -9700,15 +10162,14 @@ do
             FreeBkPros = true,
             Zephyrr = true,
             PetsGOModder = true,
-            TheRobot = true,
-            Farmer = true,
-            DeadpoolHalloween = true,
         }
-        -- save.Questline track keys, in the order the driver prefers to start a
-        -- fresh line. "main" is the shared FreeBkPros/Zephyrr/PetsGOModder line
-        -- and lives at the tree root, the rest under .tracks.
-        local MAIN_QUEST_TRACKS = { "main", "TheRobot", "Farmer", "DeadpoolHalloween" }
-        local SIDE_QUEST_TRACKS = { "LuckyBK", "RainyFarmer", "ArcadeRobot" }
+        -- Only the three NPCs the player asked for are worked: BK (FreeBkPros),
+        -- PetsGOModder and Zephyrr. Every one of their quests lives on the single
+        -- shared root "main" line in save.Questline, so there is exactly one
+        -- track to drive. The Robot / Farmer / Deadpool and the event lines
+        -- (Lucky BK, Old Feller, Arcade Robot) are deliberately left alone.
+        local MAIN_QUEST_TRACKS = { "main" }
+        local SIDE_QUEST_TRACKS = {}
 
         -- Build the text -> stat lookup from the LIVE quest state, which already
         -- carries the true `stat` field on every objective. This is primary
@@ -9846,11 +10307,14 @@ do
                 if type(cfg) == "table" then
                     local cfgTrack = cfg.track ~= nil and tostring(cfg.track) or nil
                     if track == "main" then
-                        -- The shared root line is exactly the quests with no
-                        -- `track` field of their own (FreeBkPros/Zephyrr/
-                        -- PetsGOModder), which is what save.Questline.claimed
-                        -- counts.
-                        if cfgTrack == nil then total = total + 1 end
+                        -- The shared root line holds FreeBkPros/Zephyrr/
+                        -- PetsGOModder quests (save.Questline.claimed counts
+                        -- them). Scope the total to exactly those three NPCs so
+                        -- a stray root quest from another NPC cannot stop the
+                        -- line from ever reading as done.
+                        if cfgTrack == nil and MAIN_QUEST_NPCS[tostring(cfg.npc)] then
+                            total = total + 1
+                        end
                     elseif cfgTrack == track or tostring(cfg.npc) == track then
                         total = total + 1
                     end
@@ -9894,7 +10358,12 @@ do
                 else
                     AutoBuying = true
                 end
-            elseif kind == "gameAutoFarm" and not QuestOwnedAutoFarm then
+            elseif kind == "gameAutoFarm" then
+                -- Re-raise "wanted" on every acquire, not just the first one.
+                -- applyObjective resets QuestAreaFarmWanted at the top of every
+                -- driver pass (~every 3s), so the old "only when not owned" guard
+                -- left the farm switching itself back off mid-objective once the
+                -- flag was cleared but ownership was still set.
                 questOwned.gameAutoFarm = true
                 QuestOwnedAutoFarm = true
                 QuestAreaFarmWanted = true
@@ -9914,7 +10383,17 @@ do
         end
 
         local function questReleaseAll()
-            if questOwned.hatch and type(setAutoHatchState) == "function" then
+            if not AutoQuests and not AutoQuestsSide then
+                if type(setAutoHatchState) == "function" then
+                    pcall(setAutoHatchState, false)
+                else
+                    AutoBuying = false
+                    pcall(function()
+                        Library.Variables.AutoHatchEggId = nil
+                        Library.Variables.AutoHatchEnabled = false
+                    end)
+                end
+            elseif questOwned.hatch and type(setAutoHatchState) == "function" then
                 pcall(setAutoHatchState, false)
             end
             if questOwned.potionUse then AutoPotionUse = false end
@@ -9938,6 +10417,7 @@ do
         -- so the player is parked once at the area centre and the game's
         -- engine does the walking.
         local function applyObjective(stat)
+            local wasPlaytimeActive = QuestPlaytimeActive
             QuestCoinFilter = nil
             QuestFarmActive = false
             QuestAreaFarmWanted = false
@@ -9945,7 +10425,12 @@ do
             QuestHatchAnywhere = false
             QuestTargetEggId = nil
             QuestTargetEggLabel = nil
+            QuestPlaytimeActive = false
 
+            if stat ~= "PlaytimeSeconds" then
+                QuestPlaytimeFarmReady = false
+                QuestPlaytimeFarmTarget = nil
+            end
             if not stat then return "objective has no stat" end
 
             -- Breakables ---------------------------------------------------
@@ -10095,7 +10580,55 @@ do
                 return "farming for " .. stat
             end
             if stat == "PlaytimeSeconds" then
-                return "waiting (playtime)"
+                -- The clock just ticks, so put the wait to work: farm the AFK
+                -- area the user picked and/or hatch the egg they picked until
+                -- the objective completes. With neither picked it stays a
+                -- plain wait, which is the old behaviour.
+                --
+                -- The selected AFK farm area takes priority. If no area was
+                -- selected, fall back to the chosen egg's area. The startup
+                -- sequence always captures Auto Farm at the area centre first,
+                -- then moves to the egg capsule for hatching.
+                local eggDef = AfkFarmEgg and Library.Directory.Eggs[AfkFarmEgg] or nil
+                local eggArea = type(eggDef) == "table" and eggDef.area or nil
+
+                if AfkFarmEgg then
+                    questAcquire("hatch")
+                    QuestTargetEggId = AfkFarmEgg
+                    QuestTargetEggLabel = AfkFarmEgg
+                end
+
+                -- Use the user's selected farm area first. When none was
+                -- selected, use the chosen egg's area if it is a real
+                -- Directory.Areas entry; unusual egg/world labels are ignored.
+                local farmArea = AfkFarmArea
+                if not farmArea and AfkFarmEgg
+                    and eggArea and Library.Directory.Areas[eggArea] ~= nil then
+                    farmArea = eggArea
+                end
+
+                -- Farm only when there is something to farm: a picked area or a
+                -- picked egg. With neither, the objective degrades to the old
+                -- plain wait instead of farming wherever the player stands.
+                if farmArea or AfkFarmEgg then
+                    questAcquire("gameAutoFarm")
+                    QuestAreaFarmTarget = farmArea
+                end
+
+                -- Reset the staged startup only when entering a new playtime
+                -- objective or changing its selected farm area. Repeated quest
+                -- driver passes must not restart the waits.
+                if not wasPlaytimeActive or QuestPlaytimeFarmTarget ~= farmArea then
+                    QuestPlaytimeFarmReady = false
+                    QuestPlaytimeFarmTarget = farmArea
+                end
+                QuestPlaytimeActive = true
+
+                local bits = {}
+                if farmArea then bits[#bits + 1] = "farming " .. farmArea end
+                if AfkFarmEgg then bits[#bits + 1] = "hatching " .. AfkFarmEgg end
+                return #bits > 0 and ("playtime: " .. table.concat(bits, " + "))
+                    or "waiting (playtime)"
             end
 
             return "unsupported: " .. stat
@@ -10105,7 +10638,7 @@ do
                 -- Release everything when neither quest toggle is on.
                 if not AutoQuests and not AutoQuestsSide then
                     if QuestFarmActive or QuestCoinFilter or QuestTargetEggId
-                        or QuestAreaFarmWanted or QuestHatchAnywhere then
+                        or QuestAreaFarmWanted or QuestHatchAnywhere or QuestPlaytimeActive then
                         questReleaseAll()
                         QuestCoinFilter = nil
                         QuestFarmActive = false
@@ -10114,6 +10647,9 @@ do
                         QuestHatchAnywhere = false
                         QuestTargetEggId = nil
                         QuestTargetEggLabel = nil
+                        QuestPlaytimeActive = false
+                        QuestPlaytimeFarmReady = false
+                        QuestPlaytimeFarmTarget = nil
                     end
                     AfkQuestStatus = "Idle"
                     AfkSideQuestStatus = "Idle"
@@ -10238,10 +10774,10 @@ do
 
                                 -- Steer movement for area-bound objectives.
                                 if QuestAreaFarmWanted then
-                                    -- Breakable objective: park at the area
-                                    -- centre once and let the game's own Auto
-                                    -- Farm (manager loop above) walk the pets
-                                    -- over everything in range. The hub's
+                                    -- Breakable/playtime objective: park inside
+                                    -- the objective's own area and let the game's
+                                    -- own Auto Farm (manager loop above) walk the
+                                    -- pets over everything in range. The hub's
                                     -- per-coin teleport farm is NOT used here.
                                     local root = getPlayerRoot()
 
@@ -10256,14 +10792,98 @@ do
                                         end
                                     end
 
-                                    local area = richestAreaForFilter(QuestCoinFilter or {})
-                                    if root and area then
-                                        local centre = sharedGetAreaCenter and sharedGetAreaCenter(area) or nil
-                                        if centre and (root.Position - centre).Magnitude > 25 then
-                                            steerToArea(area)
+                                    -- Park target: the objective's own area when
+                                    -- it named a real one (playtime area pick,
+                                    -- WorldBreakables area), otherwise the
+                                    -- richest area that holds a matching
+                                    -- breakable. The old code ignored
+                                    -- QuestAreaFarmTarget here, so a playtime
+                                    -- area pick was never actually steered to.
+                                    local parkArea = QuestAreaFarmTarget
+                                    if not parkArea or Library.WorldCmds.HasArea(parkArea) == false then
+                                        parkArea = richestAreaForFilter(QuestCoinFilter or {})
+                                    end
+
+                                    if QuestPlaytimeActive then
+                                        -- Playtime with an AFK egg must start at
+                                        -- the centre of the selected farm area.
+                                        -- Let the world settle there before
+                                        -- enabling Auto Farm, then give its
+                                        -- capture a few seconds before moving to
+                                        -- the egg capsule for hatching.
+                                        -- Only park at the area centre during startup.
+                                        -- Once the farm has been enabled and the player
+                                        -- has moved to the egg, never steer back to the
+                                        -- centre on subsequent quest-driver passes.
+                                        if not QuestPlaytimeFarmReady and parkArea then
+                                            local centre = sharedGetAreaCenter and sharedGetAreaCenter(parkArea) or nil
+                                            if root and centre and (root.Position - centre).Magnitude > 25 then
+                                                steerToArea(parkArea)
+                                                task.wait(0.5)
+                                                root = getPlayerRoot()
+                                            elseif not root then
+                                                steerToArea(parkArea)
+                                                task.wait(0.5)
+                                                root = getPlayerRoot()
+                                            end
                                         end
-                                    elseif root == nil or area ~= nil then
-                                        steerToArea(area)
+
+                                        if not QuestPlaytimeFarmReady then
+                                            task.wait(3)
+                                            if QuestPlaytimeActive and (AutoQuests or AutoQuestsSide) then
+                                                -- Clear any stale capture first so
+                                                -- Auto Farm records this area centre.
+                                                questSetGameAutoFarm(false)
+                                                task.wait(0.6)
+                                                questSetGameAutoFarm(true)
+                                                task.wait(3)
+                                                if QuestPlaytimeActive and (AutoQuests or AutoQuestsSide) then
+                                                    QuestPlaytimeFarmReady = true
+                                                end
+                                            end
+                                        end
+
+                                        if QuestPlaytimeFarmReady and QuestTargetEggId then
+                                            local capsule = questFindEggCapsule(QuestTargetEggId)
+                                            local part = capsule
+                                                and (capsule.PrimaryPart or capsule:FindFirstChildWhichIsA("BasePart"))
+                                            if part and root then
+                                                if (root.Position - part.Position).Magnitude > 15 then
+                                                    pcall(function()
+                                                        root.CFrame = CFrame.new(part.Position + Vector3.new(0, 5, 0))
+                                                    end)
+                                                    task.wait(0.5)
+                                                end
+                                            -- If the capsule is not currently streamed in,
+                                            -- stay where we are; do not bounce back to the
+                                            -- farm centre. The next pass will retry the egg.
+                                            end
+                                        end
+                                    elseif QuestTargetEggId then
+                                        -- Non-playtime egg objectives still go
+                                        -- directly to their capsule.
+                                        local capsule = questFindEggCapsule(QuestTargetEggId)
+                                        local part = capsule
+                                            and (capsule.PrimaryPart or capsule:FindFirstChildWhichIsA("BasePart"))
+                                        if part and root then
+                                            if (root.Position - part.Position).Magnitude > 15 then
+                                                pcall(function()
+                                                    root.CFrame = CFrame.new(part.Position + Vector3.new(0, 5, 0))
+                                                end)
+                                                task.wait(0.5)
+                                            end
+                                        elseif parkArea then
+                                            steerToArea(parkArea)
+                                        end
+                                    elseif parkArea then
+                                        if root then
+                                            local centre = sharedGetAreaCenter and sharedGetAreaCenter(parkArea) or nil
+                                            if centre and (root.Position - centre).Magnitude > 25 then
+                                                steerToArea(parkArea)
+                                            end
+                                        else
+                                            steerToArea(parkArea)
+                                        end
                                     end
                                 elseif QuestCoinFilter then
                                     -- Kind/name-restricted breakables (chests
@@ -11801,6 +12421,7 @@ registerCleanup(function()
     QuestHatchAnywhere = false
     QuestTargetEggId = nil
     QuestTargetEggLabel = nil
+    QuestPlaytimeActive = false
     QuestOwnedAutoFarm = false
     AutoFarmTabActive = false
     AutoFarmTabTargetEgg = nil
@@ -11849,8 +12470,7 @@ end
 return {
     cleanup = runCleanup,
     isLoaded = function() return isExecutorLoaded end,
-    executorType = executorType,
+    executorType = executorTypae,
 }
-
 
 
