@@ -1,7 +1,7 @@
 -- =====================================================================
 -- COMBINED AUTOMATION SCRIPT: UNIFIED UI + FIXED AUTO TOKENS + PET TRACKER
 -- HATCH LOGIC + EGG CHANCE VIEWER + AUTO FARM & PET TRACKER
--- REAL EXECUTOR OPTIMIZED VERSION
+-- EXECUTOR-NEUTRAL VERSION
 -- =====================================================================
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -15,8 +15,156 @@ local VirtualInputManager = game:GetService("VirtualInputManager")
 local localPlayer = Players.LocalPlayer
 local playerGui = localPlayer:WaitForChild("PlayerGui")
 
+-- ------------------------------------------------------------------
+-- Cross-executor compatibility shims.
+-- Every executor exposes task.* or the classic Roblox spawn/wait globals;
+-- use a single local wrapper so no feature dies on a missing field.
+-- ------------------------------------------------------------------
+local TaskLib = type(task) == "table" and task or {}
+local taskSpawn = type(TaskLib.spawn) == "function" and TaskLib.spawn or spawn
+local taskWait = type(TaskLib.wait) == "function" and TaskLib.wait or wait
+local taskDelay = type(TaskLib.delay) == "function" and TaskLib.delay or delay
+local defer = type(TaskLib.defer) == "function" and TaskLib.defer or taskSpawn
+local taskCancel = type(TaskLib.cancel) == "function" and TaskLib.cancel or function() end
+
+-- A few Luau library helpers are missing on older/Lua 5.1-style executors.
+if type(math.clamp) ~= "function" then
+    math.clamp = function(value, minValue, maxValue)
+        if value < minValue then return minValue end
+        if value > maxValue then return maxValue end
+        return value
+    end
+end
+if type(table.find) ~= "function" then
+    table.find = function(haystack, needle, init)
+        local startIndex = tonumber(init) or 1
+        if startIndex < 1 then startIndex = 1 end
+        for index = startIndex, #haystack do
+            if haystack[index] == needle then return index end
+        end
+        return nil
+    end
+end
+
+-- Safely obtain an executor environment when one exists, otherwise use the
+-- ordinary Lua environment. This avoids assuming a particular executor API.
+local function getExecutorEnv()
+    if type(getgenv) == "function" then
+        local ok, env = pcall(getgenv)
+        if ok and type(env) == "table" then
+            return env
+        end
+    end
+    return _G
+end
+
+-- ------------------------------------------------------------------
+-- Touch simulation helper.
+-- Executors disagree about firetouchinterest's argument order, and some
+-- remove it entirely. Prefer firing the game's Touched handlers directly,
+-- then try both firetouchinterest orders, then a TouchInterest object and
+-- finally ProximityPrompt. An optional verify callback stops after the first
+-- method that actually advances the game state, avoiding double triggers.
+-- ------------------------------------------------------------------
+local function findTouchInterestObject(part)
+    if not part or type(part.GetDescendants) ~= "function" then return nil end
+    for _, child in ipairs(part:GetDescendants()) do
+        local className = child.ClassName
+        if className == "TouchInterest" or className == "TouchTransmitter" then
+            return child
+        end
+    end
+    return nil
+end
+
+local function connectionHandler(connection)
+    if type(connection) ~= "table" and type(connection) ~= "userdata" then return nil end
+    if connection.Enabled == false then return nil end
+    if type(connection.Function) == "function" then
+        return connection.Function
+    end
+    if type(connection.Fire) == "function" then
+        return function(...)
+            return connection.Fire(connection, ...)
+        end
+    end
+    return nil
+end
+
+local function fireTouchSafe(otherPart, targetPart, verify)
+    if not otherPart or not targetPart or not targetPart.Parent then return false end
+
+    local function verified()
+        return type(verify) == "function" and verify() == true
+    end
+
+    if verified() then return true end
+
+    -- 1. Direct Touched handlers (works even when firetouchinterest is patched).
+    if type(getconnections) == "function" then
+        local ok, connections = pcall(getconnections, targetPart.Touched)
+        if ok and type(connections) == "table" then
+            for _, connection in ipairs(connections) do
+                local handler = connectionHandler(connection)
+                if handler then
+                    pcall(handler, otherPart)
+                end
+            end
+            taskWait(0.05)
+            if verified() then return true end
+        end
+    end
+
+    -- 2. Executor firetouchinterest, common order then reversed order.
+    local env = getExecutorEnv()
+    local fire = (type(firetouchinterest) == "function" and firetouchinterest)
+        or (type(env) == "table" and type(env.firetouchinterest) == "function" and env.firetouchinterest)
+        or (type(syn) == "table" and type(syn.firetouchinterest) == "function" and syn.firetouchinterest)
+        or nil
+
+    local interestObject = findTouchInterestObject(targetPart)
+    local targets = { targetPart }
+    if interestObject and interestObject ~= targetPart then
+        targets[#targets + 1] = interestObject
+    end
+
+    if fire then
+        for _, target in ipairs(targets) do
+            pcall(fire, otherPart, target, 0)
+            pcall(fire, otherPart, target, 1)
+            taskWait(0.05)
+            if verified() then return true end
+
+            -- Some executors use the opposite argument order.
+            pcall(fire, target, otherPart, 0)
+            pcall(fire, target, otherPart, 1)
+            taskWait(0.05)
+            if verified() then return true end
+        end
+    end
+
+    -- 3. ProximityPrompt fallback for games that replaced touch with prompts.
+    if type(fireproximityprompt) == "function" then
+        for _, child in ipairs(targetPart:GetDescendants()) do
+            if child:IsA("ProximityPrompt") then
+                pcall(fireproximityprompt, child)
+                taskWait(0.05)
+                if verified() then return true end
+                break
+            end
+        end
+        if targetPart:IsA("ProximityPrompt") then
+            pcall(fireproximityprompt, targetPart)
+            taskWait(0.05)
+            if verified() then return true end
+        end
+    end
+
+    return false
+end
+
 -- =====================================================================
--- REAL EXECUTOR COMPATIBILITY & SAFETY FEATURES
+-- EXECUTOR COMPATIBILITY & SAFETY FEATURES
 -- =====================================================================
 local isExecutorLoaded = false
 local scriptCleanupHandlers = {}
@@ -36,7 +184,7 @@ local function runCleanup()
     scriptCleanupHandlers = {}
 end
 
--- Signal for script unload (Real executor compatibility)
+-- Signal for script unload (executor compatibility)
 -- BindToClose only exists on the server; calling it from a client script throws
 -- and would kill the whole script before the UI is ever built.
 pcall(function()
@@ -176,7 +324,7 @@ local function saveSettings()
     if type(writefile) ~= "function" then return end
     if savePending then return end
     savePending = true
-    task.defer(function()
+    defer(function()
         savePending = false
         pcall(function()
             writefile(SettingsFile, HttpService:JSONEncode({
@@ -197,6 +345,20 @@ while not Library.Loaded do
     RunService.Heartbeat:Wait()
 end
 
+-- Directory keys are not consistent: some eggs are keyed by string id, others
+-- by numeric id. Resolve both forms so premium/special eggs are detected.
+local function eggDefForId(eggId)
+    if eggId == nil then return nil end
+    local eggs = Library.Directory and Library.Directory.Eggs
+    if type(eggs) ~= "table" then return nil end
+    local def = eggs[eggId] or eggs[tostring(eggId)]
+    if not def then
+        local numericId = tonumber(eggId)
+        if numericId then def = eggs[numericId] end
+    end
+    return def
+end
+
 -- ---------------------------------------------------------------------
 -- Raw remote access
 --
@@ -208,7 +370,8 @@ end
 local RawNet = {}
 
 do
-    local getup = (type(getgenv) == "function" and type(getgenv().getupvalues) == "function" and getgenv().getupvalues)
+    local env = getExecutorEnv()
+    local getup = (type(env) == "table" and type(env.getupvalues) == "function" and env.getupvalues)
         or (type(getupvalues) == "function" and getupvalues)
         or nil
 
@@ -278,8 +441,22 @@ do
                 if not remote then return false, "remote unavailable" end
                 return pcall(remote.FireServer, remote, ...)
             end
+        else
+            -- Always leave callable wrappers behind. Without this, executors
+            -- whose getupvalues is missing turn every remote call into
+            -- "attempt to call a nil value" instead of a clean no-op.
+            RawNet.invoke = function() return false, "network unavailable" end
+            RawNet.fire = function() return false, "network unavailable" end
         end
     end
+end
+
+-- Final guard: also covers executors without any getupvalues-style API.
+if type(RawNet.invoke) ~= "function" then
+    RawNet.invoke = function() return false, "network unavailable" end
+end
+if type(RawNet.fire) ~= "function" then
+    RawNet.fire = function() return false, "network unavailable" end
 end
 
 -- BUGFIX (from v3): egg.drops may be a STRING chaining to another egg's
@@ -290,7 +467,7 @@ local function resolveEggDrops(eggDirectory, egg)
     local drops = egg.drops
     local seen, guard = {}, 0
     while type(drops) == "string" and guard < 10 do
-        guard += 1
+        guard = guard + 1
         if seen[drops] then return nil end
         seen[drops] = true
         local nextEgg = type(eggDirectory) == "table" and eggDirectory[drops] or nil
@@ -400,7 +577,7 @@ local AutoFarmTabActive = false
 -- full attack rate even when its feature was switched off, which burned frame
 -- time for nothing. These loops now fall back to a slow tick while idle.
 local function idleWait(active, fast, slow)
-    task.wait(active and fast or slow)
+    taskWait(active and fast or slow)
 end
 
 local SaveModule = nil
@@ -688,12 +865,12 @@ local function FocusPetsContinuous(coinInstance)
 
     if coinId and #myPets > 0 then
         pcall(function()
-            Library.Network.Invoke("Join Coin", coinId, myPets)
+            RawNet.invoke("Join Coin", coinId, myPets)
         end)
 
         for _, petUid in ipairs(myPets) do
             pcall(function()
-                Library.Network.Fire("Change Pet Target", petUid, "Coin", coinId)
+                RawNet.fire("Change Pet Target", petUid, "Coin", coinId)
             end)
         end
     end
@@ -761,12 +938,12 @@ local function FocusCometFast(comet)
     end)
 
     pcall(function()
-        Library.Network.Invoke("Join Coin", cometId, pets)
+        RawNet.invoke("Join Coin", cometId, pets)
     end)
 
     for _, petUid in ipairs(pets) do
         pcall(function()
-            Library.Network.Fire("Change Pet Target", petUid, "Coin", cometId)
+            RawNet.fire("Change Pet Target", petUid, "Coin", cometId)
         end)
     end
 
@@ -785,7 +962,7 @@ local function collectAbilityTokens()
     return {}
 end
 
-task.spawn(function()
+taskSpawn(function()
     while true do
         if AutoTokens and localPlayer.Character and localPlayer.Character:FindFirstChild("HumanoidRootPart") then
             local tokens = collectAbilityTokens()
@@ -794,44 +971,45 @@ task.spawn(function()
             if hrp and #tokens > 0 then
                 for _, token in ipairs(tokens) do
                     if not AutoTokens then break end
-                    if not token or not token.Parent or ignoreTokens[token] then continue end
+                    -- Lua 5.1 has no `continue`, so guard the whole body.
+                    if token and token.Parent and not ignoreTokens[token] then
+                        local targetPart = nil
+                        if token:IsA("BasePart") then
+                            targetPart = token
+                        elseif token:IsA("Model") then
+                            targetPart = token.PrimaryPart or token:FindFirstChildWhichIsA("BasePart", true)
+                        elseif token:IsA("Folder") then
+                            targetPart = token:FindFirstChildWhichIsA("BasePart", true)
+                        end
 
-                    local targetPart = nil
-                    if token:IsA("BasePart") then
-                        targetPart = token
-                    elseif token:IsA("Model") then
-                        targetPart = token.PrimaryPart or token:FindFirstChildWhichIsA("BasePart", true)
-                    elseif token:IsA("Folder") then
-                        targetPart = token:FindFirstChildWhichIsA("BasePart", true)
-                    end
+                        if targetPart then
+                            ignoreTokens[token] = true
+                            taskDelay(4, function() ignoreTokens[token] = nil end)
 
-                    if targetPart then
-                        ignoreTokens[token] = true
-                        task.delay(4, function() ignoreTokens[token] = nil end)
+                            local tokenPos = targetPart.Position
+                            local tokenId = tonumber(token.Name) or token.Name
 
-                        local tokenPos = targetPart.Position
-                        local tokenId = tonumber(token.Name) or token.Name
+                            -- Collect the orb without teleporting the character.
+                            -- BUGFIX (from v3): the token remote is resolved by
+                            -- Library.Network hash, not by name. Invoke the exact
+                            -- remote the game's own collector uses.
+                            pcall(function()
+                                RawNet.invoke("Ability Token: Collect", tokenId, tokenPos)
+                            end)
 
-                        -- Collect the orb without teleporting the character.
-                        -- BUGFIX (from v3): the token remote is resolved by
-                        -- Library.Network hash, not by name. Invoke the exact
-                        -- remote the game's own collector uses.
-                        pcall(function()
-                            RawNet.invoke("Ability Token: Collect", tokenId, tokenPos)
-                        end)
-
-                        local waitCount = 0
-                        while token.Parent and waitCount < 6 do
-                            task.wait(0.04)
-                            waitCount += 1
+                            local waitCount = 0
+                            while token.Parent and waitCount < 6 do
+                                taskWait(0.04)
+                                waitCount = waitCount + 1
+                            end
                         end
                     end
                 end
 
             end
-            task.wait(0.2)
+            taskWait(0.2)
         else
-            task.wait(1)
+            taskWait(1)
         end
     end
 end)
@@ -839,7 +1017,7 @@ end)
 local CurrentComet = nil
 local CurrentCometId = nil
 
-task.spawn(function()
+taskSpawn(function()
     while true do
         if AutoFarmComet then
             local comet = CurrentComet
@@ -854,21 +1032,21 @@ task.spawn(function()
                     CurrentCometId = tostring(comet:GetAttribute("ID"))
                 end
                 FocusCometFast(comet)
-                task.wait(0.05)
+                taskWait(0.05)
             else
                 CurrentComet = nil
                 CurrentCometId = nil
-                task.wait(0.25)
+                taskWait(0.25)
             end
         else
             CurrentComet = nil
             CurrentCometId = nil
-            task.wait(0.4)
+            taskWait(0.4)
         end
     end
 end)
 
-task.spawn(function()
+taskSpawn(function()
     while true do
         if AutoFarmComet and CurrentCometId then
             -- BUGFIX (from v3): ReplicatedStorage:GetChildren()[66] resolved
@@ -881,15 +1059,15 @@ task.spawn(function()
                     RawNet.fire("Farm Coin", CurrentCometId, petUid)
                 end)
             end
-            task.wait(0.05)
+            taskWait(0.05)
         else
-            task.wait(0.3)
+            taskWait(0.3)
         end
     end
 end)
 
 -- Fast attack loop
-task.spawn(function()
+taskSpawn(function()
     while true do
         if FastAttackSpeed then
             local targetId = nil
@@ -913,12 +1091,12 @@ task.spawn(function()
                         RawNet.fire("Farm Coin", targetId, petUid)
                     end)
                 end
-                task.wait(FastAttackInterval)
+                taskWait(FastAttackInterval)
             else
-                task.wait(0.2)
+                taskWait(0.2)
             end
         else
-            task.wait(0.25)
+            taskWait(0.25)
         end
     end
 end)
@@ -927,9 +1105,9 @@ end)
 -- Hacker Boss Auto Farm Loop
 -- Uses the same coin selection / Join Coin / Change Pet Target sequence
 -- as the other auto farms, targeting the live Hacker Prime boss coin.
-task.spawn(function()
+taskSpawn(function()
     while true do
-        task.wait(0.15)
+        taskWait(0.15)
 
         if AutoFarmHackerBoss then
             if not CurrentHackerBoss or not CurrentHackerBoss.Parent then
@@ -952,9 +1130,9 @@ task.spawn(function()
 end)
 
 -- Main Auto Farm Loop
-task.spawn(function()
+taskSpawn(function()
     while true do
-        task.wait(0.15)
+        taskWait(0.15)
         if AutoFarmRobot then
             if not CurrentTarget or not CurrentTarget.Parent then
                 CurrentTarget = GetNextRobot()
@@ -974,7 +1152,7 @@ task.spawn(function()
 end)
 
 -- Damage Spam Loop
-task.spawn(function()
+taskSpawn(function()
     while true do
         if CurrentTargetId and AutoFarmRobot then
             -- BUGFIX (from v3): Fire "Farm Coin" per equipped pet instead of
@@ -985,15 +1163,15 @@ task.spawn(function()
                     RawNet.fire("Farm Coin", CurrentTargetId, petUid)
                 end)
             end
-            task.wait(0.05)
+            taskWait(0.05)
         else
-            task.wait(0.3)
+            taskWait(0.3)
         end
     end
 end)
 
 -- Hacker Boss damage loop
-task.spawn(function()
+taskSpawn(function()
     while true do
         if AutoFarmHackerBoss and CurrentHackerBossId then
             -- BUGFIX (from v3): Fire "Farm Coin" per equipped pet instead of
@@ -1004,9 +1182,9 @@ task.spawn(function()
                     RawNet.fire("Farm Coin", CurrentHackerBossId, petUid)
                 end)
             end
-            task.wait(0.05)
+            taskWait(0.05)
         else
-            task.wait(0.3)
+            taskWait(0.3)
         end
     end
 end)
@@ -1020,7 +1198,7 @@ local LastCoinInteractionTarget = nil
 local LastCoinTeleportTarget = nil
 
 -- Find and select the target at a lower rate than the actual attack loop.
-task.spawn(function()
+taskSpawn(function()
     while true do
         if AutoTap or AutoTeleportClosestCoin or QuestFarmActive then
             local previous = CurrentCoinTarget
@@ -1047,12 +1225,12 @@ task.spawn(function()
                             local pets = RefreshCachedEquippedPets(true)
                             if #pets > 0 then
                                 pcall(function()
-                                    Library.Network.Invoke("Join Coin", targetId, pets)
+                                    RawNet.invoke("Join Coin", targetId, pets)
                                 end)
 
                                 for _, petUid in ipairs(pets) do
                                     pcall(function()
-                                        Library.Network.Fire("Change Pet Target", petUid, "Coin", targetId)
+                                        RawNet.fire("Change Pet Target", petUid, "Coin", targetId)
                                     end)
                                 end
                             end
@@ -1083,13 +1261,13 @@ task.spawn(function()
             LastCoinTeleportTarget = nil
         end
 
-        task.wait((AutoTap or AutoTeleportClosestCoin or QuestFarmActive) and ClosestCoinScanInterval or 0.4)
+        taskWait((AutoTap or AutoTeleportClosestCoin or QuestFarmActive) and ClosestCoinScanInterval or 0.4)
     end
 end)
 
 -- Dedicated hit loop. It uses the same direct damage/Farm Coin calls as the
 -- pet list on every hit.
-task.spawn(function()
+taskSpawn(function()
     while true do
         if (AutoTap or QuestFarmActive) and CurrentCoinTargetId then
             local targetId = CurrentCoinTargetId
@@ -1102,35 +1280,35 @@ task.spawn(function()
                     RawNet.fire("Farm Coin", targetId, petUid)
                 end)
             end
-            task.wait(ClosestCoinHitInterval)
+            taskWait(ClosestCoinHitInterval)
         else
-            task.wait(0.25)
+            taskWait(0.25)
         end
     end
 end)
 
 -- ANTI-AFK
 -- Sends a real Space key press at the user-selected interval (minutes).
-task.spawn(function()
+taskSpawn(function()
     while true do
         if AntiAFK then
             local interval = math.max(0.1, tonumber(AntiAFKIntervalMinutes) or 1) * 60
             local elapsed = 0
             while AntiAFK and elapsed < interval do
                 local step = math.min(1, interval - elapsed)
-                task.wait(step)
-                elapsed += step
+                taskWait(step)
+                elapsed = elapsed + step
             end
 
             if AntiAFK then
                 pcall(function()
                     VirtualInputManager:SendKeyEvent(true, Enum.KeyCode.Space, false, game)
-                    task.wait(0.1)
+                    taskWait(0.1)
                     VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.Space, false, game)
                 end)
             end
         else
-            task.wait(0.25)
+            taskWait(0.25)
         end
     end
 end)
@@ -1158,15 +1336,34 @@ local function getFreeGiftRemote()
         return nil
     end
 
-    local env = getgenv and getgenv() or _G
-    local getter = env and env.getupvalues
+    local env = getExecutorEnv()
+    local getter = (type(env) == "table" and type(env.getupvalues) == "function" and env.getupvalues)
+        or (type(getupvalues) == "function" and getupvalues)
+        or nil
+    if not getter and type(debug) == "table" and type(debug.getupvalue) == "function" then
+        getter = function(fn)
+            local ups, index = {}, 1
+            while true do
+                local _, value = debug.getupvalue(fn, index)
+                if value == nil and debug.getupvalue(fn, index) == nil then break end
+                ups[index] = value
+                index = index + 1
+            end
+            return ups
+        end
+    end
+
     if type(getter) == "function" then
         local ok, ups = pcall(getter, invoke)
-        if ok and type(ups) == "table" and type(ups[2]) == "function" then
-            local ok2, remote = pcall(ups[2], "Redeem Free Gift")
-            if ok2 and typeof(remote) == "Instance" and remote:IsA("RemoteFunction") then
-                freeGiftRemote = remote
-                return remote
+        if ok and type(ups) == "table" then
+            for _, up in ipairs(ups) do
+                if type(up) == "function" then
+                    local ok2, remote = pcall(up, "Redeem Free Gift")
+                    if ok2 and typeof(remote) == "Instance" and remote:IsA("RemoteFunction") then
+                        freeGiftRemote = remote
+                        return remote
+                    end
+                end
             end
         end
     end
@@ -1176,16 +1373,15 @@ end
 
 -- Identifies the newest run so a reloaded hub stops the previous claim loop.
 local giftLoopToken = {}
-if getgenv then
-    getgenv().__pdhGiftLoopToken = giftLoopToken
+do
+    local env = getExecutorEnv()
+    if type(env) == "table" then env.__pdhGiftLoopToken = giftLoopToken end
 end
 
-task.spawn(function()
+taskSpawn(function()
     local function isCurrentRun()
-        if not getgenv then
-            return true
-        end
-        return getgenv().__pdhGiftLoopToken == giftLoopToken
+        local env = getExecutorEnv()
+        return type(env) ~= "table" or env.__pdhGiftLoopToken == giftLoopToken
     end
 
     while isCurrentRun() do
@@ -1216,13 +1412,13 @@ task.spawn(function()
                         if remote then
                             remote:InvokeServer(index)
                         end
-                        task.wait(0.2)
+                        taskWait(0.2)
                     end
                 end
             end)
-            task.wait(2)
+            taskWait(2)
         else
-            task.wait(1)
+            taskWait(1)
         end
     end
 end)
@@ -1253,7 +1449,7 @@ local function DiamondPackShort(value)
     return tostring(math.floor(value))
 end
 
-task.spawn(function()
+taskSpawn(function()
     while true do
         if AutoDiamondPacks then
             local packs = Library.Shared and Library.Shared.DiamondPacks
@@ -1278,8 +1474,8 @@ task.spawn(function()
                             local cost = math.max(0, tonumber(info.cost) or 0)
                             currency = currency or info.currency
                             entries[#entries + 1] = { tier = tier, count = count, cost = cost }
-                            remaining += count
-                            totalCost += count * cost
+                            remaining = remaining + count
+                            totalCost = totalCost + count * cost
                         end
                     end
 
@@ -1300,7 +1496,7 @@ task.spawn(function()
                         local used = type(record) == "table" and record.UsedByPack
                         if type(used) ~= "table" then return 0 end
                         local total = 0
-                        for _, n in pairs(used) do total += math.max(0, tonumber(n) or 0) end
+                        for _, n in pairs(used) do total = total + math.max(0, tonumber(n) or 0) end
                         return total
                     end
 
@@ -1338,7 +1534,7 @@ task.spawn(function()
                                 -- success, so the real amount bought is read back
                                 -- from the stock table below.
                                 RawNet.invoke("Diamonds Packs", entry.tier, entry.count)
-                                task.wait(0.2)
+                                taskWait(0.2)
                             end
                         end
 
@@ -1352,9 +1548,9 @@ task.spawn(function()
                                 after = math.max(0, math.floor(tonumber(stockAfter[entry.tier]) or 0))
                             end
                             entry.after = after
-                            left += after
-                            missingCost += after * entry.cost
-                            bought += math.max(0, entry.count - after)
+                            left = left + after
+                            missingCost = missingCost + after * entry.cost
+                            bought = bought + math.max(0, entry.count - after)
                         end
 
                         DiamondPackLastStock = left
@@ -1384,17 +1580,17 @@ task.spawn(function()
         -- Poll quickly while there is still stock to chase, slowly while sold
         -- out (restocks are daily) or while the feature is off.
         if AutoDiamondPacks then
-            task.wait(DiamondPackLastStock > 0 and 2.5 or 5)
+            taskWait(DiamondPackLastStock > 0 and 2.5 or 5)
         else
-            task.wait(1)
+            taskWait(1)
         end
     end
 end)
 
 -- Potato Mode Continuous Focus Loop
-task.spawn(function()
+taskSpawn(function()
     while true do
-        task.wait(0.1)
+        taskWait(0.1)
         if PotatoMode and AutoFarmRobot and CurrentTarget and CurrentTarget.Parent then
             FocusPetsContinuous(CurrentTarget)
         end
@@ -1474,28 +1670,12 @@ end)
 -- Frontend. Detaching that one connection stops the animation before it is ever
 -- scheduled - no TweenService work, no DepthOfFieldEffect, no preloaded assets,
 -- no EggOpenAnim instances - and costs nothing per frame.
-local EggOpenEnv = (type(getgenv) == "function" and getgenv()) or _G
+local EggOpenEnv = getExecutorEnv()
 local eggOpenHookCleanup = {}
 
--- Detect Real executor environment and adjust hooking strategy
-local function detectExecutorType()
-    local env = getgenv and getgenv() or _G
-    if env then
-        if env.ROC or env.RoC or env["RO-C"] or env["R_O_C"] then
-            return "Real"
-        elseif env.XX or env.XXC or env["XX-C"] then
-            return "XX"
-        elseif env.Delta or env["Delta-X"] then
-            return "Delta"
-        elseif env.Astro or env["Astro-Code"] then
-            return "Astro"
-        end
-    end
-    return "Unknown"
-end
-
-local executorType = detectExecutorType()
-local useDirectHook = executorType == "Real" or executorType == "Unknown"
+-- Keep the script executor-neutral. Optional executor APIs are feature-detected
+-- at the point of use; no specific executor name is required.
+local executorType = "Generic"
 
 -- How the game plays the animation (read from the live scripts):
 --   server -> Network "Eggs_PlayOpenAnimation" -> Game.EggOpenHook
@@ -1513,8 +1693,8 @@ local function eggOpenBookkeeping(eggId, pets)
     if type(pets) == "table" then
         for uid in pairs(pets) do uids[#uids + 1] = uid end
     end
-    task.defer(function()
-        pcall(function() Library.Network.Fire("Pets_ClearHidden", uids) end)
+    defer(function()
+        pcall(function() RawNet.fire("Pets_ClearHidden", uids) end)
         pcall(function() Library.Signal.Fire("CompletedHatching", eggId, uids) end)
     end)
 end
@@ -1524,8 +1704,16 @@ pcall(function()
     local previous = EggOpenEnv.PD_EggOpenHook
     if previous then
         if previous.replacement then previous.replacement:Disconnect() end
-        if previous.trigger and previous.callback then
-            previous.trigger.Event:Connect(previous.callback)
+        if previous.signal and previous.callback then
+            pcall(function()
+                previous.signal:Connect(previous.callback)
+            end)
+        elseif previous.trigger and previous.callback then
+            -- Older hook records stored the Instance instead of its signal.
+            pcall(function()
+                local oldSignal = previous.trigger:IsA("BindableEvent") and previous.trigger.Event or previous.trigger.OnClientEvent
+                if oldSignal then oldSignal:Connect(previous.callback) end
+            end)
         end
         if previous.cleanup then
             pcall(previous.cleanup)
@@ -1536,7 +1724,7 @@ EggOpenEnv.PD_EggOpenHook = nil
 
 local eggOpenDetached = false
 local eggOpenConnection
-task.spawn(function()
+taskSpawn(function()
     local port = ReplicatedStorage:WaitForChild("EggOpenPort", 15)
     local trigger = port and port:WaitForChild("PlayTrigger", 15)
     if not trigger then return end
@@ -1544,6 +1732,7 @@ task.spawn(function()
     pcall(function()
         local signal = trigger:IsA("BindableEvent") and trigger.Event or trigger.OnClientEvent
         local callback
+        if type(getconnections) ~= "function" then return end
         for _, connection in ipairs(getconnections(signal)) do
             if connection.Enabled and type(connection.Function) == "function" then
                 callback = callback or connection.Function
@@ -1553,6 +1742,7 @@ task.spawn(function()
         if callback then
             EggOpenEnv.PD_EggOpenHook = {
                 trigger = trigger,
+                signal = signal,
                 callback = callback,
                 replacement = signal:Connect(eggOpenBookkeeping),
                 cleanup = function()
@@ -1605,19 +1795,19 @@ end)
 -- safety net for leftovers from an animation that was already in flight when
 -- the script loaded - not a per-frame tree scan.
 local eggCleanupTask
-eggCleanupTask = task.spawn(function()
+eggCleanupTask = taskSpawn(function()
     while true do
         if AutoBuying and eggOpenCleanupActive then
             cleanupEggOpeningEffects()
         end
-        task.wait(2)
+        taskWait(2)
     end
 end)
 
 registerCleanup(function()
     eggOpenCleanupActive = false
     if eggCleanupTask then
-        task.cancel(eggCleanupTask)
+        taskCancel(eggCleanupTask)
     end
 end)
 
@@ -1704,7 +1894,6 @@ local function questGameAutoFarmHandler()
     if questAutoFarmHandlerResolved then
         return questAutoFarmHandlerCache
     end
-    questAutoFarmHandlerResolved = true
 
     if type(getconnections) ~= "function" then
         return nil
@@ -1725,9 +1914,11 @@ local function questGameAutoFarmHandler()
     for _, connection in ipairs(connections) do
         if type(connection.Function) == "function" then
             questAutoFarmHandlerCache = connection.Function
+            questAutoFarmHandlerResolved = true
             return connection.Function
         end
     end
+    -- Do not cache failures: the button connection may be installed later.
     return nil
 end
 
@@ -1787,7 +1978,7 @@ end
 -- drops the capture on "World Changed" but leaves the flag on - only the
 -- captured area is lost, and CaptureArea() rebuilds it from wherever the
 -- player is standing).
-task.spawn(function()
+taskSpawn(function()
     local recaptureArmed = false
     -- Bounded re-capture. The engine snaps its capture to wherever the player
     -- stood when it enabled, so a mismatch usually means the driver has not
@@ -1830,7 +2021,7 @@ task.spawn(function()
                         questSetGameAutoFarm(false)
                     else
                         recaptureArmed = false
-                        recaptureTries += 1
+                        recaptureTries = recaptureTries + 1
                         questSetGameAutoFarm(true)
                     end
                 else
@@ -1840,12 +2031,12 @@ task.spawn(function()
                 recaptureArmed = false
                 recaptureTries = 0
             end
-            task.wait(0.6)
+            taskWait(0.6)
         elseif QuestAreaFarmWanted and QuestPlaytimeActive and not QuestPlaytimeFarmReady then
             -- The playtime driver is deliberately handling the ordered startup
             -- (centre, wait, Auto Farm, wait, egg). Do not race it by enabling
             -- Auto Farm here, or by releasing a farm it has just acquired.
-            task.wait(0.25)
+            taskWait(0.25)
         else
             if QuestOwnedAutoFarm then
                 QuestOwnedAutoFarm = false
@@ -1853,7 +2044,7 @@ task.spawn(function()
             end
             lastTarget = nil
             recaptureTries = 0
-            task.wait(0.5)
+            taskWait(0.5)
         end
     end
 end)
@@ -1869,7 +2060,7 @@ local function destroyOldGui(name)
     end
 end
 
--- Clean up previous UI instances for Real executor reloads
+-- Clean up previous UI instances across executor reloads
 pcall(function()
     if playerGui:FindFirstChild("CombinedAutomationUI") then
         playerGui.CombinedAutomationUI:Destroy()
@@ -1881,7 +2072,7 @@ end)
 
 destroyOldGui("CombinedAutomationUI")
 
-task.spawn(function()
+taskSpawn(function()
     local Save = nil
     local okSave = pcall(function()
         Save = require(ReplicatedStorage:WaitForChild("Library", 2):WaitForChild("Client", 2):WaitForChild("Save", 2))
@@ -2299,13 +2490,13 @@ task.spawn(function()
                 local category = getPetCategory(pet)
                 if category then
                     if category == "Huge" then
-                        totalHuge += 1
+                        totalHuge = totalHuge + 1
                     elseif category == "Secret" then
-                        totalSecret += 1
+                        totalSecret = totalSecret + 1
                     elseif category == "Titanic" then
-                        totalTitanic += 1
+                        totalTitanic = totalTitanic + 1
                     elseif category == "Gargantuan" then
-                        totalGargantuan += 1
+                        totalGargantuan = totalGargantuan + 1
                     end
 
                     -- The inventory table key is the stable instance UID in
@@ -2442,10 +2633,10 @@ task.spawn(function()
 
     updateTrackerState()
     tracker:Destroy()
-    task.spawn(function()
+    taskSpawn(function()
         while ui.Parent do
             refreshTracker()
-            task.wait(2.5)
+            taskWait(2.5)
         end
     end)
 
@@ -2616,7 +2807,7 @@ task.spawn(function()
             pillText.Parent = pill
         end
 
-        task.spawn(function()
+        taskSpawn(function()
             local tweenService = game:GetService("TweenService")
             while dot.Parent do
                 local fadeOut = tweenService:Create(dot, TweenInfo.new(0.9, Enum.EasingStyle.Sine), { BackgroundTransparency = 0.7 })
@@ -2825,17 +3016,17 @@ gemsLegacy:SetAttribute("ThemeKeepTextColor", true)
 
             local rares = 0
             for _, count in pairs(afkSessionCounts) do
-                rares += count
+                rares = rares + count
             end
             statRares.Text = "+" .. tostring(rares)
         end
 
-        task.spawn(function()
+        taskSpawn(function()
             while overlay.Parent do
                 if overlay.Visible then
                     pcall(refreshHeader)
                 end
-                task.wait(0.5)
+                taskWait(0.5)
             end
         end)
 
@@ -2889,7 +3080,7 @@ gemsLegacy:SetAttribute("ThemeKeepTextColor", true)
     -- The ScreenGui origin is above the screen while IgnoreGuiInset is on, so
     -- a freshly centred hub lands ~58 px high. Re-centre once the ScreenGui has
     -- reported its real inset (it can be 0 on the first frame).
-    task.defer(function()
+    defer(function()
         local inset = math.max(0, -ui.AbsolutePosition.Y)
         if inset <= 0 then return end
         if autoHatchMain.Position.Y.Offset == -380 then
@@ -3327,6 +3518,11 @@ TAB_TOTAL.frame = Instance.new("ScrollingFrame")
     -- =====================================================================
     -- FULL EXTENDED THEMES SYSTEM
     -- =====================================================================
+    -- Forward declarations. These were implicit globals before; keeping them
+    -- local avoids leaking state into the executor environment and lets
+    -- applyTheme see the theme rows/scroll created much later in this builder.
+    local themeRows, themeScroll, statsContainer
+
     local function makeTheme(name, background, panel, surface, accent, controlOn, danger, text, muted, stroke)
         -- `input` used to alias `surface`, which made every textbox the same
         -- shade as the button next to it - the field read as part of the
@@ -3781,7 +3977,7 @@ TAB_TOTAL.frame = Instance.new("ScrollingFrame")
         themedWatchers[obj] = true
         local function repaint()
             if themeApplying then return end
-            task.defer(function()
+            defer(function()
                 if obj and obj.Parent and not themeApplying then
                     applyThemeToObject(obj)
                 end
@@ -3813,7 +4009,7 @@ TAB_TOTAL.frame = Instance.new("ScrollingFrame")
     end
 
     local function onThemedDescendantAdded(obj)
-        task.defer(function()
+        defer(function()
             if obj and obj.Parent then
                 rememberBaseColors(obj)
                 watchThemeProperties(obj)
@@ -4167,7 +4363,7 @@ switchTab(hatchTab, hatchFrame)
     diamondStock.Visible = false
     diamondStock.Parent = farmFrame
 
-    task.spawn(function()
+    taskSpawn(function()
         while farmFrame.Parent do
             diamondStock.Visible = AutoDiamondPacks
             if AutoDiamondPacks then
@@ -4205,7 +4401,7 @@ switchTab(hatchTab, hatchFrame)
                 farmStatus.Text = "Status: Idle"
                 farmStatus.TextColor3 = Color3.fromRGB(150, 150, 150)
             end
-            task.wait(0.5)
+            taskWait(0.5)
         end
     end)
 
@@ -4423,7 +4619,7 @@ switchTab(hatchTab, hatchFrame)
             local shown = 0
             for _, optionName in ipairs(names) do
                 if query == "" or optionName:lower():find(query, 1, true) then
-                    shown += 1
+                    shown = shown + 1
                     local row = Instance.new("TextButton")
                     row.Size = UDim2.new(1, -6, 0, 26)
                     row.ZIndex = 21
@@ -4585,7 +4781,7 @@ switchTab(hatchTab, hatchFrame)
         afkStatus.TextYAlignment = Enum.TextYAlignment.Top
         afkStatus.Parent = TAB_TOTAL.afkFrame
 
-        task.spawn(function()
+        taskSpawn(function()
             while afkStatus.Parent do
                 afkStatus.Text = table.concat({
                     "Group rewards: " .. tostring(AfkGroupStatus),
@@ -4595,7 +4791,7 @@ switchTab(hatchTab, hatchFrame)
                     "Main quests: " .. tostring(AfkQuestStatus),
                     "Side quests: " .. tostring(AfkSideQuestStatus),
                 }, "\n")
-                task.wait(0.5)
+                taskWait(0.5)
             end
         end)
     end
@@ -4755,7 +4951,7 @@ switchTab(hatchTab, hatchFrame)
     end
 
     -- Tile: upgrade once per new tile the player lands on.
-    task.spawn(function()
+    taskSpawn(function()
         local lastTile = nil
         while TAB_TOTAL.luckyWorldFrame.Parent do
             if AutoTileUpgrade and RawNet.invoke then
@@ -4786,17 +4982,17 @@ switchTab(hatchTab, hatchFrame)
                         end
                     end
                 end
-                task.wait(0.5)
+                taskWait(0.5)
             else
                 lastTile = nil
-                task.wait(0.7)
+                taskWait(0.7)
             end
         end
     end)
 
     -- Boost machine: fill each rarity to MaxSeconds using the exact amount
     -- the game's own purchase button would spend.
-    task.spawn(function()
+    taskSpawn(function()
         while TAB_TOTAL.luckyWorldFrame.Parent do
             local boost = LuckyWorldData and LuckyWorldData.Boost
             if AutoBoostMachine and RawNet.invoke and boost then
@@ -4834,16 +5030,16 @@ switchTab(hatchTab, hatchFrame)
                     luckyStatus.TextColor3 = Color3.fromRGB(160, 170, 190)
                 end
 
-                task.wait(bought and 1.2 or 3)
+                taskWait(bought and 1.2 or 3)
             else
-                task.wait(0.7)
+                taskWait(0.7)
             end
         end
     end)
 
     -- Lucky panel: buy the cheapest affordable upgrade in the game's own
     -- suggested order (EggTier, Power, Coins, BlockLuck, luck tiers).
-    task.spawn(function()
+    taskSpawn(function()
         while TAB_TOTAL.luckyWorldFrame.Parent do
             local upgrades = LuckyWorldData and LuckyWorldData.Upgrades
             if AutoLuckyUpgrades and RawNet.invoke and type(upgrades) == "table" then
@@ -4877,21 +5073,21 @@ switchTab(hatchTab, hatchFrame)
                         luckyStatus.Text = ("Status: %s upgrade rejected"):format(bestId)
                         luckyStatus.TextColor3 = Color3.fromRGB(255, 190, 90)
                     end
-                    task.wait(1.2)
+                    taskWait(1.2)
                 else
                     luckyStatus.Text = "Status: No affordable Lucky Upgrade"
                     luckyStatus.TextColor3 = Color3.fromRGB(160, 170, 190)
-                    task.wait(3)
+                    taskWait(3)
                 end
             else
-                task.wait(1)
+                taskWait(1)
             end
         end
     end)
 
     -- Boss: the game's Select Coin path assigns one pet per signal, which is
     -- exactly the 1-by-1 pacing wanted. Keep firing while the boss exists.
-    task.spawn(function()
+    taskSpawn(function()
         local lastBoss = nil
         while TAB_TOTAL.luckyWorldFrame.Parent do
             if AutoBossAttack then
@@ -4905,9 +5101,9 @@ switchTab(hatchTab, hatchFrame)
                             luckyStatus.TextColor3 = Color3.fromRGB(255, 210, 80)
                         end
                         pcall(function() Library.Signal.Fire("Select Coin", coin) end)
-                        task.wait(0.07)
+                        taskWait(0.07)
                     else
-                        task.wait(0.4)
+                        taskWait(0.4)
                     end
                 else
                     if lastBoss ~= nil then
@@ -4915,17 +5111,17 @@ switchTab(hatchTab, hatchFrame)
                         luckyStatus.TextColor3 = Color3.fromRGB(160, 170, 190)
                     end
                     lastBoss = nil
-                    task.wait(0.5)
+                    taskWait(0.5)
                 end
             else
                 lastBoss = nil
-                task.wait(0.5)
+                taskWait(0.5)
             end
         end
     end)
 
     -- Currency readout for the tab.
-    task.spawn(function()
+    taskSpawn(function()
         while TAB_TOTAL.luckyWorldFrame.Parent do
             if TAB_TOTAL.luckyWorldFrame.Visible then
                 local bucks = readCurrency("Breakout Bucks")
@@ -4935,7 +5131,7 @@ switchTab(hatchTab, hatchFrame)
                     coins and string.format("%.0f", coins) or "?"
                 )
             end
-            task.wait(1)
+            taskWait(1)
         end
     end)
 
@@ -4945,6 +5141,7 @@ switchTab(hatchTab, hatchFrame)
     -- Uses the maze route logic from the standalone Auto Maze script.
     -- The feature is controlled exclusively by the Lucky World tab toggle.
     -- =====================================================================
+    ;(function()
 local MAZE_CONFIG = {
     enabled = false,
     driftTolerance = 0.5,     -- studs of drift before the character is re-seated
@@ -4958,7 +5155,7 @@ local MAZE_CONFIG = {
     verbose = true,
 }
 
-local MazeEnv = (type(getgenv) == "function" and getgenv()) or _G
+local MazeEnv = getExecutorEnv()
 local MAZE = MazeEnv.__LuckyMazeState or {
     enabled = false,
     mazesDone = 0,
@@ -5101,10 +5298,8 @@ local function seat(hrp, position)
     hrp.CFrame = CFrame.new(position)
 end
 
--- Poke the trigger directly. Executor-only helper, so this is just a backup for
--- when the humanoid never manages to register a real overlap.
-local firetouchinterest = firetouchinterest
-
+-- Poke the trigger directly. Uses the shared cross-executor touch helper so a
+-- missing/renamed firetouchinterest cannot break the portal fallback.
 local function portalTaken(part, entrance)
     if not part.Parent then
         return true
@@ -5166,7 +5361,7 @@ local function walkTo(hrp, position, radius, timeout, portalPart, entrance)
             hum:MoveTo(position)
         end
 
-        task.wait(step)
+        taskWait(step)
     end
 
     stopWalk()
@@ -5174,12 +5369,12 @@ local function walkTo(hrp, position, radius, timeout, portalPart, entrance)
 end
 
 -- Executor touch helper, used only when the walk never produces a real overlap.
+-- The verify callback stops after the first method that actually moves the
+-- player into the next maze, so no method is fired twice unnecessarily.
 local function forceTouch(hrp, part)
-    if not hrp or not part.Parent or not firetouchinterest then
-        return
-    end
-    pcall(firetouchinterest, hrp, part, 0)
-    pcall(firetouchinterest, hrp, part, 1)
+    fireTouchSafe(hrp, part, function()
+        return portalTaken(part, MAZE.currentEntrance) or not inTrial()
+    end)
 end
 
 -- Enter the exit portal so the game's own trigger fires, then fall back to a
@@ -5197,7 +5392,7 @@ local function walkIntoPortal(room)
     MAZE.portalBusy = true
     MAZE.status = "holding at exit portal"
 
-    task.spawn(function()
+    taskSpawn(function()
         local entrance = MAZE.currentEntrance
         local enterAt = os.clock() + MAZE_CONFIG.portalEnterDelay
 
@@ -5209,7 +5404,7 @@ local function walkIntoPortal(room)
             end
             local left = enterAt - os.clock()
             MAZE.status = ("portal in %.1fs"):format(math.max(0, left))
-            task.wait(0.05)
+            taskWait(0.05)
         end
 
         if part.Parent and not portalTaken(part, entrance) then
@@ -5228,7 +5423,7 @@ local function walkIntoPortal(room)
             MAZE.status = "forcing portal touch"
             local _, hrp = localCharacter()
             forceTouch(hrp, part)
-            task.wait(0.15)
+            taskWait(0.15)
         end
 
         local waitUntil = os.clock() + MAZE_CONFIG.portalRetryTimeout
@@ -5236,7 +5431,7 @@ local function walkIntoPortal(room)
             if portalTaken(part, entrance) or not inTrial() then
                 break
             end
-            task.wait(0.05)
+            taskWait(0.05)
         end
 
         -- Clear any lingering movement command after the portal transition.
@@ -5361,8 +5556,10 @@ end
         MAZE.enabled = false
         MAZE.portalBusy = false
     end)
+    end)()
 
     -- =====================================================================
+    do -- Isolate Egg Chances UI locals from the larger hub builder.
     -- EGG CHANCES TAB
     -- =====================================================================
     local function collectEggChanceData()
@@ -5473,7 +5670,7 @@ end
                 for _, entry in ipairs(results) do entry.Chance = entry.Chance * 100 end
             elseif allWeight then
                 local totalWeight = 0
-                for _, entry in ipairs(results) do totalWeight += entry.Chance end
+                for _, entry in ipairs(results) do totalWeight = totalWeight + entry.Chance end
                 if totalWeight > 0 then
                     for _, entry in ipairs(results) do entry.Chance = entry.Chance / totalWeight * 100 end
                 end
@@ -5535,6 +5732,9 @@ end
             end
 
             for index = 1, 12 do
+                if type(debug) ~= "table" or type(debug.getupvalue) ~= "function" then
+                    return liveEggs
+                end
                 local first, second = debug.getupvalue(probabilityGetter, index)
                 if first == nil then break end
                 consider(first)
@@ -5578,7 +5778,7 @@ end
                             local totalWeight = 0
                             for _, drop in ipairs(drops) do
                                 if type(drop) == "table" and type(drop[1]) == "string" and tonumber(drop[2]) then
-                                    totalWeight += tonumber(drop[2])
+                                    totalWeight = totalWeight + tonumber(drop[2])
                                 end
                             end
 
@@ -5804,7 +6004,7 @@ end
 
         local value = tonumber(string.format("%.2f", odds / units[index][1]))
         if value >= 1000 and units[index + 1] then
-            index += 1
+            index = index + 1
             value = tonumber(string.format("%.2f", odds / units[index][1]))
         end
 
@@ -6064,6 +6264,8 @@ end
     rebuildEggOptions()
     eggSelect.Text = bestChanceEgg and ("Selected: " .. bestChanceEgg.Name) or "Select an egg"
     selectEggSubTab("Eggs", subTabButtons["Eggs"])
+    end -- End Egg Chances local scope.
+
 
     -- =====================================================================
     -- AUTO HATCH TAB UI
@@ -6278,9 +6480,9 @@ end
                     if type(pets) == "table" then
                         for _, pet in pairs(pets) do
                             if type(pet) == "table" then
-                                if pet.r == true then ownedVariants.Rainbow += 1 end
-                                if pet.g == true then ownedVariants.Golden += 1 end
-                                if pet.sh == true then ownedVariants.Shiny += 1 end
+                                if pet.r == true then ownedVariants.Rainbow = ownedVariants.Rainbow + 1 end
+                                if pet.g == true then ownedVariants.Golden = ownedVariants.Golden + 1 end
+                                if pet.sh == true then ownedVariants.Shiny = ownedVariants.Shiny + 1 end
                             end
                         end
                     end
@@ -6486,7 +6688,11 @@ end
     end
 
     hatchToggleBtn.MouseButton1Click:Connect(function()
-        setAutoHatchState(not AutoBuying)
+        -- setAutoHatchState is assigned later in the load sequence; guard the
+        -- callback so an early click cannot call a nil value.
+        if type(setAutoHatchState) == "function" then
+            pcall(setAutoHatchState, not AutoBuying)
+        end
     end)
 
     -- Wrapped in a block purely to keep its locals out of the UI thread's
@@ -6696,15 +6902,15 @@ end
                     local variants = {}
                     if entryData.rainbow then
                         table.insert(variants, "Rainbow")
-                        variantTotals.Rainbow += 1
+                        variantTotals.Rainbow = variantTotals.Rainbow + 1
                     end
                     if entryData.golden then
                         table.insert(variants, "Golden")
-                        variantTotals.Golden += 1
+                        variantTotals.Golden = variantTotals.Golden + 1
                     end
                     if entryData.shiny then
                         table.insert(variants, "Shiny")
-                        variantTotals.Shiny += 1
+                        variantTotals.Shiny = variantTotals.Shiny + 1
                     end
                     local variantPrefix = #variants > 0 and ("[" .. table.concat(variants, " + ") .. "] ") or ""
                     label.Text = "- " .. variantPrefix .. tostring(entryData.name)
@@ -6759,10 +6965,7 @@ end
         local WebhookUserId = PersistedSettings.webhook.userId or ""
 
         local function webhookRequest()
-            local env = _G
-            pcall(function()
-                if type(getgenv) == "function" then env = getgenv() end
-            end)
+            local env = getExecutorEnv()
             local fn = nil
             if type(env) == "table" then fn = env.request or env.http_request end
             if type(fn) ~= "function" and type(syn) == "table" then fn = syn.request end
@@ -7256,7 +7459,7 @@ end
             if WebhookURL == "" then status.Text="Enter a webhook URL first" return end
             WebhookSending=true
             test.Text="Sending..."
-            task.spawn(function()
+            taskSpawn(function()
                 local ok, result = pcall(function()
                     return webhookSend(makePayload(true,nil,nil,getCurrentTotals()))
                 end)
@@ -7280,7 +7483,7 @@ end
             return ok and type(inventory) == "table" and inventory or nil
         end
 
-        task.spawn(function()
+        taskSpawn(function()
             while ui.Parent do
                 local inventory = readRareInventory()
                 if inventory then
@@ -7321,7 +7524,7 @@ end
                         table.remove(pendingWebhooks, 1)
                     else
                         warn("[Pet Hub] Webhook delivery failed: " .. tostring(ok and err or sent))
-                        task.wait(5)
+                        taskWait(5)
                     end
                 end
 
@@ -7347,7 +7550,7 @@ end
                         end
                     end
                 end
-                task.wait(1)
+                taskWait(1)
             end
         end)
     end)
@@ -7395,7 +7598,7 @@ end
                 return false, "network unavailable"
             end
 
-            local genv = (type(getgenv) == "function" and getgenv()) or _G
+            local genv = getExecutorEnv()
             if type(genv) ~= "table" then
                 local ok, a, b, c = pcall(Network.Invoke, name, ...)
                 if not ok then return false, tostring(a) end
@@ -7938,7 +8141,7 @@ end
             busy = false
         end
 
-        task.spawn(function()
+        taskSpawn(function()
             while daycareFrame.Parent do
                 updateStatus()
 
@@ -7949,7 +8152,7 @@ end
                     nextPassAt = os.clock() + INTERVAL
                 end
 
-                task.wait(1)
+                taskWait(1)
             end
         end)
     end)
@@ -7986,7 +8189,7 @@ end
     -- with Visible = false and never re-shown, which is why the AFK screen
     -- stopped reporting rare hatches entirely.
     -- =====================================================================
-    do
+    local function buildAfkRarePanel()
         local panel = Instance.new("Frame")
         panel.Name = "AfkRarePanel"
         panel.Size = UDim2.new(1, -12, 0.49, 0)
@@ -8281,6 +8484,7 @@ end
             end
         end
     end
+    buildAfkRarePanel()
 
     local childNodes = ReplicatedStorage:GetChildren()
     renderAfkRecent()
@@ -8333,7 +8537,7 @@ end
             end)
         end
     end
-    task.spawn(hookLeaderstats)
+    taskSpawn(hookLeaderstats)
 
 -- AUTO-HATCH
 -- The game already ships a complete auto-hatch driver in
@@ -8354,11 +8558,8 @@ local function ownsAutoHatchGamepass()
     return ok and pass == true
 end
 
--- The map keeps every egg capsule under Workspace.__MAP.Eggs.<area>.Eggs as a
--- "Egg Capsule" model with an `ID` attribute that already matches the
--- directory egg id, so the closest egg can be picked without any name games.
 local function eggCostsDiamonds(eggId)
-    local def = eggId and Library.Directory.Eggs and Library.Directory.Eggs[eggId]
+    local def = eggDefForId(eggId)
     return type(def) == "table" and tostring(def.currency) == "Diamonds"
 end
 
@@ -8368,6 +8569,9 @@ local function selectedQuestDiamondEgg(eggId)
     return eggId ~= nil and (eggId == AfkFarmEgg or eggId == AutoFarmTabTargetEgg)
 end
 
+-- Eggs are not all named "Egg Capsule": Lucky / Storm / Chroma and other
+-- special eggs are models named after themselves. Match on the ID attribute
+-- instead, exactly like the quest capsule resolver does.
 local function findClosestEggId(allowDiamonds)
     local character = localPlayer.Character
     local hrp = character and character:FindFirstChild("HumanoidRootPart")
@@ -8379,10 +8583,10 @@ local function findClosestEggId(allowDiamonds)
 
     local bestId, bestDistance = nil, math.huge
     for _, model in ipairs(eggsFolder:GetDescendants()) do
-        if model:IsA("Model") and model.Name == "Egg Capsule" then
+        if model:IsA("Model") then
             local id = model:GetAttribute("ID")
-            local part = model.PrimaryPart or model:FindFirstChildWhichIsA("BasePart")
-            if id and part and (allowDiamonds ~= false or not eggCostsDiamonds(tostring(id))) then
+            local part = model.PrimaryPart or model:FindFirstChildWhichIsA("BasePart", true)
+            if id ~= nil and part and (allowDiamonds ~= false or not eggCostsDiamonds(tostring(id))) then
                 local distance = (hrp.Position - part.Position).Magnitude
                 if distance < bestDistance then
                     bestDistance = distance
@@ -8400,13 +8604,15 @@ end
 -- long as its capsule is streamed in - so the moment the objective clears (or
 -- the player leaves the area) the loop falls back to the closest egg.
 local function eggCapsuleExists(eggId)
+    if eggId == nil then return false end
     local map = Workspace:FindFirstChild("__MAP")
     local eggsFolder = map and map:FindFirstChild("Eggs")
     if not eggsFolder then return false end
+    local wanted = tostring(eggId)
     for _, model in ipairs(eggsFolder:GetDescendants()) do
-        if model:IsA("Model") and model.Name == "Egg Capsule" then
+        if model:IsA("Model") then
             local id = model:GetAttribute("ID")
-            if id ~= nil and tostring(id) == eggId then
+            if id ~= nil and tostring(id) == wanted then
                 return true
             end
         end
@@ -8423,12 +8629,12 @@ local function currentHatchEggId()
     end
     -- Playtime AFK's dropdown is an explicit user selection, so a Diamond egg
     -- selected there is allowed even while quest automation owns auto-hatch.
-    if QuestPlaytimeActive and AfkFarmEgg and Library.Directory.Eggs[AfkFarmEgg]
+    if QuestPlaytimeActive and AfkFarmEgg and eggDefForId(AfkFarmEgg)
         and (not questMode or not eggCostsDiamonds(AfkFarmEgg) or selectedQuestDiamondEgg(AfkFarmEgg)) then
         return AfkFarmEgg
     end
     -- Auto Farm tab dropdown is also an explicit selection.
-    if type(AutoFarmTabTargetEgg) == "string" and Library.Directory.Eggs[AutoFarmTabTargetEgg]
+    if type(AutoFarmTabTargetEgg) == "string" and eggDefForId(AutoFarmTabTargetEgg)
         and (not questMode or not eggCostsDiamonds(AutoFarmTabTargetEgg) or selectedQuestDiamondEgg(AutoFarmTabTargetEgg))
         and eggCapsuleExists(AutoFarmTabTargetEgg) then
         return AutoFarmTabTargetEgg
@@ -8455,7 +8661,7 @@ local function hatchViaBuyX()
     local invoked, result, err = RawNet.invoke("BuyX Egg", eggId)
 
     if not invoked then
-        HatchFailures += 1
+        HatchFailures = HatchFailures + 1
     elseif result == true then
         HatchFailures = 0
         HatchLastEgg = os.clock()
@@ -8468,7 +8674,7 @@ local function hatchViaBuyX()
         HatchWatchdogStatus = "closest egg out of range"
         HatchCooldownUntil = os.clock() + 1.0
     else
-        HatchFailures += 1
+        HatchFailures = HatchFailures + 1
         HatchWatchdogStatus = "buy failed: " .. tostring(err)
     end
 
@@ -8494,7 +8700,7 @@ local function clearHatchState()
 end
 
 local ownsPassCached, ownsPassRefreshAt = false, 0
-task.spawn(function()
+taskSpawn(function()
     local wasOn = false
     while true do
         if AutoBuying then
@@ -8525,13 +8731,13 @@ task.spawn(function()
                 pcall(function() Library.Variables.AutoHatchEnabled = false end)
             end
             if ownsPassCached and not diamondEgg then
-                HatchWatchdogStatus = "auto hatch running (engine)"
-                task.wait(1)
+                HatchWatchdogStatus = "auto hatch running (engine) -> " .. tostring(eggId)
+                taskWait(1)
             else
                 -- No gamepass: we drive it. hatchViaBuyX enforces a 0.25s
                 -- server cooldown (tested safe), so poll at 0.1s.
                 hatchViaBuyX()
-                task.wait(0.1)
+                taskWait(0.1)
             end
         else
             -- Only touch the engine state on the transition, so a hatch the
@@ -8541,7 +8747,7 @@ task.spawn(function()
                 wasOn = false
             end
             HatchWatchdogStatus = "Idle"
-            task.wait(0.5)
+            taskWait(0.5)
         end
     end
 end)
@@ -8671,8 +8877,8 @@ end
         local executorGetUpvalues = nil
         local executorSetupValue = nil
         do
-            local okEnv, env = pcall(function() return getgenv() end)
-            if okEnv and type(env) == "table" then
+            local env = getExecutorEnv()
+            if type(env) == "table" then
                 if type(env.getupvalues) == "function" then
                     executorGetUpvalues = env.getupvalues
                 end
@@ -8851,7 +9057,7 @@ end
             while os.clock() < deadline do
                 local center = getAreaCenter(areaName)
                 if center then return center end
-                task.wait(0.25)
+                taskWait(0.25)
             end
             return nil
         end
@@ -8896,7 +9102,7 @@ end
             teleportBusy = true
             setTeleportStatus("Loading " .. tostring(targetWorld) .. " for " .. areaName .. "...", activeTheme.accent)
 
-            task.spawn(function()
+            taskSpawn(function()
                 local okRun, runError = pcall(function()
                     local loaded = loadWorldSafely(targetWorld)
                     local landedWorld = nil
@@ -8909,7 +9115,7 @@ end
                     end
 
                     local center = waitForAreaCenter(areaName, 10)
-                    task.wait(0.35)
+                    taskWait(0.35)
 
                     local _, newRoot = getCharacterRoot()
                     if not newRoot then
@@ -9069,7 +9275,7 @@ end
                     else
                         expandedWorld = worldName
                     end
-                    task.defer(renderTeleportList)
+                    defer(renderTeleportList)
                 end)
 
                 if isOpen then
@@ -9238,7 +9444,7 @@ end
                 if not sharedLoadWorldSafely then return false end
                 local ok, loaded = pcall(sharedLoadWorldSafely, targetWorld)
                 if not ok or loaded ~= true then return false end
-                task.wait(1.5)
+                taskWait(1.5)
                 root = afGetRoot()
                 if not root then return false end
             end
@@ -9336,7 +9542,7 @@ end
             -- 2. Let the character and area finish loading before Auto Farm
             --    captures its area. The player is still at the area's centre.
             setAfStatus("Settling in " .. area .. " (3 seconds)...", AF_ACCENT)
-            task.wait(3)
+            taskWait(3)
             if not afRunning or not AutoFarmTabActive then return end
 
             -- Force a clean capture of the selected area, then enable the
@@ -9344,7 +9550,7 @@ end
             setAfStatus("Enabling Auto Farm in " .. area .. "...", AF_ACCENT)
             if type(questSetGameAutoFarm) == "function" then
                 pcall(questSetGameAutoFarm, false)
-                task.wait(0.6)
+                taskWait(0.6)
             end
             local farmOk = afEnableGameFarm()
             if not farmOk then
@@ -9354,7 +9560,7 @@ end
             -- Keep the player at the area centre for a few seconds after
             -- Auto Farm is enabled so its capture/engine can initialize.
             setAfStatus("Auto Farm starting in " .. area .. " (3 seconds)...", AF_ACCENT)
-            task.wait(3)
+            taskWait(3)
             if not afRunning or not AutoFarmTabActive then return end
 
             -- 3. Target the chosen egg for auto-hatch.
@@ -9373,7 +9579,7 @@ end
             if egg then
                 setAfStatus("Teleporting to " .. egg .. "...", AF_ACCENT)
                 local eggMoved = afSteerToEgg(egg)
-                task.wait(0.6)
+                taskWait(0.6)
                 if not eggMoved then
                     setAfStatus("Waiting for " .. egg .. " capsule...", AF_WARN)
                 end
@@ -9388,7 +9594,7 @@ end
             end
 
             -- 4. Watchdog. Re-assert farm + hatch target while the toggle is on.
-            task.spawn(function()
+            taskSpawn(function()
                 local recaptureLeft = 3
                 local lastFlipAt = 0
                 while afRunning do
@@ -9407,9 +9613,9 @@ end
                             and captured and tostring(captured) ~= area then
                             if os.clock() - lastFlipAt > 3 then
                                 lastFlipAt = os.clock()
-                                recaptureLeft -= 1
+                                recaptureLeft = recaptureLeft - 1
                                 questSetGameAutoFarm(false)
-                                task.wait(0.5)
+                                taskWait(0.5)
                                 questSetGameAutoFarm(true)
                             end
                         end
@@ -9439,7 +9645,7 @@ end
                     if type(setAutoHatchState) == "function" and not AutoBuying then
                         pcall(setAutoHatchState, true)
                     end
-                    task.wait(1.5)
+                    taskWait(1.5)
                 end
             end)
         end
@@ -9506,7 +9712,7 @@ end
                 SetSetting("autoFarmArea", afSelectedArea)
                 SetSetting("autoFarmEgg", afSelectedEgg)
                 saveSettings()
-                task.spawn(function()
+                taskSpawn(function()
                     pcall(afStart)
                 end)
             end
@@ -9815,11 +10021,11 @@ end
             afRunning = true
             AutoFarmTabActive = true
             setAfStatus("Restoring auto farm...", AF_ACCENT)
-            task.spawn(function()
+            taskSpawn(function()
                 local waited = 0
                 while waited < 15 do
-                    task.wait(0.5)
-                    waited += 0.5
+                    taskWait(0.5)
+                    waited = waited + 0.5
                     if afGetRoot() then break end
                 end
                 pcall(afStart)
@@ -9871,7 +10077,7 @@ do
                 if not sharedLoadWorldSafely then return false end
                 local ok, loaded = pcall(sharedLoadWorldSafely, targetWorld)
                 if not ok or loaded ~= true then return false end
-                task.wait(1.5)
+                taskWait(1.5)
                 root = getPlayerRoot()
                 if not root then return false end
             end
@@ -9892,7 +10098,7 @@ do
         -- first, then fire the claim. The pad lives in Spawn/Town (and Fantasy
         -- Isle), so Spawn is loaded when the current map has no pad.
         -- -----------------------------------------------------------------
-        task.spawn(function()
+        taskSpawn(function()
             local function findPad()
                 local ok, map = pcall(function() return Library.WorldCmds.GetMap() end)
                 if not ok or not map then return nil end
@@ -9908,7 +10114,7 @@ do
             while true do
                 if not AutoGroupRewards then
                     AfkGroupStatus = "Idle"
-                    task.wait(0.5)
+                    taskWait(0.5)
                 else
                     local ok, state = false, nil
                     if RawNet.invoke then
@@ -9917,7 +10123,7 @@ do
 
                     if not ok or type(state) ~= "table" then
                         AfkGroupStatus = "state unavailable"
-                        task.wait(5)
+                        taskWait(5)
                     elseif state.ready then
                         local pad = findPad()
                         if not pad then
@@ -9927,30 +10133,30 @@ do
                                 local okLoad, loaded = pcall(sharedLoadWorldSafely, "Spawn")
                                 moved = okLoad and loaded == true
                             end
-                            task.wait(moved and 2 or 5)
+                            taskWait(moved and 2 or 5)
                         else
                             local root = getPlayerRoot()
                             if not root then
                                 AfkGroupStatus = "character not loaded"
-                                task.wait(1)
+                                taskWait(1)
                             else
                                 local padPos = pad.Position
                                 pcall(function()
                                     root.CFrame = CFrame.new(padPos + Vector3.new(0, pad.Size.Y * 0.5 + 3, 0))
                                 end)
-                                task.wait(0.4)
+                                taskWait(0.4)
                                 local okClaim, claimed, message = RawNet.invoke("Group Rewards: Claim")
                                 if okClaim and claimed then
                                     AfkGroupStatus = "claimed"
                                 else
                                     AfkGroupStatus = "claim failed: " .. tostring(message)
                                 end
-                                task.wait(3)
+                                taskWait(3)
                             end
                         end
                     else
                         AfkGroupStatus = "ready in " .. tostring(state.secondsLeft or "?") .. "s"
-                        task.wait(15)
+                        taskWait(15)
                     end
                 end
             end
@@ -9961,7 +10167,7 @@ do
         -- One spin per ticket held, per wheel, read straight from the wheel
         -- definition's TicketStat.
         -- -----------------------------------------------------------------
-        task.spawn(function()
+        taskSpawn(function()
             local wheelIds = {}
             for id in pairs(Library.Directory.SpinnyWheels or {}) do
                 wheelIds[#wheelIds + 1] = tostring(id)
@@ -9971,7 +10177,7 @@ do
             while true do
                 if not AutoSpinnyWheels or #wheelIds == 0 then
                     AfkWheelStatus = #wheelIds == 0 and "no wheels in directory" or "Idle"
-                    task.wait(0.5)
+                    taskWait(0.5)
                 else
                     local save = nil
                     pcall(function() save = Library.Save.Get() end)
@@ -9991,12 +10197,12 @@ do
                             if ok and result ~= nil and result ~= false then
                                 spun = true
                             end
-                            task.wait(0.35)
+                            taskWait(0.35)
                         end
                     end
 
                     AfkWheelStatus = table.concat(parts, "  ")
-                    task.wait(spun and 0.5 or 5)
+                    taskWait(spun and 0.5 or 5)
                 end
             end
         end)
@@ -10046,16 +10252,16 @@ do
             return plan
         end
 
-        task.spawn(function()
+        taskSpawn(function()
             while true do
                 if not AutoPotionUpgrade then
                     AfkPotionStatus = "Idle"
-                    task.wait(0.5)
+                    taskWait(0.5)
                 else
                     local plan = buildUpgradePlan()
                     if #plan == 0 then
                         AfkPotionStatus = "nothing to upgrade"
-                        task.wait(10)
+                        taskWait(10)
                     else
                         local cap = tonumber(Library.Shared.PotionUpgradeMachine.MaxUpgradesPerPress) or 500
                         local parts, upgraded = {}, false
@@ -10068,11 +10274,11 @@ do
                                 )
                                 if ok and result then upgraded = true end
                                 parts[#parts + 1] = string.format("%s x%d", entry.key, batch)
-                                task.wait(0.4)
+                                taskWait(0.4)
                             end
                         end
                         AfkPotionStatus = #parts > 0 and ("upgraded " .. table.concat(parts, ", ")) or "nothing to upgrade"
-                        task.wait(upgraded and 2 or 15)
+                        taskWait(upgraded and 2 or 15)
                     end
                 end
             end
@@ -10103,11 +10309,11 @@ do
             return best
         end
 
-        task.spawn(function()
+        taskSpawn(function()
             while true do
                 if not AutoPotionUse then
                     AfkPotionUseStatus = "Idle"
-                    task.wait(0.5)
+                    taskWait(0.5)
                 else
                     local best = maxTierKeyByFamily()
                     local okSave, save = pcall(function() return Library.Save.Get() end)
@@ -10120,14 +10326,14 @@ do
                                 RawNet.fire("Use Item", entry.key, owned)
                                 AfkPotionUseStatus = string.format("drank %s x%d", entry.key, owned)
                                 drank = true
-                                task.wait(0.45)
+                                taskWait(0.45)
                             end
                         end
                     end
                     if not drank then
                         AfkPotionUseStatus = "no max-tier potions held"
                     end
-                    task.wait(drank and 1 or 10)
+                    taskWait(drank and 1 or 10)
                 end
             end
         end)
@@ -10135,7 +10341,7 @@ do
         -- -----------------------------------------------------------------
         -- Isolate quest-controller helpers from the large UI-builder closure.
         -- Luau allows at most 200 local registers in a function.
-        task.spawn(function()
+        taskSpawn(function()
         -- -----------------------------------------------------------------
         -- Auto Quests
         -- Reads the live quest state, accepts unaccepted quests, steers the
@@ -10589,7 +10795,8 @@ do
                 -- selected, fall back to the chosen egg's area. The startup
                 -- sequence always captures Auto Farm at the area centre first,
                 -- then moves to the egg capsule for hatching.
-                local eggDef = AfkFarmEgg and Library.Directory.Eggs[AfkFarmEgg] or nil
+                local eggDef = AfkFarmEgg and Library.Directory and Library.Directory.Eggs
+                    and Library.Directory.Eggs[AfkFarmEgg] or nil
                 local eggArea = type(eggDef) == "table" and eggDef.area or nil
 
                 if AfkFarmEgg then
@@ -10653,7 +10860,7 @@ do
                     end
                     AfkQuestStatus = "Idle"
                     AfkSideQuestStatus = "Idle"
-                    task.wait(0.5)
+                    taskWait(0.5)
                 else
                     local ok, all = false, nil
                     if RawNet.invoke then
@@ -10663,7 +10870,7 @@ do
                     if not ok or type(all) ~= "table" then
                         AfkQuestStatus = "quest state unavailable"
                         AfkSideQuestStatus = "quest state unavailable"
-                        task.wait(5)
+                        taskWait(5)
                     else
                         -- Walk the enabled lines in a fixed order. An already
                         -- accepted line always wins, then the first line that
@@ -10720,7 +10927,7 @@ do
                         if not chosenState then
                             AfkQuestStatus = mainSummary
                             AfkSideQuestStatus = sideSummary
-                            task.wait(15)
+                            taskWait(15)
                         elseif not chosenInfo.accepted then
                             -- The server rejects Accept handled by another line's
                             -- NPC, so only accept when the track we picked really
@@ -10733,7 +10940,7 @@ do
                                 AfkQuestStatus = "accept failed [" .. chosen .. "]"
                                 AfkSideQuestStatus = AfkQuestStatus
                             end
-                            task.wait(1.5)
+                            taskWait(1.5)
                         else
                             local objective = nil
                             if type(chosenState.objectives) == "table" then
@@ -10753,7 +10960,7 @@ do
                                     AfkQuestStatus = "claim failed: " .. tostring(message)
                                 end
                                 AfkSideQuestStatus = AfkQuestStatus
-                                task.wait(2)
+                                taskWait(2)
                             else
                                 local stat = statForObjective(objective)
 
@@ -10787,7 +10994,7 @@ do
                                         and Library.WorldCmds.HasArea(QuestAreaFarmTarget) == false then
                                         if sharedLoadWorldSafely then
                                             pcall(sharedLoadWorldSafely, QuestAreaFarmTarget)
-                                            task.wait(1.5)
+                                            taskWait(1.5)
                                             root = getPlayerRoot()
                                         end
                                     end
@@ -10819,24 +11026,24 @@ do
                                             local centre = sharedGetAreaCenter and sharedGetAreaCenter(parkArea) or nil
                                             if root and centre and (root.Position - centre).Magnitude > 25 then
                                                 steerToArea(parkArea)
-                                                task.wait(0.5)
+                                                taskWait(0.5)
                                                 root = getPlayerRoot()
                                             elseif not root then
                                                 steerToArea(parkArea)
-                                                task.wait(0.5)
+                                                taskWait(0.5)
                                                 root = getPlayerRoot()
                                             end
                                         end
 
                                         if not QuestPlaytimeFarmReady then
-                                            task.wait(3)
+                                            taskWait(3)
                                             if QuestPlaytimeActive and (AutoQuests or AutoQuestsSide) then
                                                 -- Clear any stale capture first so
                                                 -- Auto Farm records this area centre.
                                                 questSetGameAutoFarm(false)
-                                                task.wait(0.6)
+                                                taskWait(0.6)
                                                 questSetGameAutoFarm(true)
-                                                task.wait(3)
+                                                taskWait(3)
                                                 if QuestPlaytimeActive and (AutoQuests or AutoQuestsSide) then
                                                     QuestPlaytimeFarmReady = true
                                                 end
@@ -10852,7 +11059,7 @@ do
                                                     pcall(function()
                                                         root.CFrame = CFrame.new(part.Position + Vector3.new(0, 5, 0))
                                                     end)
-                                                    task.wait(0.5)
+                                                    taskWait(0.5)
                                                 end
                                             -- If the capsule is not currently streamed in,
                                             -- stay where we are; do not bounce back to the
@@ -10870,7 +11077,7 @@ do
                                                 pcall(function()
                                                     root.CFrame = CFrame.new(part.Position + Vector3.new(0, 5, 0))
                                                 end)
-                                                task.wait(0.5)
+                                                taskWait(0.5)
                                             end
                                         elseif parkArea then
                                             steerToArea(parkArea)
@@ -10926,13 +11133,14 @@ do
                                                 pcall(function()
                                                     root.CFrame = CFrame.new(part.Position + Vector3.new(0, 5, 0))
                                                 end)
-                                                task.wait(0.5)
+                                                taskWait(0.5)
                                             end
                                         end
                                     else
                                         -- Capsule not streamed in: fall back to
                                         -- the egg's area centre until it is.
-                                        local eggDef = Library.Directory.Eggs[QuestTargetEggId]
+                                        local eggDef = Library.Directory and Library.Directory.Eggs
+                                            and Library.Directory.Eggs[QuestTargetEggId] or nil
                                         local area = type(eggDef) == "table" and eggDef.area or nil
                                         if area then steerToArea(area) end
                                     end
@@ -10955,7 +11163,7 @@ do
                                     end
                                 end
 
-                                task.wait(3)
+                                taskWait(3)
                             end
                         end
                     end
@@ -11088,6 +11296,7 @@ do
         end
     end)
 
+    ;(function()
     local themeLabel = Instance.new("TextLabel")
     themeLabel.Size = UDim2.new(0.6, 0, 0, 20)
     themeLabel.Position = UDim2.new(0, 0, 0, 100)
@@ -11232,7 +11441,7 @@ do
         check.Parent = row
 
         themeRows[themeObj.name] = { row = row, check = check, stroke = tStroke, label = tLabel }
-        themeIndex += 1
+        themeIndex = themeIndex + 1
 
         row.MouseButton1Click:Connect(function()
             applyTheme(themeObj)
@@ -11263,9 +11472,9 @@ do
             local match = (query == "") or (string.find(string.lower(name), query, 1, true) ~= nil)
             entry.row.Visible = match
             if match then
-                order += 1
+                order = order + 1
                 entry.row.LayoutOrder = order
-                shown += 1
+                shown = shown + 1
             end
         end
         themeLabel.Text = (query == "")
@@ -11291,8 +11500,9 @@ do
         end
     end
     applySavedTheme()
+    end)()
 
-    task.spawn(function()
+    taskSpawn(function()
         -- PET INDEX: integrated into the existing hub and tab switcher.
         local variantNames = { [1] = "Base", [2] = "Golden", [3] = "Rainbow" }
         local variantColors = {
@@ -11547,6 +11757,7 @@ do
         local function buildNearbyPanelRows(cfg, owned)
             local rows = {}
             local variants = {}
+            local eggDirectory = Library.Directory and Library.Directory.Eggs or {}
             local collectables = cachedIndexCollectables
             if not collectables then
                 local ok, result = pcall(function()
@@ -11725,7 +11936,7 @@ do
             for _, row in ipairs(rows) do
                 if not seenPets[row.name] then
                     seenPets[row.name] = true
-                    petCount += 1
+                    petCount = petCount + 1
                 end
             end
             nearbyPanelSub.Text = ("%d missing variants · %d pets · %.1f studs"):format(#rows, petCount, distance)
@@ -11786,7 +11997,7 @@ do
                     end
                     hashA = (hashA + keyHash) % 2147483647
                     hashB = (hashB + (keyHash * keyHash) % 2147483647) % 2147483647
-                    keyCount += 1
+                    keyCount = keyCount + 1
                 end
             end
             local signature = table.concat({ hasSave and "ready" or "unavailable", keyCount, hashA, hashB }, "|")
@@ -12034,8 +12245,8 @@ do
                         -- variants obtainable from that egg. Outside its range
                         -- the normal complete index remains visible.
                         if isForNearbyEgg and (not nearbyEgg or not isOwned) then
-                            totalVariants += 1
-                            if isOwned then totalOwned += 1 end
+                            totalVariants = totalVariants + 1
+                            if isOwned then totalOwned = totalOwned + 1 end
 
                             local name = tostring(pet.displayName or pet.name or id)
                             local rarity = tostring(pet.rarity or "Unknown")
@@ -12182,17 +12393,17 @@ do
             indexQuery = TAB_TOTAL.indexUI.search.Text:lower():gsub("^%s+", ""):gsub("%s+$", "")
             if not searchRefreshQueued then
                 searchRefreshQueued = true
-                task.delay(0.2, function()
+                taskDelay(0.2, function()
                     searchRefreshQueued = false
                     if ui.Parent then refreshIndex() end
                 end)
             end
         end)
         TAB_TOTAL.indexUI.refresh.MouseButton1Click:Connect(refreshIndex)
-        task.spawn(function()
+        taskSpawn(function()
             while ui.Parent do
                 if TAB_TOTAL.indexUI.frame.Visible then refreshIndex() end
-                task.wait(1.25)
+                taskWait(1.25)
             end
         end)
         refreshIndex()
@@ -12200,16 +12411,16 @@ do
         -- Keep the floating missing-pets panel independent from the normal
         -- Index list. Ownership is polled every 0.60 seconds for near-real-time
         -- updates; the heavier egg hierarchy sweep runs only every 8 seconds.
-        task.spawn(function()
+        taskSpawn(function()
             local previousTick = os.clock()
             while ui.Parent do
                 local now = os.clock()
                 local elapsed = math.min(now - previousTick, 0.5)
                 previousTick = now
                 if nearbyPanelEnabled then
-                    nearbyEggTickAcc += elapsed
-                    nearbyEggOwnedAcc += elapsed
-                    nearbyEggSweepAcc += elapsed
+                    nearbyEggTickAcc = nearbyEggTickAcc + elapsed
+                    nearbyEggOwnedAcc = nearbyEggOwnedAcc + elapsed
+                    nearbyEggSweepAcc = nearbyEggSweepAcc + elapsed
 
                     if nearbyEggSweepAcc >= NEARBY_PANEL_EGG_SWEEP then
                         nearbyEggSweepAcc = 0
@@ -12247,7 +12458,7 @@ do
                                 for _, row in ipairs(nearbyEggRows) do
                                     if not seen[row.name] then
                                         seen[row.name] = true
-                                        petCount += 1
+                                        petCount = petCount + 1
                                     end
                                 end
                                 nearbyPanelSub.Text = ("%d missing variants · %d pets · %.1f studs"):format(
@@ -12259,12 +12470,12 @@ do
                 elseif nearbyPanel.Visible then
                     nearbyPanel.Visible = false
                 end
-                task.wait(NEARBY_PANEL_TICK)
+                taskWait(NEARBY_PANEL_TICK)
             end
         end)
     end)
 
-	end)
+    end)
 
 
 -- =====================================================================
@@ -12360,7 +12571,7 @@ pcall(function()
     local AutoPickupLootbagSent = {}
 
     -- Lootbags: use the same network request as the game's Lootbags module.
-    task.spawn(function()
+    taskSpawn(function()
         while true do
             if AutoPickupLootbags then
                 for _, lootbag in ipairs(AutoPickupLootbags:GetChildren()) do
@@ -12372,7 +12583,7 @@ pcall(function()
                             local id = idValue and idValue.Value or lootbag:GetAttribute("ID")
                             if id ~= nil and not AutoPickupLootbagSent[lootbag] then
                                 AutoPickupLootbagSent[lootbag] = true
-                                Library.Network.Fire("Collect Lootbag", id, lootbag.CFrame.Position)
+                                RawNet.fire("Collect Lootbag", id, lootbag.CFrame.Position)
                             end
                         end
                     end)
@@ -12383,16 +12594,16 @@ pcall(function()
                         AutoPickupLootbagSent[lootbag] = nil
                     end
                 end
-                task.wait(0.2)
+                taskWait(0.2)
             else
-                task.wait(1)
+                taskWait(1)
             end
         end
     end)
 end)
 
 -- =====================================================================
--- REAL EXECUTOR COMPATIBILITY - CLEANUP & RELOAD HANDLING
+-- EXECUTOR COMPATIBILITY - CLEANUP & RELOAD HANDLING
 -- =====================================================================
 -- Add cleanup function to the cleanup handlers list
 registerCleanup(function()
@@ -12447,8 +12658,15 @@ registerCleanup(function()
             if previous.replacement and previous.replacement.Connected then
                 previous.replacement:Disconnect()
             end
-            if previous.trigger and previous.callback then
-                previous.trigger.Event:Connect(previous.callback)
+            if previous.signal and previous.callback then
+                pcall(function()
+                    previous.signal:Connect(previous.callback)
+                end)
+            elseif previous.trigger and previous.callback then
+                pcall(function()
+                    local oldSignal = previous.trigger:IsA("BindableEvent") and previous.trigger.Event or previous.trigger.OnClientEvent
+                    if oldSignal then oldSignal:Connect(previous.callback) end
+                end)
             end
         end
     end)
@@ -12462,15 +12680,17 @@ registerCleanup(function()
 end)
 
 -- Script fully loaded indicator
-if getgenv then
-    getgenv().PetDimensionsLoaded = true
-    getgenv().PetDimensionsVersion = "RealExecutor_Optimized_v2+v3fixes+autoFarming"
+do
+    local env = getExecutorEnv()
+    if type(env) == "table" then
+        env.PetDimensionsLoaded = true
+        env.PetDimensionsVersion = "ExecutorNeutral_v3+autoFarming"
+    end
 end
 
 return {
     cleanup = runCleanup,
     isLoaded = function() return isExecutorLoaded end,
-    executorType = executorTypae,
+    executorType = executorType,
 }
-
 
